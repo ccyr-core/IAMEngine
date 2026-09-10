@@ -3438,15 +3438,27 @@ while ($true) {
     if ($script:BrowserInstallJob) {
         $st = $script:BrowserInstallJob.State
         if ($st -in @('Completed', 'Failed', 'Stopped')) {
-            try { Receive-Job -Job $script:BrowserInstallJob -ErrorAction SilentlyContinue | Out-Null } catch { }
+            # KEEP what the job said. Install-CtgBrowser warns with the actual reason (npm exit code and
+            # its output tail, a missing node, an absent sidecar directory) and this used to pipe all of
+            # it to Out-Null — so a failed install left the operator a guess ("no egress?") in a local
+            # log file and nothing at all in the app. Two installs failed that way unnoticed.
+            $detail = ''
+            try {
+                $out = Receive-Job -Job $script:BrowserInstallJob -ErrorAction SilentlyContinue 2>&1
+                $detail = (@($out) | Where-Object { $_ } | ForEach-Object { [string]$_ } | Select-Object -Last 4) -join ' | '
+            } catch { }
             try { Remove-Job -Job $script:BrowserInstallJob -Force -ErrorAction SilentlyContinue } catch { }
             $script:BrowserInstallJob = $null
             if (Test-CtgBrowserAvailable) {
                 if ($script:RunnerCapabilities -notcontains 'browser') { $script:RunnerCapabilities += 'browser' }
                 $script:RunnerCapabilitiesJson = ($script:RunnerCapabilities | ConvertTo-Json -Compress -AsArray)
+                $script:LastBrowserInstallError = $null
                 Write-Host "Browser sidecar ready — now advertising 'browser' ($script:RunnerCapabilitiesJson)" -ForegroundColor Green
             } else {
-                Write-Warning "browser sidecar install did not complete (no egress to npmjs.org / the Playwright CDN?) — browser jobs stay withheld from this agent. Set IAM_RUNNER_NO_BROWSER_INSTALL=1 to stop retrying."
+                # Reported on the next heartbeat (see $hbBody) so the Agents page shows the reason
+                # instead of a spinner that never resolves.
+                $script:LastBrowserInstallError = if ($detail) { $detail } else { "the install job finished without a usable sidecar and gave no output — check runner.log on this host for 'browser sidecar'" }
+                Write-Warning "browser sidecar install did not complete: $script:LastBrowserInstallError — browser jobs stay withheld from this agent. Set IAM_RUNNER_NO_BROWSER_INSTALL=1 to stop retrying."
             }
         }
     }
@@ -3455,6 +3467,7 @@ while ($true) {
         # completed migration) and any last migrate failure (surfaced on the Agents page).
         $hbBody = @{ agentId = $AgentId; version = $script:RunnerBuild; semver = $script:RunnerSemver; startedAt = $script:RunnerStartedAt; capabilities = $script:RunnerCapabilitiesJson; appUrl = $AppUrl; authMode = $(if ($script:AgentToken) { 'per-agent' } else { 'shared' }) }
         if ($script:LastMigrateError) { $hbBody['migrateError'] = $script:LastMigrateError }
+        if ($script:LastBrowserInstallError) { $hbBody['browserInstallError'] = $script:LastBrowserInstallError }
         $hb = Invoke-AppApi POST '/api/agents/heartbeat' $hbBody
         if ($hb.enabled -eq $false) { Write-Warning "agent disabled server-side; stopping."; break }
         # Adopt a delivered per-agent token BEFORE update/restart handling below: the token is a

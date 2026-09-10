@@ -329,6 +329,14 @@ model Agent {
   browserInstallRequestedAt DateTime?
   browserInstallRequestedBy String?
   browserInstallDeliveredAt DateTime?
+  // What the browser-sidecar install actually did, reported by the agent on the heartbeat exactly as
+  // migrateError is. The install runs as a BACKGROUND job on the runner (a cold Node + Playwright +
+  // Chromium download takes many minutes and must not stall heartbeats), so the app only ever learned
+  // the outcome by inference: the 'browser' capability either turned up or it did not. When it did
+  // not there was nothing to read, and the runner's own reason was written to its local log and
+  // discarded from the job. Two installs failed that way without anyone knowing why.
+  // null once the sidecar reports ready; set to the reason when the job finishes without it.
+  browserInstallError String?
   // Operator-driven app-URL migration. The agent reports its current base URL each heartbeat
   // (currentAppUrl); a global target (AppSetting agent_migration) + this per-agent canary flag make
   // the heartbeat return migrate:{appUrl}. The runner verifies the new URL, rewrites its own supervisor
