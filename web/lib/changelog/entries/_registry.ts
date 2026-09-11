@@ -333,3 +333,5 @@ export { entry as locationsActiveFilterFixed } from "./locations-active-filter-f
 
 export { entry as restoreDrillSelfHeal } from "./restore-drill-self-heal";
 export { entry as exoPinSaysWhy } from "./exo-pin-says-why";
+
+export { entry as inflightMarkerPerAgent } from "./inflight-marker-per-agent";

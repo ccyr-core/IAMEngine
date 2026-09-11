@@ -2124,7 +2124,36 @@ function Set-CtgSelfHealRestart {
 # So: stamp the job on disk while it runs, clear it when it finishes, and on the next start report any
 # marker still lying there as a failure with a real reason. A killed process therefore turns into an
 # explained failure within one restart, not a silent 30-minute gap.
-$script:CtgInFlightFile = Join-Path $PSScriptRoot 'inflight.json'
+# Keyed by AGENT, and dot-prefixed, for three separate reasons — all of which bit core1748:
+#   1. A runner POOL and any second runner share one folder. The lock (.runner.<agentId>.lock) and the
+#      heartbeat (temp/iam-runner-<agentId>.heartbeat) are already per agent; this was not, so a second
+#      runner read the first one's marker at startup and posted its LIVE job to the app as failed.
+#   2. Get-CtgBuildId hashes every file in the folder except dot-segments, tests/dist/node_modules/
+#      scripts and *.log. A bare 'inflight.json' is none of those, so a runner that died mid-job came
+#      back hashing a build the app's bundle can never equal — and was told to self-update forever,
+#      which EXITS the process each time. The dot prefix takes it out of the hash entirely.
+#   3. The self-update prune skips dot-segments too, so the marker now survives a self-update instead
+#      of being deleted with the abandoned job still unreported.
+function Get-CtgInFlightPath {
+    param([Parameter(Mandatory)][string]$RunnerDir, [Parameter(Mandatory)][string]$AgentId)
+    return (Join-Path $RunnerDir ".inflight.$AgentId.json")
+}
+
+# Delete the pre-1.123 shared marker if this host still has one. It must go BEFORE Get-CtgBuildId runs
+# or it keeps skewing the build id (defect 2) for the life of the install. It is deliberately NOT
+# reported: the file carries no agent id, so on the very shared-folder host this fixes we cannot tell
+# whether it is ours or belongs to a runner still executing that job — reporting it would BE the bug.
+# Unreported, the job ages out of its claim lease, which is the pre-existing and safe behaviour.
+function Remove-CtgLegacyInFlight {
+    param([Parameter(Mandatory)][string]$RunnerDir)
+    $legacy = Join-Path $RunnerDir 'inflight.json'
+    try {
+        if (Test-Path -LiteralPath $legacy) { Remove-Item -LiteralPath $legacy -Force -ErrorAction Stop; return $true }
+    } catch { }
+    return $false
+}
+
+$script:CtgInFlightFile = Get-CtgInFlightPath -RunnerDir $PSScriptRoot -AgentId $AgentId
 
 function Set-CtgInFlight {
     param([Parameter(Mandatory)]$Job)
@@ -3346,6 +3375,11 @@ function Invoke-CtgCloudGroupDiscovery {
 # Build id of the code we're actually running = hash of our own files (matches the app's hash of the
 # bundle it serves). Reported on every heartbeat → accurate even if a past restart half-landed, with
 # no marker file to keep in sync.
+# Before the hash: a leftover pre-1.123 inflight.json would otherwise be folded into this runner's
+# build id, which the app's bundle can never match — the "told to update, never converges" loop.
+if (Remove-CtgLegacyInFlight -RunnerDir $PSScriptRoot) {
+    Write-CtgLog -Level INFO -Message "removed the legacy shared inflight.json (superseded by a per-agent marker; not reported — it carries no agent id)"
+}
 $script:RunnerBuild = Get-CtgBuildId
 
 # Human-readable release version from VERSION (e.g. "1.0.0"), reported alongside the build id so the

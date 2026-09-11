@@ -12,7 +12,7 @@ BeforeAll {
     $Root = Split-Path $PSScriptRoot -Parent
     $script:Runner = Get-Content "$Root/Start-IamRunner.ps1" -Raw
 
-    foreach ($fn in 'Set-CtgInFlight', 'Clear-CtgInFlight', 'Report-CtgAbandonedJob') {
+    foreach ($fn in 'Set-CtgInFlight', 'Clear-CtgInFlight', 'Report-CtgAbandonedJob', 'Get-CtgInFlightPath', 'Remove-CtgLegacyInFlight') {
         $m = [regex]::Match($script:Runner, "(?ms)^function $([regex]::Escape($fn)) \{.*?^\}")
         $m.Success | Should -BeTrue -Because "Start-IamRunner.ps1 must declare $fn"
         . ([scriptblock]::Create($m.Value))
@@ -101,5 +101,65 @@ Describe 'the job loop keeps the marker honest' {
         $script:Runner | Should -Match 'Set-CtgInFlight \$job'
         $loopFinally = [regex]::Match($script:Runner, '(?ms)finally \{\s*\r?\n\s*Clear-CtgInFlight')
         $loopFinally.Success | Should -BeTrue -Because 'the clear must be in the job loop finally, so it runs on success AND failure'
+    }
+}
+
+# The marker file was a single `inflight.json` in the runner folder, keyed by nothing. That is one
+# name for three jobs it cannot do:
+#
+#   1. TWO AGENTS, ONE FOLDER. The lock is .runner.<agentId>.lock and the heartbeat is
+#      iam-runner-<agentId>.heartbeat in temp -- both per agent, deliberately. This one was not, so a
+#      second runner in the same directory read the FIRST one's marker at startup and posted its live
+#      job to the app as failed, then deleted the marker. On core1748 the same job id was declared
+#      dead on three separate days while it was running.
+#   2. IT MOVED THE BUILD ID. Get-CtgBuildId hashes every file in the folder except dot-segments,
+#      tests/dist/node_modules/scripts and *.log -- and `inflight.json` is none of those. A runner
+#      that died mid-job came back with a marker on disk, hashed a build the app's bundle can never
+#      equal, and was told to self-update forever. A self-update EXITS the runner process.
+#   3. THE PRUNE ATE IT. Invoke-CtgManifestPull deletes what the manifest did not send, skipping
+#      dot-segments -- so a self-update destroyed the marker and the abandoned job went unreported.
+#
+# A dot-prefixed, per-agent name fixes all three at once.
+Describe 'the in-flight marker is per agent and invisible to the bundle' {
+    It 'gives two agents sharing one folder two different files' {
+        $a = Get-CtgInFlightPath -RunnerDir 'C:/iam-runner' -AgentId 'cmsqc9d9n035m10lyc2kzrm90'
+        $b = Get-CtgInFlightPath -RunnerDir 'C:/iam-runner' -AgentId 'cmrz0u6fy000xclmhovdgh0lh'
+        $a | Should -Not -Be $b
+    }
+
+    It 'names the file after the agent, matching the lock file convention' {
+        $p = Get-CtgInFlightPath -RunnerDir 'C:/iam-runner' -AgentId 'cmsqc9d9n035m10lyc2kzrm90'
+        [System.IO.Path]::GetFileName($p) | Should -BeLike '*cmsqc9d9n035m10lyc2kzrm90*'
+    }
+
+    It 'is a dot-entry, so the build id and the self-update prune both skip it' {
+        # Get-CtgBuildId skips any path segment starting with '.' (and so does bundle.ts). A marker
+        # that is NOT skipped makes the runner hash a build the app cannot serve -- update forever.
+        $p = Get-CtgInFlightPath -RunnerDir 'C:/iam-runner' -AgentId 'agent1'
+        [System.IO.Path]::GetFileName($p).StartsWith('.') | Should -BeTrue
+    }
+
+    It 'the script derives the path from the agent id, not a fixed name' {
+        $script:Runner | Should -Match 'Get-CtgInFlightPath -RunnerDir \$PSScriptRoot -AgentId \$AgentId'
+        # Single-quoted: in a DOUBLE-quoted PowerShell string $PSScriptRoot interpolates into the pattern.
+        $script:Runner | Should -Not -Match 'CtgInFlightFile = Join-Path \$PSScriptRoot'
+    }
+}
+
+# A host upgrading across this change still has the old shared inflight.json lying in the folder.
+# Left there it keeps skewing the build id forever (defect 2 above), so it must go. It is NOT
+# reported: the file carries no agent id, so on the very shared-folder host this fixes we cannot tell
+# whether it belongs to this runner or to one that is still running the job. Reporting it would be
+# the exact bug being fixed. Unreported, the job ages out of its lease -- the pre-existing, safe path.
+Describe 'the legacy shared marker' {
+    It 'is deleted on startup so it cannot keep skewing the build id' {
+        $legacy = Join-Path $TestDrive 'inflight.json'
+        '{"jobId":"job9","systemKey":"m365","at":1}' | Set-Content -LiteralPath $legacy
+        Remove-CtgLegacyInFlight -RunnerDir $TestDrive | Should -BeTrue
+        Test-Path $legacy | Should -BeFalse
+    }
+
+    It 'is a no-op when there is none' {
+        Remove-CtgLegacyInFlight -RunnerDir $TestDrive | Should -BeFalse
     }
 }
