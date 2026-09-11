@@ -15,6 +15,12 @@ BeforeAll {
     $m.Success | Should -BeTrue -Because 'Start-IamRunner.ps1 must declare Install-CtgExoPin'
     . ([scriptblock]::Create($m.Value))
 
+    # The out-of-process install seam. Dot-sourced (not stubbed) so these tests also assert the
+    # script really declares it — mocking a command Pester cannot resolve is a CommandNotFound error.
+    $p = [regex]::Match($script:Runner, '(?ms)^function Invoke-CtgPwshInstall \{.*?^\}')
+    $p.Success | Should -BeTrue -Because 'Start-IamRunner.ps1 must declare Invoke-CtgPwshInstall'
+    . ([scriptblock]::Create($p.Value))
+
     function Initialize-CtgGallery { }  # stub the gallery bootstrap the guard calls before installing
 
     # This pwsh has no PowerShellGet, so there is no real Install-Module for Pester to hook -
@@ -33,11 +39,11 @@ Describe 'Install-CtgExoPin' {
     It 'installs the pin, at the exact requested version, when it is absent' {
         # The failing state: only the broken 3.10.0 is on the host, the 3.9.2 pin is missing.
         Mock Get-Module { @(FakeModule 'ExchangeOnlineManagement' '3.10.0') }
-        Mock Install-Module { }
+        Mock Invoke-CtgPwshInstall { [pscustomobject]@{ Code = 0; Tail = '' } }
         Mock Write-Warning { }
         Install-CtgExoPin -Version '3.9.2'
-        Should -Invoke Install-Module -Times 1 -Exactly -ParameterFilter {
-            $Name -eq 'ExchangeOnlineManagement' -and $RequiredVersion -eq [version]'3.9.2'
+        Should -Invoke Invoke-CtgPwshInstall -Times 1 -Exactly -ParameterFilter {
+            $Name -eq 'ExchangeOnlineManagement' -and $Version -eq '3.9.2'
         }
     }
 
@@ -55,18 +61,18 @@ Describe 'Install-CtgExoPin' {
 
     It 'installs the pin when EXO is not present at all' {
         Mock Get-Module { @() }
-        Mock Install-Module { }
+        Mock Invoke-CtgPwshInstall { [pscustomobject]@{ Code = 0; Tail = '' } }
         Mock Write-Warning { }
         Install-CtgExoPin -Version '3.9.2'
-        Should -Invoke Install-Module -Times 1 -Exactly -ParameterFilter { $RequiredVersion -eq [version]'3.9.2' }
+        Should -Invoke Invoke-CtgPwshInstall -Times 1 -Exactly -ParameterFilter { $Version -eq '3.9.2' }
     }
 
     It 'never throws when the gallery is unreachable (best-effort, never blocks startup)' {
         Mock Get-Module { @(FakeModule 'ExchangeOnlineManagement' '3.10.0') }
-        Mock Install-Module { throw 'gallery unreachable' }
+        Mock Invoke-CtgPwshInstall { [pscustomobject]@{ Code = 1; Tail = 'gallery unreachable' } }
         Mock Write-Warning { }
         { Install-CtgExoPin -Version '3.9.2' } | Should -Not -Throw
-        Should -Invoke Install-Module -Times 1 -Exactly
+        Should -Invoke Invoke-CtgPwshInstall -Times 1 -Exactly
     }
 }
 
@@ -126,5 +132,70 @@ Describe 'the Exchange finish hint names the real cause' {
     It 'says plainly that it is NOT a permissions problem, and names the fix' {
         $script:Runner | Should -Match 'NOT a permissions or certificate problem'
         $script:Runner | Should -Match 'Install-Module ExchangeOnlineManagement -RequiredVersion'
+    }
+}
+
+# The pin's self-heal ran Install-Module INSIDE the runner process, which by that point has imported
+# Graph, AD and a dozen Coretelligent.* modules. PowerShellGet then refuses with "The version
+# '1.4.8.1' of module 'PackageManagement' is currently in use. Retry the operation after closing the
+# applications." -- caught, written to a Write-Warning, and on a Windows SYSTEM scheduled task that
+# warning goes to a console nobody is attached to. So on core1748 the self-heal failed at EVERY
+# startup, invisibly, the fallback loaded the broken 3.10.0, and every Exchange job died with
+# "does not contain a method named 'GetResponseHeader'" (UM0031200, 2026-09-11).
+Describe 'Install-CtgExoPin installs out-of-process and says so when it cannot' {
+    BeforeEach {
+        $script:LastExoPinError = $null
+    }
+
+    It 'installs the pin in a CLEAN child pwsh, never in the running session' {
+        # In-session Install-Module is the bug: the runner's own loaded modules block it.
+        Mock Get-Module { @(FakeModule 'ExchangeOnlineManagement' '3.10.0') }
+        Mock Invoke-CtgPwshInstall { [pscustomobject]@{ Code = 0; Tail = '' } }
+        Mock Install-Module { }
+        Mock Write-Warning { }
+        Install-CtgExoPin -Version '3.9.2'
+        Should -Invoke Invoke-CtgPwshInstall -Times 1 -Exactly -ParameterFilter {
+            $Name -eq 'ExchangeOnlineManagement' -and $Version -eq '3.9.2'
+        }
+        Should -Invoke Install-Module -Times 0 -Exactly
+    }
+
+    It 'records WHY when the pin is still absent after the attempt' {
+        # The host state that caused UM0031200: the install is refused and the pin never appears.
+        Mock Get-Module { @(FakeModule 'ExchangeOnlineManagement' '3.10.0') }
+        Mock Invoke-CtgPwshInstall {
+            [pscustomobject]@{ Code = 1; Tail = "The version '1.4.8.1' of module 'PackageManagement' is currently in use." }
+        }
+        Mock Write-Warning { }
+        Install-CtgExoPin -Version '3.9.2'
+        $script:LastExoPinError | Should -Not -BeNullOrEmpty
+        $script:LastExoPinError | Should -Match 'PackageManagement'
+    }
+
+    It 'names the build it will fall back to, so the reason is actionable' {
+        # A version that appears nowhere in the source, so this can only pass by actually reading the
+        # host's installed build -- not by a hardcoded '3.10.0' in the message.
+        Mock Get-Module { @(FakeModule 'ExchangeOnlineManagement' '3.11.7') }
+        Mock Invoke-CtgPwshInstall { [pscustomobject]@{ Code = 1; Tail = 'gallery unreachable' } }
+        Mock Write-Warning { }
+        Install-CtgExoPin -Version '3.9.2'
+        $script:LastExoPinError | Should -Match '3\.11\.7'
+    }
+
+    It 'clears a previously recorded failure once the pin IS present' {
+        # The agent having the pin outranks a reason it did not, earlier -- mirrors the browser capability.
+        $script:LastExoPinError = 'a stale reason from the last boot'
+        Mock Get-Module { @(FakeModule 'ExchangeOnlineManagement' '3.9.2') }
+        Mock Invoke-CtgPwshInstall { throw 'must not be called when the pin is already present' }
+        Install-CtgExoPin -Version '3.9.2'
+        $script:LastExoPinError | Should -BeNullOrEmpty
+    }
+
+    It 'never throws when the child process itself cannot be started' {
+        Mock Get-Module { @(FakeModule 'ExchangeOnlineManagement' '3.10.0') }
+        Mock Invoke-CtgPwshInstall { throw 'pwsh not found' }
+        Mock Write-Warning { }
+        { Install-CtgExoPin -Version '3.9.2' } | Should -Not -Throw
+        $script:LastExoPinError | Should -Not -BeNullOrEmpty
     }
 }

@@ -9,7 +9,7 @@ import { authenticateAgent } from "@/lib/auth/agent-auth";
 import { HttpError } from "@/lib/jobs/types";
 
 export async function POST(request: Request) {
-  let body: { agentId?: unknown; version?: unknown; semver?: unknown; startedAt?: unknown; capabilities?: unknown; appUrl?: unknown; migrateError?: unknown; browserInstallError?: unknown };
+  let body: { agentId?: unknown; version?: unknown; semver?: unknown; startedAt?: unknown; capabilities?: unknown; appUrl?: unknown; migrateError?: unknown; browserInstallError?: unknown; exoPinOk?: unknown; exoPinError?: unknown };
   try {
     body = await request.json();
   } catch {
@@ -25,10 +25,14 @@ export async function POST(request: Request) {
   // Why the background browser-sidecar install did not end with a usable sidecar. Absent while an
   // install is still running, so "no field" must never be read as "it failed".
   const browserInstallError = typeof body.browserInstallError === "string" ? body.browserInstallError : null;
+  // The EXO pin has no capability to key off, so the runner states health explicitly. A pre-1.122
+  // runner sends neither field: exoPinOk stays null and nothing is written (absence != failure).
+  const exoPinOk = typeof body.exoPinOk === "boolean" ? body.exoPinOk : null;
+  const exoPinError = typeof body.exoPinError === "string" ? body.exoPinError : null;
 
   try {
     const authed = await authenticateAgent(db, request, typeof body.agentId === "string" ? body.agentId : null);
-    const out = await makeRunnerService(db).heartbeat(authed.id, version, semver, startedAt, capabilities, appUrl, migrateError, browserInstallError, authed.via);
+    const out = await makeRunnerService(db).heartbeat(authed.id, version, semver, startedAt, capabilities, appUrl, migrateError, browserInstallError, exoPinOk, exoPinError, authed.via);
     return NextResponse.json(out);
   } catch (e) {
     if (e instanceof HttpError) return NextResponse.json({ error: e.message }, { status: e.status });

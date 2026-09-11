@@ -113,6 +113,7 @@ export async function loadAgentsPage() {
       migratedAt: a.migratedAt?.toISOString() ?? null,
       migrateError: a.migrateError ?? null,
       browserInstallError: a.browserInstallError ?? null,
+      exoPinError: a.exoPinError ?? null,
       tokenConfirmedAt: a.tokenConfirmedAt?.toISOString() ?? null,
       tokenRefreshRequested: a.tokenRefreshRequested,
       tokenRefreshRequestedAt: a.tokenRefreshRequestedAt?.toISOString() ?? null,

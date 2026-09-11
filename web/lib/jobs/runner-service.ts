@@ -11,7 +11,8 @@ import { CONCURRENCY_KEY, resolveCaps, admitUnderCaps, governorActive, groupKey,
 // AppSetting key for the setup-state dispatch gate ({ enforceTested: boolean }, default off).
 export const SETUP_GATE_KEY = "setup_gate";
 import { isConvertConfirmed, isConvertStillComing } from "./mailbox-convert";
-import { jobResultEnvelope } from "./job-result";
+import { jobResultEnvelope } from "./job-result";
+
 import { cloudObjectFor, type CloudObject } from "./cloud-object";
 import { PASSWORD_RESET_SYSTEM_KEYS } from "./password-reset";
 import { ADHOC_SYSTEM_KEYS } from "./adhoc";
@@ -148,6 +149,19 @@ export function browserInstallPatch(
 ): { browserInstallError?: string | null } {
   if (capabilities?.includes("browser")) return { browserInstallError: null };
   if (browserInstallError != null) return { browserInstallError: browserInstallError.slice(0, 2000) };
+  return {};
+}
+
+// What to write for the EXO pin on this heartbeat. Mirrors browserInstallPatch exactly, with the
+// runner's explicit exoPinOk playing the role the 'browser' capability plays there: the pin has no
+// capability of its own, and an absent error cannot mean "healthy" because a pre-1.122 runner sends
+// neither field. So healthy is stated, not inferred.
+export function exoPinPatch(
+  exoPinOk: boolean | null | undefined,
+  exoPinError: string | null | undefined,
+): { exoPinError?: string | null } {
+  if (exoPinOk) return { exoPinError: null };
+  if (exoPinError != null) return { exoPinError: exoPinError.slice(0, 2000) };
   return {};
 }
 
@@ -465,7 +479,7 @@ export function makeRunnerService(db: PrismaClient) {
       return res.count;
     },
 
-    async heartbeat(agentId: string, version?: string | null, semver?: string | null, startedAt?: string | null, capabilities?: string[] | null, appUrl?: string | null, migrateError?: string | null, browserInstallError?: string | null, authVia?: "per-agent" | "shared" | null): Promise<{ ok: true; enabled: boolean; update: boolean; restart: boolean; discover: boolean; installBrowser: boolean; migrate: { appUrl: string } | null; drain: boolean; governorActive: boolean; provisionToken?: string }> {
+    async heartbeat(agentId: string, version?: string | null, semver?: string | null, startedAt?: string | null, capabilities?: string[] | null, appUrl?: string | null, migrateError?: string | null, browserInstallError?: string | null, exoPinOk?: boolean | null, exoPinError?: string | null, authVia?: "per-agent" | "shared" | null): Promise<{ ok: true; enabled: boolean; update: boolean; restart: boolean; discover: boolean; installBrowser: boolean; migrate: { appUrl: string } | null; drain: boolean; governorActive: boolean; provisionToken?: string }> {
       const agent = await db.agent.findUnique({ where: { id: agentId }, select: { id: true, version: true, semver: true, enabled: true, updateRequested: true, updateDeliveredAt: true, updateAttempts: true, updateStalledAt: true, updateStalledBuild: true, restartRequested: true, browserInstallRequested: true, migrateRequested: true, currentAppUrl: true, clientId: true, tokenRefreshRequested: true, tokenConfirmedAt: true, client: { select: { adDiscoverRequestedAt: true } } } });
       if (!agent) throw new HttpError(404, "unknown agent");
       // Tell an ENABLED agent to self-update at most once. Consume the flag with an ATOMIC
@@ -564,7 +578,7 @@ export function makeRunnerService(db: PrismaClient) {
       // Persist reported on-prem capabilities only when the runner sent them (1.31+). A legacy runner
       // passes null → keep whatever's stored (stays null → treated as capable). An empty array IS a
       // report ("can run no on-prem system") and is persisted as [].
-      await db.agent.update({ where: { id: agentId }, data: { lastSeenAt: new Date(), version: version ?? agent.version, semver: semver ?? agent.semver, ...(bootAt ? { bootAt } : {}), ...(capabilities != null ? { capabilities: capabilities as Prisma.InputJsonValue } : {}), ...(appUrl ? { currentAppUrl: appUrl } : {}), ...(decision.converged ? { migratedAt: new Date(), migrateError: null, migrateRequested: false } : migrateError != null ? { migrateError } : {}), ...browserInstallPatch(capabilities, browserInstallError) } });
+      await db.agent.update({ where: { id: agentId }, data: { lastSeenAt: new Date(), version: version ?? agent.version, semver: semver ?? agent.semver, ...(bootAt ? { bootAt } : {}), ...(capabilities != null ? { capabilities: capabilities as Prisma.InputJsonValue } : {}), ...(appUrl ? { currentAppUrl: appUrl } : {}), ...(decision.converged ? { migratedAt: new Date(), migrateError: null, migrateRequested: false } : migrateError != null ? { migrateError } : {}), ...browserInstallPatch(capabilities, browserInstallError), ...exoPinPatch(exoPinOk, exoPinError) } });
       // A failed PROOF migration (the "prove it on one agent first" canary) clears the pending proof
       // right here, server-side — otherwise every admin's Agents page would keep waiting to offer
       // "move all the others" on a canary that already gave its answer. The row still shows the

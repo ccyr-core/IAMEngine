@@ -332,3 +332,4 @@ export { entry as anniversaryEgg } from "./anniversary-egg";
 export { entry as locationsActiveFilterFixed } from "./locations-active-filter-fixed";
 
 export { entry as restoreDrillSelfHeal } from "./restore-drill-self-heal";
+export { entry as exoPinSaysWhy } from "./exo-pin-says-why";

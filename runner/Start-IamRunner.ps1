@@ -227,6 +227,25 @@ if ($adReady) {
 } else {
     Write-Warning "ActiveDirectory module could not be loaded on this host — AD jobs will be withheld (this agent reports no 'active-directory' capability)."
 }
+# Install a module in a CLEAN child pwsh. By the time a self-heal runs, THIS process has imported
+# Graph, ActiveDirectory and a dozen Coretelligent.* modules, and PowerShellGet then refuses outright:
+# "The version '1.4.8.1' of module 'PackageManagement' is currently in use. Retry the operation after
+# closing the applications." A child started with -NoProfile has none of that loaded, so the install
+# proceeds. Returns { Code; Tail } (the shape Invoke-CtgToolProcess uses); a non-zero exit is data,
+# not an exception — only a failure to START the child throws.
+function Invoke-CtgPwshInstall {
+    param([Parameter(Mandatory)][string]$Name,
+          [Parameter(Mandatory)][string]$Version,
+          [string]$Scope = 'CurrentUser')
+    $pwshPath = (Get-Process -Id $PID).Path
+    if (-not $pwshPath) { $pwshPath = (Get-Command pwsh -ErrorAction SilentlyContinue).Source }
+    if (-not $pwshPath) { throw 'cannot locate pwsh to run the install in a clean process' }
+    $cmd = "Install-Module -Name '$Name' -RequiredVersion '$Version' -Scope $Scope -Force -AllowClobber -Confirm:`$false -AcceptLicense -ErrorAction Stop"
+    $out = & $pwshPath -NoProfile -NonInteractive -Command $cmd 2>&1
+    $tail = (@($out) | Where-Object { $_ } | ForEach-Object { [string]$_ } | Select-Object -Last 4) -join ' | '
+    return [pscustomobject]@{ Code = [int]$LASTEXITCODE; Tail = $tail }
+}
+
 # Self-heal the pinned EXO build if it's absent — mirrors Install-CtgMissingGraphModules above. Without
 # it, a host that only has the broken 3.10.0 (whose REST cmdlets call the removed
 # HttpResponseMessage.GetResponseHeader() on PS7.6) silently falls back to it and EVERY Exchange job
@@ -236,17 +255,36 @@ function Install-CtgExoPin {
     param([Parameter(Mandatory)][string]$Version)
     $have = Get-Module -ListAvailable -Name ExchangeOnlineManagement -ErrorAction SilentlyContinue |
         Where-Object { $_.Version -eq [version]$Version }
-    if ($have) { return }
+    # Having the pin outranks any reason we did not have it earlier — clear the recorded failure.
+    if ($have) { $script:LastExoPinError = $null; return }
     Write-Warning "ExchangeOnlineManagement $Version (the PS7.6-safe pin) not installed — installing it so Exchange jobs don't fall back to a build that breaks on 'GetResponseHeader'."
     Initialize-CtgGallery
+    $tail = ''
     try {
-        Install-Module ExchangeOnlineManagement -RequiredVersion $Version -Scope CurrentUser -Force -AllowClobber -Confirm:$false -AcceptLicense -ErrorAction Stop
-        Write-Host "  installed ExchangeOnlineManagement $Version" -ForegroundColor Yellow
+        $r = Invoke-CtgPwshInstall -Name 'ExchangeOnlineManagement' -Version $Version -Scope 'CurrentUser'
+        $tail = [string]$r.Tail
     } catch {
-        Write-Warning "  could not install ExchangeOnlineManagement ${Version}: $($_.Exception.Message)"
+        $tail = $_.Exception.Message
     }
+    $now = Get-Module -ListAvailable -Name ExchangeOnlineManagement -ErrorAction SilentlyContinue |
+        Where-Object { $_.Version -eq [version]$Version }
+    if ($now) {
+        $script:LastExoPinError = $null
+        Write-Host "  installed ExchangeOnlineManagement $Version" -ForegroundColor Yellow
+        return
+    }
+    # Still absent. Say what will be loaded INSTEAD: that is the fact that decides whether Exchange
+    # works at all, and it used to reach nobody — this warning goes to stdout, which a Windows SYSTEM
+    # scheduled task discards. Reported on the heartbeat as exoPinError so the Agents page shows it.
+    $others = @(Get-Module -ListAvailable -Name ExchangeOnlineManagement -ErrorAction SilentlyContinue | Sort-Object Version -Descending)
+    $fallback = if ($others.Count) { [string]$others[0].Version } else { 'none — Exchange steps cannot run at all' }
+    $script:LastExoPinError = "could not install the ExchangeOnlineManagement $Version pin; Exchange jobs will load $fallback instead. Reason: $tail"
+    Write-Warning "  $script:LastExoPinError"
 }
 # Pull the pin in before we resolve which build to load, so the healthy path below finds it present.
+# Initialised HERE, not beside $script:LastMigrateError further down — that runs after this point and
+# would erase the verdict the self-heal just recorded.
+$script:LastExoPinError = $null
 Install-CtgExoPin -Version $ExoModuleVersion
 $exoAvail = Get-Module -ListAvailable ExchangeOnlineManagement
 if ($exoAvail) {
@@ -3468,6 +3506,10 @@ while ($true) {
         $hbBody = @{ agentId = $AgentId; version = $script:RunnerBuild; semver = $script:RunnerSemver; startedAt = $script:RunnerStartedAt; capabilities = $script:RunnerCapabilitiesJson; appUrl = $AppUrl; authMode = $(if ($script:AgentToken) { 'per-agent' } else { 'shared' }) }
         if ($script:LastMigrateError) { $hbBody['migrateError'] = $script:LastMigrateError }
         if ($script:LastBrowserInstallError) { $hbBody['browserInstallError'] = $script:LastBrowserInstallError }
+        # The EXO pin has no capability to key off, so health is STATED rather than inferred: exoPinOk
+        # clears any recorded reason server-side, exactly as reporting 'browser' does for the sidecar.
+        $hbBody['exoPinOk'] = [bool](-not $script:LastExoPinError)
+        if ($script:LastExoPinError) { $hbBody['exoPinError'] = $script:LastExoPinError }
         $hb = Invoke-AppApi POST '/api/agents/heartbeat' $hbBody
         if ($hb.enabled -eq $false) { Write-Warning "agent disabled server-side; stopping."; break }
         # Adopt a delivered per-agent token BEFORE update/restart handling below: the token is a
