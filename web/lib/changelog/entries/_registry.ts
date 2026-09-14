@@ -335,3 +335,5 @@ export { entry as restoreDrillSelfHeal } from "./restore-drill-self-heal";
 export { entry as exoPinSaysWhy } from "./exo-pin-says-why";
 
 export { entry as inflightMarkerPerAgent } from "./inflight-marker-per-agent";
+
+export { entry as browserInstallSurvivesUpdate } from "./browser-install-survives-update";
