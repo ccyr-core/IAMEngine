@@ -345,3 +345,5 @@ export { entry as browserInstallReasonCaptured } from "./browser-install-reason-
 export { entry as managerResolvedByEmail } from "./manager-resolved-by-email";
 
 export { entry as systemConfigIntentGuard } from "./system-config-intent-guard";
+
+export { entry as licenseHoldCoversMailboxSystems } from "./license-hold-covers-mailbox-systems";
