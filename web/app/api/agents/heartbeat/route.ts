@@ -9,7 +9,7 @@ import { authenticateAgent } from "@/lib/auth/agent-auth";
 import { HttpError } from "@/lib/jobs/types";
 
 export async function POST(request: Request) {
-  let body: { agentId?: unknown; version?: unknown; semver?: unknown; startedAt?: unknown; capabilities?: unknown; appUrl?: unknown; migrateError?: unknown };
+  let body: { agentId?: unknown; version?: unknown; semver?: unknown; startedAt?: unknown; capabilities?: unknown; appUrl?: unknown; migrateError?: unknown; browserInstallError?: unknown };
   try {
     body = await request.json();
   } catch {
@@ -22,10 +22,13 @@ export async function POST(request: Request) {
   const capabilities = parseCapabilities(body.capabilities); // null = not reported (legacy runner)
   const appUrl = typeof body.appUrl === "string" ? body.appUrl : null; // the base URL the agent is polling (1.62+)
   const migrateError = typeof body.migrateError === "string" ? body.migrateError : null; // last migrate failure the agent hit
+  // Why the background browser-sidecar install did not end with a usable sidecar. Absent while an
+  // install is still running, so "no field" must never be read as "it failed".
+  const browserInstallError = typeof body.browserInstallError === "string" ? body.browserInstallError : null;
 
   try {
     const authed = await authenticateAgent(db, request, typeof body.agentId === "string" ? body.agentId : null);
-    const out = await makeRunnerService(db).heartbeat(authed.id, version, semver, startedAt, capabilities, appUrl, migrateError, authed.via);
+    const out = await makeRunnerService(db).heartbeat(authed.id, version, semver, startedAt, capabilities, appUrl, migrateError, browserInstallError, authed.via);
     return NextResponse.json(out);
   } catch (e) {
     if (e instanceof HttpError) return NextResponse.json({ error: e.message }, { status: e.status });

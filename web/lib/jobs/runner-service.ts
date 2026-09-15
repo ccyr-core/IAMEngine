@@ -137,6 +137,20 @@ function connTestRow(
 // case-then-sequence order so a case's steps still run in order.
 export const CLAIM_ORDER: Prisma.JobOrderByWithRelationInput[] = [{ singleRun: "desc" }, { caseRequestId: "asc" }, { sequence: "asc" }];
 
+// What to write for the browser sidecar on this heartbeat. Reporting 'browser' clears any recorded
+// error unconditionally — the capability is the agent saying the sidecar works now, which outranks a
+// reason it did not five minutes ago. Otherwise record whatever reason the agent sent, and say
+// nothing when it sent none (an install still running reports neither, and must not be mistaken for
+// one that failed).
+export function browserInstallPatch(
+  capabilities: string[] | null | undefined,
+  browserInstallError: string | null | undefined,
+): { browserInstallError?: string | null } {
+  if (capabilities?.includes("browser")) return { browserInstallError: null };
+  if (browserInstallError != null) return { browserInstallError: browserInstallError.slice(0, 2000) };
+  return {};
+}
+
 // A claimed job whose runner never posts a result is reclaimed after this long (crash/stall).
 const LEASE_MS = 10 * 60 * 1000;
 // A "running" job whose progress hasn't moved in this long has wedged (the worker died / a step hung
@@ -451,7 +465,7 @@ export function makeRunnerService(db: PrismaClient) {
       return res.count;
     },
 
-    async heartbeat(agentId: string, version?: string | null, semver?: string | null, startedAt?: string | null, capabilities?: string[] | null, appUrl?: string | null, migrateError?: string | null, authVia?: "per-agent" | "shared" | null): Promise<{ ok: true; enabled: boolean; update: boolean; restart: boolean; discover: boolean; installBrowser: boolean; migrate: { appUrl: string } | null; drain: boolean; governorActive: boolean; provisionToken?: string }> {
+    async heartbeat(agentId: string, version?: string | null, semver?: string | null, startedAt?: string | null, capabilities?: string[] | null, appUrl?: string | null, migrateError?: string | null, browserInstallError?: string | null, authVia?: "per-agent" | "shared" | null): Promise<{ ok: true; enabled: boolean; update: boolean; restart: boolean; discover: boolean; installBrowser: boolean; migrate: { appUrl: string } | null; drain: boolean; governorActive: boolean; provisionToken?: string }> {
       const agent = await db.agent.findUnique({ where: { id: agentId }, select: { id: true, version: true, semver: true, enabled: true, updateRequested: true, updateDeliveredAt: true, updateAttempts: true, updateStalledAt: true, updateStalledBuild: true, restartRequested: true, browserInstallRequested: true, migrateRequested: true, currentAppUrl: true, clientId: true, tokenRefreshRequested: true, tokenConfirmedAt: true, client: { select: { adDiscoverRequestedAt: true } } } });
       if (!agent) throw new HttpError(404, "unknown agent");
       // Tell an ENABLED agent to self-update at most once. Consume the flag with an ATOMIC
@@ -550,7 +564,7 @@ export function makeRunnerService(db: PrismaClient) {
       // Persist reported on-prem capabilities only when the runner sent them (1.31+). A legacy runner
       // passes null → keep whatever's stored (stays null → treated as capable). An empty array IS a
       // report ("can run no on-prem system") and is persisted as [].
-      await db.agent.update({ where: { id: agentId }, data: { lastSeenAt: new Date(), version: version ?? agent.version, semver: semver ?? agent.semver, ...(bootAt ? { bootAt } : {}), ...(capabilities != null ? { capabilities: capabilities as Prisma.InputJsonValue } : {}), ...(appUrl ? { currentAppUrl: appUrl } : {}), ...(decision.converged ? { migratedAt: new Date(), migrateError: null, migrateRequested: false } : migrateError != null ? { migrateError } : {}) } });
+      await db.agent.update({ where: { id: agentId }, data: { lastSeenAt: new Date(), version: version ?? agent.version, semver: semver ?? agent.semver, ...(bootAt ? { bootAt } : {}), ...(capabilities != null ? { capabilities: capabilities as Prisma.InputJsonValue } : {}), ...(appUrl ? { currentAppUrl: appUrl } : {}), ...(decision.converged ? { migratedAt: new Date(), migrateError: null, migrateRequested: false } : migrateError != null ? { migrateError } : {}), ...browserInstallPatch(capabilities, browserInstallError) } });
       // A failed PROOF migration (the "prove it on one agent first" canary) clears the pending proof
       // right here, server-side — otherwise every admin's Agents page would keep waiting to offer
       // "move all the others" on a canary that already gave its answer. The row still shows the

@@ -63,6 +63,7 @@ export type AgentVM = {
   migrateDeliveredAt: string | null;
   migratedAt: string | null;
   migrateError: string | null;
+  browserInstallError: string | null;
   // Per-agent auth: joint (shared) token vs its own. tokenConfirmedAt is set the first time the
   // runner authenticates WITH its per-agent token — everything after that is a rotate, not a switch.
   tokenConfirmedAt: string | null;
@@ -163,16 +164,20 @@ function browserInstallStatus(a: AgentVM): { label: string; color: string } | nu
   if (a.browserInstallDeliveredAt) {
     const del = new Date(a.browserInstallDeliveredAt).getTime();
     const installed = a.capabilities?.includes("browser");
-    if (Date.now() - del > 30 * 60_000) {
-      // Long past the download window. If the capability still is not there the install did not take,
-      // and going quiet here is what let that hide: it was requested twice on the central runner and
-      // failed both times, while every browser job queued behind it sat pending. The absence of a
-      // 'browser' chip was the only clue, and an absence is not something anyone spots. Say it.
-      if (installed) return null;
-      return { label: "⚠ browser automation was installed but this runner still does not report it — browser jobs (Spanning force sync, Entra device code) cannot run until it does", color: "var(--warn-fg)" };
+    if (installed) return Date.now() - del > 30 * 60_000 ? null : { label: `✓ browser automation installed${by} — this runner now takes browser jobs`, color: "var(--ok-fg)" };
+    // The runner tells us when the install finished WITHOUT a usable sidecar, and why. That beats
+    // inferring failure from a stopwatch: the install is three sequential downloads each allowed 15
+    // minutes, so a slow-but-fine install can legitimately run for the best part of an hour.
+    if (a.browserInstallError) {
+      return { label: `⚠ browser automation install failed — ${a.browserInstallError}`, color: "var(--err-fg)" };
     }
-    if (installed) return { label: `✓ browser automation installed${by} — this runner now takes browser jobs`, color: "var(--ok-fg)" };
-    return { label: `↻ installing browser automation${by} — Node + Playwright + Chromium downloading in the background…`, color: "var(--info-fg)" };
+    // No verdict yet. Still say something past the point where it should have finished, because going
+    // quiet is what hid two failed installs: the only remaining signal was a missing capability chip,
+    // and an absence is not something anyone spots.
+    if (Date.now() - del > 50 * 60_000) {
+      return { label: "⚠ browser automation was requested but this runner still does not report it, and has not said why — check runner.log on the host for 'browser sidecar'", color: "var(--warn-fg)" };
+    }
+    return { label: `↻ installing browser automation${by} — Node + Playwright + Chromium downloading in the background (can take up to ~45 min on a cold host)…`, color: "var(--info-fg)" };
   }
   return null;
 }

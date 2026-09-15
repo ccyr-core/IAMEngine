@@ -29,6 +29,7 @@ export { entry as auditWatchedGraphAppPerms } from "./audit-watched-graph-app-pe
 export { entry as azureInventoryAndS1Roster } from "./azure-inventory-and-s1-roster";
 export { entry as backupAzureRestoreDrill } from "./backup-azure-restore-drill";
 export { entry as baypineRunFixesAdoptRetryArchive } from "./baypine-run-fixes-adopt-retry-archive";
+export { entry as browserInstallSaysWhy } from "./browser-install-says-why";
 export { entry as buildFromSystemsPreview } from "./build-from-systems-preview";
 export { entry as calendarReviewerChangesExisting } from "./calendar-reviewer-changes-existing";
 export { entry as calendarReviewerGrants } from "./calendar-reviewer-grants";
