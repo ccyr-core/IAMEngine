@@ -337,3 +337,5 @@ export { entry as exoPinSaysWhy } from "./exo-pin-says-why";
 export { entry as inflightMarkerPerAgent } from "./inflight-marker-per-agent";
 
 export { entry as browserInstallSurvivesUpdate } from "./browser-install-survives-update";
+
+export { entry as containerMigratesBeforeServing } from "./container-migrates-before-serving";

@@ -75,4 +75,6 @@ WORKDIR /app/web
 
 EXPOSE 3000
 
-CMD ["npm", "run", "start", "--", "-H", "0.0.0.0", "-p", "3000"]
+# Migrate, then serve — see web/scripts/docker-entrypoint.sh for why this is not just `npm start`.
+# Invoked via `sh` rather than relying on the execute bit, which a Windows checkout does not carry.
+CMD ["sh", "/app/web/scripts/docker-entrypoint.sh"]
