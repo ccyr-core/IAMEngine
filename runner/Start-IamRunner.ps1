@@ -3437,6 +3437,34 @@ $script:OnPremCapabilityProbe = [ordered]@{
 $script:RunnerCapabilities = @(
     $script:OnPremCapabilityProbe.Keys | Where-Object { Get-Command $script:OnPremCapabilityProbe[$_] -ErrorAction SilentlyContinue }
 )
+# What a finished background job actually SAID. Receive-Job returns only the success stream, and
+# `2>&1` merges only the ERROR stream -- so a job whose diagnosis is written with Write-Warning and
+# Write-Host (which is every Coretelligent.* installer) returns nothing but its scriptblock's return
+# value. For a failed install that value is $false, which then reads as "no output at all".
+#
+# That is not hypothetical: it is why every failed browser install reported "finished without a
+# usable sidecar and gave no output" instead of the npm exit code the runner had in hand. Read the
+# job's OWN stream collections instead -- Warning, Error and Information are all held on the child
+# job object -- and deliberately ignore Output, because a bare True/False is not a diagnosis.
+# Never throws: this runs while reporting a failure and must not become one.
+function Get-CtgJobDiagnostic {
+    param($Job, [int]$Lines = 4)
+    try {
+        if (-not $Job) { return '' }
+        $cj = if ($Job.ChildJobs -and $Job.ChildJobs.Count) { $Job.ChildJobs[0] } else { $Job }
+        $all = New-Object System.Collections.Generic.List[string]
+        foreach ($i in @($cj.Information)) { if ($i) { $all.Add([string]$i.MessageData) } }
+        foreach ($w in @($cj.Warning))     { if ($w) { $all.Add([string]$w.Message) } }
+        foreach ($e in @($cj.Error))       { if ($e) { $all.Add([string]$e) } }
+        # A job killed by a THROW puts nothing in .Error — the exception is on JobStateInfo.Reason,
+        # and without this a crashed installer still looks like it said nothing.
+        if ($cj.JobStateInfo -and $cj.JobStateInfo.Reason) { $all.Add([string]$cj.JobStateInfo.Reason.Message) }
+        $kept = @($all | Where-Object { $_ -and $_.Trim() })
+        if (-not $kept.Count) { return '' }
+        return (($kept | Select-Object -Last $Lines) -join ' | ')
+    } catch { return '' }
+}
+
 # Self-heal the browser sidecar ONCE at startup (mirrors the RSAT block above). Capabilities are
 # computed here, once per process, and the claim gate WITHHOLDS browser jobs from agents not reporting
 # 'browser' — so a lazy first-use install could never happen (the agent would never receive the job).
@@ -3555,11 +3583,10 @@ while ($true) {
             # its output tail, a missing node, an absent sidecar directory) and this used to pipe all of
             # it to Out-Null — so a failed install left the operator a guess ("no egress?") in a local
             # log file and nothing at all in the app. Two installs failed that way unnoticed.
-            $detail = ''
-            try {
-                $out = Receive-Job -Job $script:BrowserInstallJob -ErrorAction SilentlyContinue 2>&1
-                $detail = (@($out) | Where-Object { $_ } | ForEach-Object { [string]$_ } | Select-Object -Last 4) -join ' | '
-            } catch { }
+            # Read the job's streams BEFORE Receive-Job drains them. Warning/Information is where
+            # Install-CtgBrowser's reason lives; Receive-Job's success output is just a bool.
+            $detail = Get-CtgJobDiagnostic -Job $script:BrowserInstallJob
+            try { $null = Receive-Job -Job $script:BrowserInstallJob -ErrorAction SilentlyContinue } catch { }
             try { Remove-Job -Job $script:BrowserInstallJob -Force -ErrorAction SilentlyContinue } catch { }
             $script:BrowserInstallJob = $null
             if (Test-CtgBrowserAvailable) {
@@ -3571,7 +3598,7 @@ while ($true) {
             } else {
                 # Reported on the next heartbeat (see $hbBody) so the Agents page shows the reason
                 # instead of a spinner that never resolves.
-                $script:LastBrowserInstallError = if ($detail) { $detail } else { "the install job finished without a usable sidecar and gave no output — check runner.log on this host for 'browser sidecar'" }
+                $script:LastBrowserInstallError = if ($detail) { $detail } else { "the install finished without a usable sidecar and reported nothing at all. runner.log will not have it either (that file holds only Write-CtgLog lines, and on a Windows SYSTEM task there is no stdout log). Run this on the host to see it directly: Import-Module <runner>/modules/Coretelligent.Browser -Force; Install-CtgBrowser -BootstrapNode" }
                 Write-Warning "browser sidecar install did not complete: $script:LastBrowserInstallError — browser jobs stay withheld from this agent. Set IAM_RUNNER_NO_BROWSER_INSTALL=1 to stop retrying."
             }
         }

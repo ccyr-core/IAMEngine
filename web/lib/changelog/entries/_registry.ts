@@ -339,3 +339,5 @@ export { entry as inflightMarkerPerAgent } from "./inflight-marker-per-agent";
 export { entry as browserInstallSurvivesUpdate } from "./browser-install-survives-update";
 
 export { entry as containerMigratesBeforeServing } from "./container-migrates-before-serving";
+
+export { entry as browserInstallReasonCaptured } from "./browser-install-reason-captured";
