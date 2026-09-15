@@ -187,3 +187,21 @@ fixed on 2026-09-14/15 are all the same defect: the engine knew what was wrong a
 reads, or said something untrue. Five of the last seven production issues were failures of *reporting*, not
 of execution. That is worth treating as a theme rather than as six separate tickets — the next one will
 also be a reporting bug.
+
+## Corrections to this spec, made while building from it
+
+- **#108 does NOT pair with #131.** Ranked second here on the assumption they share a root cause. They
+  do not. The offboard has resolved the leaver by email since `b3495481` (2026-07-14), a month before
+  #108 was filed on 2026-08-18, and the reported case UM0030657 stored
+  `userPrincipalName: calin.meserschmidt@puretechscientific.com` — full, untruncated — and completed.
+  Whatever the requester saw truncated is not what the engine consumed. #108 stays open and unbuilt:
+  it needs a case that actually failed, not a fix aimed at a symptom that does not reproduce. #131 was
+  built alone (PR #85).
+
+  Worth noting *why* the pairing looked right: both quote a ServiceNow field with a character limit,
+  and #131's fix is exactly the one #108 would have needed. Shared symptom, different code path — the
+  offboard path had already been fixed and the onboard path never was.
+
+- **#172 and #137 are closed** (resolved 2026-09-15, runner 1.122.0). **#125 was left open** pending a
+  re-run, for the reason given above: "module absent" and "module present but broken" are different
+  states and only the second is proven fixed.
