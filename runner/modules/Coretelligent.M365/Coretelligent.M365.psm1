@@ -1956,7 +1956,7 @@ function Invoke-CtgM365Offboarding {
                 # Authorization failed'. Matching only the first sent the operator to the generic
                 # "could not read MFA methods" line below, which never names the permission to grant.
                 if ($msg -match 'Authorization_RequestDenied|accessDenied|Request Authorization failed|Forbidden|403|Insufficient privileges') {
-                    $actions.Add("WARN MFA methods NOT removed — the user's second factors are STILL REGISTERED. Either the app registration lacks UserAuthenticationMethod.ReadWrite.All (grant it in Entra -> API permissions; see /help/cloud-auth), or it was granted after this runner last connected and the cached Graph token predates the consent — in that case restart the runner (or re-run this step after it reconnects) and it will succeed.")
+                    $actions.Add("WARN MFA methods NOT removed — the user's second factors are STILL REGISTERED. Check the grant first: across the fleet this is most often a tenant whose app registration simply lacks UserAuthenticationMethod.ReadWrite.All (grant it in Entra -> API permissions; see /help/cloud-auth). If the grant IS already there, the runner is holding a Graph token minted before the consent — RESTART the runner to clear it. Re-running this step alone will not: the runner connects once per tenant and reuses that token, so the retry presents the same one that was refused.")
                 }
                 # The auth-method cmdlets live in Microsoft.Graph.Identity.SignIns. If that module isn't on
                 # the host, PowerShell reports a bare "the term X is not recognized", which reads like a
