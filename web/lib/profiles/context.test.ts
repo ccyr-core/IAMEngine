@@ -77,3 +77,35 @@ test("buildPlanContext: phoneRequested derives from either phone intake flag", (
   // the raw flags still pass through for rules that target one specifically
   assert.equal(office.officeLineRequired, true);
 });
+
+// FR #0000131: "Should be grabbing the user's main email rather than the username in SNOW since that
+// has a character limit." The intake mapper already resolves the manager's real email from
+// customer_contact (intake-mapper.ts:209, whose own comment calls it "preferred for 365 lookup") --
+// but the context passed managerName, the readable display value, which is the field ServiceNow
+// truncates. Coretelligent.M365.psm1:1191-1209 looks the manager up by email OR name and warns
+// "manager not found in Entra (tried email + name)" when neither hits, so a truncated name means the
+// onboard silently finishes with no manager set.
+test("buildPlanContext: the manager is the resolved email when the intake found one", () => {
+  const { context } = buildPlanContext(
+    { managerEmail: "jim.goodmiller@example.com", managerName: "James (Jim) Goodmiller" },
+    {}
+  );
+  assert.equal(context.manager, "jim.goodmiller@example.com");
+});
+
+test("buildPlanContext: the manager falls back to the name when no email resolved", () => {
+  // customer_contact carried no email. The name is all we have, and M365 still tries a name lookup.
+  const { context } = buildPlanContext({ managerName: "James (Jim) Goodmiller" }, {});
+  assert.equal(context.manager, "James (Jim) Goodmiller");
+});
+
+test("buildPlanContext: a manually-entered `manager` still works when the intake has neither", () => {
+  const { context } = buildPlanContext({ manager: "someone@example.com" }, {});
+  assert.equal(context.manager, "someone@example.com");
+});
+
+test("buildPlanContext: an empty managerEmail does not shadow a usable name", () => {
+  // s() maps "" to undefined, so this must fall through rather than yielding an empty manager.
+  const { context } = buildPlanContext({ managerEmail: "", managerName: "Jim Goodmiller" }, {});
+  assert.equal(context.manager, "Jim Goodmiller");
+});

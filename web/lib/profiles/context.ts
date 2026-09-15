@@ -71,7 +71,14 @@ export function buildPlanContext(
     employmentType: s("employmentType"),
     startDate: s("startDate"),
     mobile: s("mobilePhone"),
-    manager: s("managerName") ?? s("manager"),
+    // Prefer the RESOLVED email over the display name. The intake mapper looks the manager up in
+    // customer_contact and stashes the real address (intake-mapper.ts:209, "preferred for 365
+    // lookup"), and the name it would otherwise pass is the ServiceNow field with a character limit
+    // -- long names arrive truncated, and Coretelligent.M365.psm1:1191 then finds no manager and only
+    // WARNs, so the onboard finishes with the manager link unset. Same treatment
+    // mirrorPermissionsFromUser has had since #61. The name stays as the fallback, because a contact
+    // with no email on file is still worth a name lookup. (FR #0000131)
+    manager: s("managerEmail") ?? s("managerName") ?? s("manager"),
     extension: s("extension"),
     did: s("did") ?? s("officePhone"),
     username: s("samAccountName"),
