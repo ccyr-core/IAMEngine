@@ -32,7 +32,20 @@ export type JobLite = {
 // Systems that can only ever succeed for a LICENSED M365 user: they discover the user via the
 // mailbox, which an unlicensed user does not have. Held while the m365/entra step reports a seat
 // shortage (FR #5) — dispatching them would just burn their retry budget on a guaranteed failure.
-export const LICENSE_DEPENDENT_SYSTEMS = ["mimecast", "spanning"];
+// Systems that CANNOT run against a user with no M365 licence, and are therefore held when the m365
+// step reports a seat shortage (FR #5 sets the hold; a licensed re-run releases it).
+//
+// Held because an unlicensed user has no mailbox and no provisioned services:
+//   mimecast, spanning  — discover the user via the mailbox; without one they burn their whole retry
+//                         budget on a guaranteed failure, which is why the hold was built.
+//   exchange            — mailbox properties, shared-mailbox access and distribution-group membership
+//                         all need a mailbox to exist.
+//   teams, sharepoint   — provisioned BY the licence; there is nothing to configure until it lands.
+//
+// Deliberately NOT held: active-directory, zoom, hardware, slack, knowbe4 and the rest. An AD account,
+// a laptop and a Zoom seat are all perfectly creatable while the licence is still being ordered, and
+// holding them would stall an onboarding for no reason. (FR #0000133)
+export const LICENSE_DEPENDENT_SYSTEMS = ["mimecast", "spanning", "exchange", "teams", "sharepoint"];
 
 const OPEN: JobStatus[] = ["pending", "dispatched", "running"];
 // Only "completed" truly blocks claiming. A "failed" case must NOT block its still-pending jobs: a
