@@ -337,6 +337,13 @@ model Agent {
   // discarded from the job. Two installs failed that way without anyone knowing why.
   // null once the sidecar reports ready; set to the reason when the job finishes without it.
   browserInstallError String?
+  // Why the ExchangeOnlineManagement pin (3.9.2) is not installed on this agent's host. The runner
+  // self-heals the pin at startup, but that install used to run INSIDE the runner process, where
+  // PowerShellGet refuses while PackageManagement is loaded — so it failed every startup and said so
+  // only via a Write-Warning, which a Windows SYSTEM scheduled task discards. The agent then loads
+  // 3.10.0, whose REST cmdlets call a method PS7.6 removed, and every Exchange job dies with
+  // "does not contain a method named 'GetResponseHeader'". null once the agent reports the pin healthy.
+  exoPinError String?
   // Operator-driven app-URL migration. The agent reports its current base URL each heartbeat
   // (currentAppUrl); a global target (AppSetting agent_migration) + this per-agent canary flag make
   // the heartbeat return migrate:{appUrl}. The runner verifies the new URL, rewrites its own supervisor

@@ -64,6 +64,7 @@ export type AgentVM = {
   migratedAt: string | null;
   migrateError: string | null;
   browserInstallError: string | null;
+  exoPinError: string | null;
   // Per-agent auth: joint (shared) token vs its own. tokenConfirmedAt is set the first time the
   // runner authenticates WITH its per-agent token — everything after that is a rotate, not a switch.
   tokenConfirmedAt: string | null;
@@ -180,6 +181,18 @@ function browserInstallStatus(a: AgentVM): { label: string; color: string } | nu
     return { label: `↻ installing browser automation${by} — Node + Playwright + Chromium downloading in the background (can take up to ~45 min on a cold host)…`, color: "var(--info-fg)" };
   }
   return null;
+}
+
+// The ExchangeOnlineManagement pin. Unlike the transient states above this is a STANDING condition
+// with no stopwatch: the runner re-evaluates it at every startup and states the verdict on every
+// heartbeat, so it clears the moment the pin is actually installed. It does not expire, because the
+// consequence does not either — without the pin the agent loads 3.10.0, whose REST cmdlets call a
+// method PS7.6 removed, and EVERY Exchange step on this agent fails with "does not contain a method
+// named 'GetResponseHeader'". That was invisible: the runner's own warning goes to stdout, which a
+// Windows SYSTEM scheduled task discards.
+function exoPinStatus(a: AgentVM): { label: string; color: string } | null {
+  if (!a.exoPinError) return null;
+  return { label: `⚠ Exchange is broken on this runner — ${a.exoPinError}`, color: "var(--err-fg)" };
 }
 
 // Live per-agent-token status from the lifecycle timestamps, mirroring updateStatus/restartStatus:
@@ -723,6 +736,7 @@ nohup ~/.local/pwsh/pwsh -NoProfile -ExecutionPolicy Bypass -File ~/iam-runner/S
                   {(() => { const u = updateStatus(a); return u ? <div className="note" style={{ color: u.color, marginTop: 2 }}>{u.label}</div> : null; })()}
                   {(() => { const r = restartStatus(a); return r ? <div className="note" style={{ color: r.color, marginTop: 2 }}>{r.label}</div> : null; })()}
                   {(() => { const b = browserInstallStatus(a); return b ? <div className="note" style={{ color: b.color, marginTop: 2 }}>{b.label}</div> : null; })()}
+                  {(() => { const x = exoPinStatus(a); return x ? <div className="note" style={{ color: x.color, marginTop: 2 }}>{x.label}</div> : null; })()}
                   {(() => { const m = migrateStatus(a, migration.targetUrl, nowMs); return m ? <div className="note" style={{ color: m.color, marginTop: 2 }}>{m.label}</div> : null; })()}
                 </td>
                 <td><AuthCell a={a} /></td>
@@ -810,6 +824,7 @@ nohup ~/.local/pwsh/pwsh -NoProfile -ExecutionPolicy Bypass -File ~/iam-runner/S
             const u = updateStatus(a);
             const r = restartStatus(a);
             const b = browserInstallStatus(a);
+            const x = exoPinStatus(a);
             const m = migrateStatus(a, migration.targetUrl, nowMs);
             const stuck = stuckLabel(a, ls.online, nowMs);
             return (
@@ -848,6 +863,7 @@ nohup ~/.local/pwsh/pwsh -NoProfile -ExecutionPolicy Bypass -File ~/iam-runner/S
                   {u && <div className="note" style={{ color: u.color, marginTop: 2 }}>{u.label}</div>}
                   {r && <div className="note" style={{ color: r.color, marginTop: 2 }}>{r.label}</div>}
                   {b && <div className="note" style={{ color: b.color, marginTop: 2 }}>{b.label}</div>}
+                  {x && <div className="note" style={{ color: x.color, marginTop: 2 }}>{x.label}</div>}
                   {m && <div className="note" style={{ color: m.color, marginTop: 2 }}>{m.label}</div>}
                 </td>
                 <td><AuthCell a={a} /></td>

@@ -227,6 +227,25 @@ if ($adReady) {
 } else {
     Write-Warning "ActiveDirectory module could not be loaded on this host — AD jobs will be withheld (this agent reports no 'active-directory' capability)."
 }
+# Install a module in a CLEAN child pwsh. By the time a self-heal runs, THIS process has imported
+# Graph, ActiveDirectory and a dozen Coretelligent.* modules, and PowerShellGet then refuses outright:
+# "The version '1.4.8.1' of module 'PackageManagement' is currently in use. Retry the operation after
+# closing the applications." A child started with -NoProfile has none of that loaded, so the install
+# proceeds. Returns { Code; Tail } (the shape Invoke-CtgToolProcess uses); a non-zero exit is data,
+# not an exception — only a failure to START the child throws.
+function Invoke-CtgPwshInstall {
+    param([Parameter(Mandatory)][string]$Name,
+          [Parameter(Mandatory)][string]$Version,
+          [string]$Scope = 'CurrentUser')
+    $pwshPath = (Get-Process -Id $PID).Path
+    if (-not $pwshPath) { $pwshPath = (Get-Command pwsh -ErrorAction SilentlyContinue).Source }
+    if (-not $pwshPath) { throw 'cannot locate pwsh to run the install in a clean process' }
+    $cmd = "Install-Module -Name '$Name' -RequiredVersion '$Version' -Scope $Scope -Force -AllowClobber -Confirm:`$false -AcceptLicense -ErrorAction Stop"
+    $out = & $pwshPath -NoProfile -NonInteractive -Command $cmd 2>&1
+    $tail = (@($out) | Where-Object { $_ } | ForEach-Object { [string]$_ } | Select-Object -Last 4) -join ' | '
+    return [pscustomobject]@{ Code = [int]$LASTEXITCODE; Tail = $tail }
+}
+
 # Self-heal the pinned EXO build if it's absent — mirrors Install-CtgMissingGraphModules above. Without
 # it, a host that only has the broken 3.10.0 (whose REST cmdlets call the removed
 # HttpResponseMessage.GetResponseHeader() on PS7.6) silently falls back to it and EVERY Exchange job
@@ -236,17 +255,36 @@ function Install-CtgExoPin {
     param([Parameter(Mandatory)][string]$Version)
     $have = Get-Module -ListAvailable -Name ExchangeOnlineManagement -ErrorAction SilentlyContinue |
         Where-Object { $_.Version -eq [version]$Version }
-    if ($have) { return }
+    # Having the pin outranks any reason we did not have it earlier — clear the recorded failure.
+    if ($have) { $script:LastExoPinError = $null; return }
     Write-Warning "ExchangeOnlineManagement $Version (the PS7.6-safe pin) not installed — installing it so Exchange jobs don't fall back to a build that breaks on 'GetResponseHeader'."
     Initialize-CtgGallery
+    $tail = ''
     try {
-        Install-Module ExchangeOnlineManagement -RequiredVersion $Version -Scope CurrentUser -Force -AllowClobber -Confirm:$false -AcceptLicense -ErrorAction Stop
-        Write-Host "  installed ExchangeOnlineManagement $Version" -ForegroundColor Yellow
+        $r = Invoke-CtgPwshInstall -Name 'ExchangeOnlineManagement' -Version $Version -Scope 'CurrentUser'
+        $tail = [string]$r.Tail
     } catch {
-        Write-Warning "  could not install ExchangeOnlineManagement ${Version}: $($_.Exception.Message)"
+        $tail = $_.Exception.Message
     }
+    $now = Get-Module -ListAvailable -Name ExchangeOnlineManagement -ErrorAction SilentlyContinue |
+        Where-Object { $_.Version -eq [version]$Version }
+    if ($now) {
+        $script:LastExoPinError = $null
+        Write-Host "  installed ExchangeOnlineManagement $Version" -ForegroundColor Yellow
+        return
+    }
+    # Still absent. Say what will be loaded INSTEAD: that is the fact that decides whether Exchange
+    # works at all, and it used to reach nobody — this warning goes to stdout, which a Windows SYSTEM
+    # scheduled task discards. Reported on the heartbeat as exoPinError so the Agents page shows it.
+    $others = @(Get-Module -ListAvailable -Name ExchangeOnlineManagement -ErrorAction SilentlyContinue | Sort-Object Version -Descending)
+    $fallback = if ($others.Count) { [string]$others[0].Version } else { 'none — Exchange steps cannot run at all' }
+    $script:LastExoPinError = "could not install the ExchangeOnlineManagement $Version pin; Exchange jobs will load $fallback instead. Reason: $tail"
+    Write-Warning "  $script:LastExoPinError"
 }
 # Pull the pin in before we resolve which build to load, so the healthy path below finds it present.
+# Initialised HERE, not beside $script:LastMigrateError further down — that runs after this point and
+# would erase the verdict the self-heal just recorded.
+$script:LastExoPinError = $null
 Install-CtgExoPin -Version $ExoModuleVersion
 $exoAvail = Get-Module -ListAvailable ExchangeOnlineManagement
 if ($exoAvail) {
@@ -2086,7 +2124,67 @@ function Set-CtgSelfHealRestart {
 # So: stamp the job on disk while it runs, clear it when it finishes, and on the next start report any
 # marker still lying there as a failure with a real reason. A killed process therefore turns into an
 # explained failure within one restart, not a silent 30-minute gap.
-$script:CtgInFlightFile = Join-Path $PSScriptRoot 'inflight.json'
+# Keyed by AGENT, and dot-prefixed, for three separate reasons — all of which bit core1748:
+#   1. A runner POOL and any second runner share one folder. The lock (.runner.<agentId>.lock) and the
+#      heartbeat (temp/iam-runner-<agentId>.heartbeat) are already per agent; this was not, so a second
+#      runner read the first one's marker at startup and posted its LIVE job to the app as failed.
+#   2. Get-CtgBuildId hashes every file in the folder except dot-segments, tests/dist/node_modules/
+#      scripts and *.log. A bare 'inflight.json' is none of those, so a runner that died mid-job came
+#      back hashing a build the app's bundle can never equal — and was told to self-update forever,
+#      which EXITS the process each time. The dot prefix takes it out of the hash entirely.
+#   3. The self-update prune skips dot-segments too, so the marker now survives a self-update instead
+#      of being deleted with the abandoned job still unreported.
+function Get-CtgInFlightPath {
+    param([Parameter(Mandatory)][string]$RunnerDir, [Parameter(Mandatory)][string]$AgentId)
+    return (Join-Path $RunnerDir ".inflight.$AgentId.json")
+}
+
+# Delete the pre-1.123 shared marker if this host still has one. It must go BEFORE Get-CtgBuildId runs
+# or it keeps skewing the build id (defect 2) for the life of the install. It is deliberately NOT
+# reported: the file carries no agent id, so on the very shared-folder host this fixes we cannot tell
+# whether it is ours or belongs to a runner still executing that job — reporting it would BE the bug.
+# Unreported, the job ages out of its claim lease, which is the pre-existing and safe behaviour.
+function Remove-CtgLegacyInFlight {
+    param([Parameter(Mandatory)][string]$RunnerDir)
+    $legacy = Join-Path $RunnerDir 'inflight.json'
+    try {
+        if (Test-Path -LiteralPath $legacy) { Remove-Item -LiteralPath $legacy -Force -ErrorAction Stop; return $true }
+    } catch { }
+    return $false
+}
+
+$script:CtgInFlightFile = Get-CtgInFlightPath -RunnerDir $PSScriptRoot -AgentId $AgentId
+
+# "Install browser automation" is a ONE-SHOT delivery: runner-service.ts clears browserInstallRequested
+# in the same statement that stamps browserInstallDeliveredAt, and never re-emits it. Holding that in
+# memory is not enough — the install is a Start-Job child that dies with its parent, and the poll loop
+# sits downstream of update/restart, both of which end in Invoke-CtgRelaunch. So the request is written
+# to DISK the moment it arrives and startup resumes it. Dot-prefixed + per agent for the same two
+# reasons as the in-flight marker above: out of the build-id hash and the prune, and un-stealable by a
+# second runner sharing the folder.
+function Get-CtgBrowserRequestPath {
+    param([Parameter(Mandatory)][string]$RunnerDir, [Parameter(Mandatory)][string]$AgentId)
+    return (Join-Path $RunnerDir ".browser-install.$AgentId.request")
+}
+
+function Set-CtgBrowserInstallRequest {
+    param([Parameter(Mandatory)][string]$RunnerDir, [Parameter(Mandatory)][string]$AgentId)
+    try {
+        [System.IO.File]::WriteAllText((Get-CtgBrowserRequestPath -RunnerDir $RunnerDir -AgentId $AgentId),
+            [string]([DateTimeOffset]::UtcNow.ToUnixTimeSeconds()))
+    } catch { }   # best-effort: bookkeeping must never fail a heartbeat
+}
+
+function Test-CtgBrowserInstallRequest {
+    param([Parameter(Mandatory)][string]$RunnerDir, [Parameter(Mandatory)][string]$AgentId)
+    return (Test-Path -LiteralPath (Get-CtgBrowserRequestPath -RunnerDir $RunnerDir -AgentId $AgentId))
+}
+
+function Clear-CtgBrowserInstallRequest {
+    param([Parameter(Mandatory)][string]$RunnerDir, [Parameter(Mandatory)][string]$AgentId)
+    $p = Get-CtgBrowserRequestPath -RunnerDir $RunnerDir -AgentId $AgentId
+    try { if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Force -ErrorAction Stop } } catch { }
+}
 
 function Set-CtgInFlight {
     param([Parameter(Mandatory)]$Job)
@@ -3308,6 +3406,11 @@ function Invoke-CtgCloudGroupDiscovery {
 # Build id of the code we're actually running = hash of our own files (matches the app's hash of the
 # bundle it serves). Reported on every heartbeat → accurate even if a past restart half-landed, with
 # no marker file to keep in sync.
+# Before the hash: a leftover pre-1.123 inflight.json would otherwise be folded into this runner's
+# build id, which the app's bundle can never match — the "told to update, never converges" loop.
+if (Remove-CtgLegacyInFlight -RunnerDir $PSScriptRoot) {
+    Write-CtgLog -Level INFO -Message "removed the legacy shared inflight.json (superseded by a per-agent marker; not reported — it carries no agent id)"
+}
 $script:RunnerBuild = Get-CtgBuildId
 
 # Human-readable release version from VERSION (e.g. "1.0.0"), reported alongside the build id so the
@@ -3345,18 +3448,25 @@ $script:RunnerCapabilities = @(
 # capability refresh below). Opt out with IAM_RUNNER_NO_BROWSER_INSTALL=1 — the installer sets that
 # for client-network agents, which have no business running headless Chromium on a DC.
 $script:BrowserInstallJob = $null
-if ($env:IAM_RUNNER_NO_BROWSER_INSTALL -eq '1') {
+# An operator's "Install browser" click, persisted by the poll loop below and resumed here. It
+# outranks IAM_RUNNER_NO_BROWSER_INSTALL (the operator is opting this host in, exactly as the
+# in-loop handler does) and it bootstraps a portable Node, which is the whole point: on a host with
+# no Node the plain self-heal below is gated off by Resolve-CtgNodeTool and can never fire.
+$script:BrowserInstallWanted = Test-CtgBrowserInstallRequest -RunnerDir $PSScriptRoot -AgentId $AgentId
+if ($env:IAM_RUNNER_NO_BROWSER_INSTALL -eq '1' -and -not $script:BrowserInstallWanted) {
     Write-Host "Browser sidecar: install disabled (IAM_RUNNER_NO_BROWSER_INSTALL=1) — browser jobs are withheld from this agent." -ForegroundColor DarkGray
 }
-elseif (-not (Test-CtgBrowserAvailable) -and (Resolve-CtgNodeTool 'node')) {
-    Write-Host "Browser sidecar not fully installed — installing Playwright + Chromium in the BACKGROUND (the runner keeps polling)…" -ForegroundColor Yellow
+elseif (-not (Test-CtgBrowserAvailable) -and ($script:BrowserInstallWanted -or (Resolve-CtgNodeTool 'node'))) {
+    if ($script:BrowserInstallWanted) { Write-Host "Resuming the operator's browser-automation install (requested earlier, not yet finished)…" -ForegroundColor Yellow }
+    else { Write-Host "Browser sidecar not fully installed — installing Playwright + Chromium in the BACKGROUND (the runner keeps polling)…" -ForegroundColor Yellow }
     try {
         $script:BrowserModulePath = (Get-Module Coretelligent.Browser).Path
         $script:BrowserInstallJob = Start-Job -Name 'ctg-browser-install' -ScriptBlock {
-            param($m)
+            param($m, $boot)
             Import-Module $m -Force
-            [bool](Install-CtgBrowser)
-        } -ArgumentList $script:BrowserModulePath
+            $r = if ($boot) { Install-CtgBrowser -BootstrapNode } else { Install-CtgBrowser }
+            [bool]$r
+        } -ArgumentList $script:BrowserModulePath, ([bool]$script:BrowserInstallWanted)
     } catch {
         Write-Warning "browser sidecar: could not start the background install: $($_.Exception.Message) — browser jobs will be withheld"
     }
@@ -3365,7 +3475,10 @@ elseif (-not (Test-CtgBrowserAvailable) -and (Resolve-CtgNodeTool 'node')) {
 # Node/Playwright sidecar is installed on this host, so the app's claim gate hands browser jobs (e.g.
 # spanning-force-sync) only to agents that can actually run them. The server ignores 'browser' in the
 # on-prem exclusion (it's not in ALWAYS_ON_PREM_SYSTEMS) and keys the separate browser gate off it.
-if (Test-CtgBrowserAvailable) { $script:RunnerCapabilities += 'browser' }
+if (Test-CtgBrowserAvailable) {
+    $script:RunnerCapabilities += 'browser'
+    Clear-CtgBrowserInstallRequest -RunnerDir $PSScriptRoot -AgentId $AgentId   # done — stop resuming it
+}
 # Serialize as a JSON-array STRING so 0- and 1-element lists stay arrays over the wire — a bare
 # @('active-directory') would ConvertTo-Json to a scalar and @() would pipe nothing (empty output),
 # making the server unable to tell "reported, none" (withhold all on-prem) from "legacy runner, not
@@ -3453,6 +3566,7 @@ while ($true) {
                 if ($script:RunnerCapabilities -notcontains 'browser') { $script:RunnerCapabilities += 'browser' }
                 $script:RunnerCapabilitiesJson = ($script:RunnerCapabilities | ConvertTo-Json -Compress -AsArray)
                 $script:LastBrowserInstallError = $null
+                Clear-CtgBrowserInstallRequest -RunnerDir $PSScriptRoot -AgentId $AgentId   # done — stop resuming it
                 Write-Host "Browser sidecar ready — now advertising 'browser' ($script:RunnerCapabilitiesJson)" -ForegroundColor Green
             } else {
                 # Reported on the next heartbeat (see $hbBody) so the Agents page shows the reason
@@ -3468,6 +3582,10 @@ while ($true) {
         $hbBody = @{ agentId = $AgentId; version = $script:RunnerBuild; semver = $script:RunnerSemver; startedAt = $script:RunnerStartedAt; capabilities = $script:RunnerCapabilitiesJson; appUrl = $AppUrl; authMode = $(if ($script:AgentToken) { 'per-agent' } else { 'shared' }) }
         if ($script:LastMigrateError) { $hbBody['migrateError'] = $script:LastMigrateError }
         if ($script:LastBrowserInstallError) { $hbBody['browserInstallError'] = $script:LastBrowserInstallError }
+        # The EXO pin has no capability to key off, so health is STATED rather than inferred: exoPinOk
+        # clears any recorded reason server-side, exactly as reporting 'browser' does for the sidecar.
+        $hbBody['exoPinOk'] = [bool](-not $script:LastExoPinError)
+        if ($script:LastExoPinError) { $hbBody['exoPinError'] = $script:LastExoPinError }
         $hb = Invoke-AppApi POST '/api/agents/heartbeat' $hbBody
         if ($hb.enabled -eq $false) { Write-Warning "agent disabled server-side; stopping."; break }
         # Adopt a delivered per-agent token BEFORE update/restart handling below: the token is a
@@ -3486,6 +3604,34 @@ while ($true) {
             Set-CtgAgentToken -Token ([string]$hb.provisionToken)
             Invoke-CtgRelaunch -Reason 'token-adopt'  # never returns
         }
+        # Operator requested "Install browser automation" (Agents page). Handled HERE, ahead of update
+        # and restart, for the same reason provisionToken is: installBrowser is a ONE-SHOT server-side
+        # consume (runner-service.ts clears the flag as it stamps the delivery) and BOTH of those
+        # branches end in Invoke-CtgRelaunch, which never returns. Handled after them, a click that
+        # arrived on the same heartbeat as an update was consumed and thrown away -- delivered, never
+        # acted on, no error ever recorded, and the Agents page stuck on "installed but this runner
+        # still does not report it" forever.
+        #
+        # Ordering alone would not be enough: the install is a background job that dies with this
+        # process, so an update seconds later still kills it. So the request is PERSISTED first and
+        # startup resumes it -- which also covers a watchdog restart mid-download. An explicit click
+        # outranks IAM_RUNNER_NO_BROWSER_INSTALL: the operator is opting this host in.
+        if ($hb.PSObject.Properties['installBrowser'] -and $hb.installBrowser -eq $true) {
+            Set-CtgBrowserInstallRequest -RunnerDir $PSScriptRoot -AgentId $AgentId
+            if (-not $script:BrowserInstallJob -and -not (Test-CtgBrowserAvailable)) {
+                Write-Host "Operator requested browser automation — installing Node (if needed) + Playwright + Chromium in the BACKGROUND…" -ForegroundColor Yellow
+                try {
+                    $script:BrowserModulePath = (Get-Module Coretelligent.Browser).Path
+                    $script:BrowserInstallJob = Start-Job -Name 'ctg-browser-install' -ScriptBlock {
+                        param($m)
+                        Import-Module $m -Force
+                        [bool](Install-CtgBrowser -BootstrapNode)
+                    } -ArgumentList $script:BrowserModulePath
+                } catch {
+                    Write-Warning "browser sidecar: could not start the operator-requested install: $($_.Exception.Message)"
+                }
+            }
+        }
         if ($hb.update -eq $true) {
             # Self-update. A STANDALONE runner (single-agent install, RUNNER_POOL_MEMBER unset) pulls +
             # relaunches itself, exactly as before. A POOL MEMBER yields: it must NOT pull, because N
@@ -3501,27 +3647,6 @@ while ($true) {
         }
         if ($hb.restart -eq $true) { Restart-CtgRunner }  # operator requested a plain restart — re-exec (never returns)
         if ($hb.discover -eq $true) { Invoke-CtgAdDiscovery }  # operator requested AD OU/group discovery
-        # Operator requested "Install browser automation" (Agents page). Unlike the startup self-heal,
-        # this bootstraps a PORTABLE Node into <runner>/.node when the host has none — the remote fix
-        # for an agent that could never self-heal (no Node → the elseif above never fired) without
-        # anyone shelling into the box. An EXPLICIT click also outranks IAM_RUNNER_NO_BROWSER_INSTALL
-        # (the installer's default for client-network agents): the operator is opting this host in.
-        # Same background rules as startup: never inline (a cold Node+Chromium download takes minutes
-        # and would stall heartbeats), one install job at a time, and the completion check above folds
-        # in the 'browser' capability on a later beat. Property guard: an older app never sends this.
-        if ($hb.PSObject.Properties['installBrowser'] -and $hb.installBrowser -eq $true -and -not $script:BrowserInstallJob -and -not (Test-CtgBrowserAvailable)) {
-            Write-Host "Operator requested browser automation — installing Node (if needed) + Playwright + Chromium in the BACKGROUND…" -ForegroundColor Yellow
-            try {
-                $script:BrowserModulePath = (Get-Module Coretelligent.Browser).Path
-                $script:BrowserInstallJob = Start-Job -Name 'ctg-browser-install' -ScriptBlock {
-                    param($m)
-                    Import-Module $m -Force
-                    [bool](Install-CtgBrowser -BootstrapNode)
-                } -ArgumentList $script:BrowserModulePath
-            } catch {
-                Write-Warning "browser sidecar: could not start the operator-requested install: $($_.Exception.Message)"
-            }
-        }
         if ($hb.migrate -and $hb.migrate.appUrl) { Invoke-CtgMigrate -NewAppUrl ([string]$hb.migrate.appUrl) }  # operator moved the app — verify + rewrite supervisor + switch
         # Maintenance drain (feature #7): the app is quiescing the fleet (e.g. an Azure host cutover).
         # Any job already in hand finished normally in the foreach below on a prior cycle (with its
