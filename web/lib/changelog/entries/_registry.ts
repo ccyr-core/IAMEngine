@@ -341,3 +341,5 @@ export { entry as browserInstallSurvivesUpdate } from "./browser-install-survive
 export { entry as containerMigratesBeforeServing } from "./container-migrates-before-serving";
 
 export { entry as browserInstallReasonCaptured } from "./browser-install-reason-captured";
+
+export { entry as managerResolvedByEmail } from "./manager-resolved-by-email";
