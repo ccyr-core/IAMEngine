@@ -26,3 +26,11 @@ web/lib/changelog/entries/_registry.ts merge=union
 # alone — the same on this box, in CI, and on a Linux host. Nothing here is Windows-line-ending
 # sensitive: PowerShell, Node and JSON all read LF natively.
 runner/** text eol=lf
+
+# Shell scripts must be LF wherever they are checked out. The Docker build context IS the working
+# tree, so a Windows checkout with core.autocrlf=true would bake a CRLF docker-entrypoint.sh into the
+# image, where `sh` fails on the stray carriage return with a message that names no file
+# ("/app/web/scripts/docker-entrypoint.sh: line 2: $'\r': command not found") and the container never
+# starts. Same class of bug as the runner bundle above: a file's meaning became a property of the
+# checkout rather than of the commit.
+*.sh text eol=lf
