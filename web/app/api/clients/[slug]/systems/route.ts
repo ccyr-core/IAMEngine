@@ -7,6 +7,7 @@ import type { Backbone } from "@prisma/client";
 import { db } from "@/lib/db";
 import { makeClientRepository } from "@/lib/clients/repository";
 import type { EditableSystem } from "@/lib/clients/types";
+import { validateSystemConfig } from "@/lib/clients/system-config";
 
 const BACKBONES = ["entra", "google", "ad_synced", "ad_standalone"];
 const LANES = ["always", "on_request", "never", "by_persona"];
@@ -45,6 +46,15 @@ export async function PUT(req: Request, { params }: { params: { slug: string } }
     return NextResponse.json({ error: "systems[] is required" }, { status: 422 });
   }
   const systems = body.systems.map(sanitize).filter((s): s is EditableSystem => s !== null);
+  // Every other field above is coerced into something valid; `config` used to be stored exactly as
+  // sent. That is how a system came to carry step configuration nested where nothing reads it, so the
+  // module fell through to its default and bought a licence the client had explicitly declined
+  // (FR #0000132). Refuse it here, server-side, rather than in the editor alone: a config accepted in
+  // silence and ignored in silence has no other moment where anyone would notice.
+  for (const s of systems) {
+    const bad = validateSystemConfig(s.config);
+    if (bad) return NextResponse.json({ error: `${s.systemKey}: ${bad}` }, { status: 422 });
+  }
   // dedupe by systemKey (last wins)
   const deduped = [...new Map(systems.map((s) => [s.systemKey, s])).values()];
 
