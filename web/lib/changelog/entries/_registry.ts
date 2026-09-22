@@ -349,3 +349,5 @@ export { entry as systemConfigIntentGuard } from "./system-config-intent-guard";
 export { entry as licenseHoldCoversMailboxSystems } from "./license-hold-covers-mailbox-systems";
 
 export { entry as mfaDenialHintRanksCauses } from "./mfa-denial-hint-ranks-causes";
+
+export { entry as passwordResetLetsEntraAnswer } from "./password-reset-lets-entra-answer";
