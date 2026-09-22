@@ -118,6 +118,7 @@ export { entry as googleCustomerIdValidation } from "./google-customer-id-valida
 export { entry as googleDelineaFieldNamesMatchTemplate } from "./google-delinea-field-names-match-template";
 export { entry as googleKeyConverterTool } from "./google-key-converter-tool";
 export { entry as googleKeyFileUpload } from "./google-key-file-upload";
+export { entry as googleOuChoice } from "./google-ou-choice";
 export { entry as googleOauthDeheadUa } from "./google-oauth-dehead-ua";
 export { entry as googleOauthErrorNamesTheBlock } from "./google-oauth-error-names-the-block";
 export { entry as googleSetupReopenFormAfterFailure } from "./google-setup-reopen-form-after-failure";

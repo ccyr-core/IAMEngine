@@ -14,6 +14,7 @@ import { loadRunReport } from "@/lib/cases/run-report";
 import { writeBackEnabled } from "@/lib/servicenow/worknote";
 import { PlaybookView } from "../_components/playbook-view";
 import { CaseSecretsPanel } from "../_components/case-secrets-panel";
+import { GoogleOuControl } from "../_components/google-ou-control";
 import { RunReportView } from "../_components/run-report-view";
 import { ChangePreview } from "../_components/change-preview";
 import { buildChangeDiffs } from "@/lib/cases/change-service";
@@ -28,6 +29,7 @@ import { IntakePanel } from "../_components/intake-panel";
 import { hasStartedJobs } from "@/lib/cases/job-status";
 import { isMilestoneCase } from "@/lib/eggs/occasions";
 import { pickResetSourceJob } from "@/lib/jobs/password-reset";
+import { GOOGLE_OU_FIELD } from "@/lib/profiles/google-ou";
 
 export const dynamic = "force-dynamic";
 
@@ -89,6 +91,22 @@ export default async function CaseDetailPage({ params }: { params: { id: string 
   const acting = authEnabled() ? await getActingContext() : { user: null, realUser: null, impersonating: false };
   const canRevealPassword = !authEnabled() || (!!acting.user && !acting.impersonating && can(acting.user.role, "case.dispatch"));
   const hasInitialPassword = Boolean(caseMeta?.initialPassword) && canRevealPassword;
+  // FR #81: the Google OU this case will use (the planned google-workspace job's config), editable
+  // per case. Only for cases that have a Google step.
+  const googleJob = await db.job.findFirst({ where: { caseRequestId: c.id, systemKey: "google-workspace" }, select: { status: true, request: true } });
+  const googleOu = googleJob && (c.action === "onboard" || c.action === "offboard")
+    ? (() => {
+        const cfg = ((googleJob.request ?? {}) as { config?: Record<string, unknown> }).config ?? {};
+        const key = c.action === "onboard" ? "ou" : "inactiveOu";
+        const current = typeof cfg[key] === "string" && cfg[key] ? String(cfg[key]) : (c.action === "onboard" ? "/Active Users" : "/Email & Calendar/Inactive");
+        const field = GOOGLE_OU_FIELD[c.action];
+        return {
+          action: c.action, current,
+          overridden: typeof c.payload[field] === "string" && String(c.payload[field]).trim() !== "",
+          locked: ["dispatched", "running", "succeeded", "failed"].includes(googleJob.status),
+        };
+      })()
+    : null;
   // FR#31: offer "reset password" from the Actions menu even before any step has run (imported
   // cases pause on import, and the reset route already supports paused cases) — pick whichever
   // planned job the ad-hoc reset job should ride on. Excluded for dry runs: nothing in a dry-run
@@ -181,6 +199,11 @@ export default async function CaseDetailPage({ params }: { params: { id: string 
           ⏸ This case is paused — runners won&rsquo;t claim its steps until you resume (a step already running finishes normally).
           {scheduledForIso && <> It resumes automatically at <LocalDateTime iso={scheduledForIso} />.</>}
         </p>
+      )}
+
+      {googleOu && (
+        <GoogleOuControl caseId={c.id} action={googleOu.action} current={googleOu.current} overridden={googleOu.overridden}
+          locked={googleOu.locked} canEdit={canRevealPassword} />
       )}
 
       {changePreviewDiffs && <ChangePreview caseId={c.id} diffs={changePreviewDiffs} />}

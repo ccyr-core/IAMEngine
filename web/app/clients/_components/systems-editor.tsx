@@ -21,7 +21,8 @@ type Row = {
   requiresApproval: boolean;
   captureEvidence: boolean;
   offboardIntent: "disable" | "destructive"; // offboard classification (config.intent.offboard)
-  onboardOu: string; // AD onboarding target DN (config.onboard.ou) — the field the runner actually uses
+  onboardOu: string; // AD onboarding target DN / Google onboarding OU path (config.onboard.ou) — the field the runner actually uses
+  googleInactiveOu: string; // Google offboarding OU (config.offboard.inactiveOu) — FR #81
   galMode: GalMode; // hide-from-GAL deviation (config.offboard.hideFromGal) — default is hide, this only records opt-outs
   galAttribute: string; // AD-only: the attribute name when galMode === "attribute"
   secretNames: string[];
@@ -57,6 +58,8 @@ const HELP = {
   secrets: "The Delinea secret references this system needs at run time (comma-separated names, e.g. m365-admin). Names only — never the values.",
   config: 'Per-lane JSON settings, nested under onboard / offboard. e.g. { "offboard": { "delete": true } }. Leave blank for defaults.',
   onboardOu: "Where new AD accounts are created (config.onboard.ou). This is the value the runner uses — it overrides any OU set in Roles & rules. Type a full DN or 📁 Browse the folders discovered from the DC. Leave blank to create at the domain default. Refresh the folder list under Roles & rules → “Refresh AD objects from DC”.",
+  googleOu: "Where new Google users are created (config.onboard.ou), as an OU path like /Active Users/Sales. Leave blank for the default, /Active Users. A single case can override it on the case page.",
+  googleInactiveOu: "Where offboarded Google users are moved (config.offboard.inactiveOu). Leave blank for the default, /Email & Calendar/Inactive. A single case can override it on the case page.",
   hideFromGal: "Hiding offboarded users from the Global Address List is the default (FR #21). Use this only to record a deviation: “Do NOT hide” opts this client out entirely; “Hide via AD attribute…” (AD only) hides by setting a named attribute (e.g. msExchHideFromAddressLists) to TRUE instead of the default mechanism.",
 };
 
@@ -99,6 +102,7 @@ function rowFromCatalog(key: string): Row {
     captureEvidence: false,
     offboardIntent: "disable",
     onboardOu: "",
+    googleInactiveOu: "",
     galMode: "default",
     galAttribute: "",
     secretNames: c?.secret ? [c.secret] : [],
@@ -176,6 +180,7 @@ export function SystemsEditor({ slug, open, onClose }: { slug: string | null; op
           captureEvidence: Boolean(sys.captureEvidence),
           offboardIntent: ((sys.config as { intent?: { offboard?: unknown } } | null)?.intent?.offboard) === "destructive" ? "destructive" : "disable",
           onboardOu: String((sys.config as { onboard?: { ou?: unknown } } | null)?.onboard?.ou ?? ""),
+          googleInactiveOu: String((sys.config as { offboard?: { inactiveOu?: unknown } } | null)?.offboard?.inactiveOu ?? ""),
           ...galFromConfig(sys.config),
           secretNames: Array.isArray(sys.secretNames) ? sys.secretNames : [],
           configText: sys.config ? JSON.stringify(sys.config, null, 2) : "",
@@ -302,6 +307,14 @@ export function SystemsEditor({ slug, open, onClose }: { slug: string | null; op
       // config.onboard.ou (the field the runner reads), so it wins over the raw JSON textarea — the
       // same "structured control beats the blob" contract as offboardIntent above.
       if (r.systemKey === "active-directory") config = withOnboardOu(config, r.onboardOu.trim());
+      // FR #81: the Google OU fields are authoritative the same way (blank = the executor's default).
+      if (r.systemKey === "google-workspace") {
+        config = withOnboardOu(config, r.onboardOu.trim());
+        const offboard = { ...((config.offboard as Record<string, unknown> | undefined) ?? {}) };
+        if (r.googleInactiveOu.trim()) offboard.inactiveOu = r.googleInactiveOu.trim(); else delete offboard.inactiveOu;
+        if (Object.keys(offboard).length) config = { ...config, offboard };
+        else { const { offboard: _drop, ...rest } = config; config = rest; }
+      }
       // The GAL control is authoritative for the offboard hide-from-GAL deviation: merge it into
       // config.offboard.hideFromGal (the planner flattens config.offboard onto the offboard job, so
       // this becomes the top-level config.hideFromGal the planner/runner read). Preserve any other
@@ -536,6 +549,19 @@ export function SystemsEditor({ slug, open, onClose }: { slug: string | null; op
                         <OuTreePicker ous={adOus} onPick={(dn) => { update(i, { onboardOu: dn }); setOuPickerRow(null); }} />
                       </div>
                     )}
+                  </div>
+                )}
+                {/* FR #81 — Google Workspace OUs (config.onboard.ou / config.offboard.inactiveOu, what the runner reads) */}
+                {r.systemKey === "google-workspace" && (
+                  <div style={{ marginTop: "0.55rem", display: "flex", gap: "0.8rem", flexWrap: "wrap", maxWidth: 720 }}>
+                    <Field label="Onboarding OU" help={HELP.googleOu} grow>
+                      <input value={r.onboardOu} onChange={(e) => update(i, { onboardOu: e.target.value })}
+                        placeholder="/Active Users" style={{ fontFamily: "monospace", fontSize: 12 }} />
+                    </Field>
+                    <Field label="Offboarding OU" help={HELP.googleInactiveOu} grow>
+                      <input value={r.googleInactiveOu} onChange={(e) => update(i, { googleInactiveOu: e.target.value })}
+                        placeholder="/Email & Calendar/Inactive" style={{ fontFamily: "monospace", fontSize: 12 }} />
+                    </Field>
                   </div>
                 )}
               </div>
