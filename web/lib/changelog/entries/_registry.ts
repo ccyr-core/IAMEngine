@@ -41,6 +41,7 @@ export { entry as caseRequestedMailForwarding } from "./case-requested-mail-forw
 export { entry as caseRequestedSharedMailboxes } from "./case-requested-shared-mailboxes";
 export { entry as casesAssignedToColumn } from "./cases-assigned-to-column";
 export { entry as casesEmptyM365autosetupJsonFilter } from "./cases-empty-m365autosetup-json-filter";
+export { entry as casesUserColumnAndWidth } from "./cases-user-column-and-width";
 export { entry as casesV2AccessRules } from "./cases-v2-access-rules";
 export { entry as changeActionGroundwork } from "./change-action-groundwork";
 export { entry as changeAdLane } from "./change-ad-lane";

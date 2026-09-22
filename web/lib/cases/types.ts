@@ -59,6 +59,8 @@ export type CaseListItem = {
   // ("system:intake-poll"). null only for rows predating this column.
   createdBy: string | null;
   createdSource: CaseSource;
+  // The person the case is about, as a name (FR #123) — null when the payload names nobody.
+  userName: string | null;
   // Per-case run readiness — can this case's systems actually run? Based on whether the required
   // Delinea credentials are set for the systems in its plan: "ready" (all set), "partial" (some set),
   // "blocked" (none set), "none" (no credential-gated systems — e.g. all-manual). readinessMissing

@@ -52,6 +52,7 @@ export async function loadCasesPage() {
     // FR #0000045: who opened/imported the case. The repository already selects and normalises it
     // (the "user:" prefix is stripped there); it was simply dropped on the way to the table.
     createdBy: c.createdBy,
+    userName: c.userName,
     createdAtIso: c.createdAt.toISOString(),
   }));
 
