@@ -488,6 +488,13 @@ model CaseRequest {
   createdByUserId      String?
   createdByUser        User?      @relation("CaseCreatedBy", fields: [createdByUserId], references: [id], onDelete: SetNull)
   createdSource        CaseSource @default(manual)
+  // Per-case step selection (FR #173 / #134), set on the case's "Steps on this case" panel and applied
+  // by every plan and re-plan. requestedSystems turns ON an on-request (or by-persona) system the
+  // intake didn't signal — the runner otherwise has no way to know it was asked for. skippedSystems
+  // turns OFF a system this one case doesn't need. Columns, not payload keys: a re-plan re-pulls the
+  // ServiceNow ticket and replaces the payload wholesale, which would silently drop the choice.
+  requestedSystems     String[]   @default([])
+  skippedSystems       String[]   @default([])
   // ONE-TIME initial password for a "generate"-mode onboard: the app generates it at dispatch (so it
   // knows the value), injects it as the runner's initial password, and stores it here to reveal to the
   // operator EXACTLY ONCE (the reveal wipes it). Never logged / never in Job.result or audit.

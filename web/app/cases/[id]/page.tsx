@@ -14,6 +14,7 @@ import { loadRunReport } from "@/lib/cases/run-report";
 import { writeBackEnabled } from "@/lib/servicenow/worknote";
 import { PlaybookView } from "../_components/playbook-view";
 import { CaseSecretsPanel } from "../_components/case-secrets-panel";
+import { CaseStepsPanel } from "../_components/case-steps-panel";
 import { RunReportView } from "../_components/run-report-view";
 import { ChangePreview } from "../_components/change-preview";
 import { buildChangeDiffs } from "@/lib/cases/change-service";
@@ -28,6 +29,7 @@ import { IntakePanel } from "../_components/intake-panel";
 import { hasStartedJobs } from "@/lib/cases/job-status";
 import { isMilestoneCase } from "@/lib/eggs/occasions";
 import { pickResetSourceJob } from "@/lib/jobs/password-reset";
+import { loadCaseSteps } from "@/lib/cases/case-steps-service";
 
 export const dynamic = "force-dynamic";
 
@@ -89,6 +91,9 @@ export default async function CaseDetailPage({ params }: { params: { id: string 
   const acting = authEnabled() ? await getActingContext() : { user: null, realUser: null, impersonating: false };
   const canRevealPassword = !authEnabled() || (!!acting.user && !acting.impersonating && can(acting.user.role, "case.dispatch"));
   const hasInitialPassword = Boolean(caseMeta?.initialPassword) && canRevealPassword;
+  // FR #173 / #134: per-case step selection. Editable with the re-plan capability (the route's gate).
+  const caseSteps = await loadCaseSteps(db, c.id);
+  const canEditSteps = !authEnabled() || (!!acting.user && !acting.impersonating && can(acting.user.role, "case.plan"));
   // FR#31: offer "reset password" from the Actions menu even before any step has run (imported
   // cases pause on import, and the reset route already supports paused cases) — pick whichever
   // planned job the ad-hoc reset job should ride on. Excluded for dry runs: nothing in a dry-run
@@ -200,6 +205,12 @@ export default async function CaseDetailPage({ params }: { params: { id: string 
       {playbook && playbook.steps.length > 0 && (
         <CollapsibleSection title="Playbook (dry run)" count={playbook.steps.length}>
           <PlaybookView playbook={playbook} caseId={c.id} />
+        </CollapsibleSection>
+      )}
+
+      {caseSteps && caseSteps.rows.length > 0 && (
+        <CollapsibleSection title="Steps on this case" count={caseSteps.rows.filter((r) => r.runs).length}>
+          <CaseStepsPanel caseId={c.id} rows={caseSteps.rows} canEdit={canEditSteps} />
         </CollapsibleSection>
       )}
 
