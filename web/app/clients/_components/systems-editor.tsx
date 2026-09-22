@@ -22,6 +22,9 @@ type Row = {
   captureEvidence: boolean;
   offboardIntent: "disable" | "destructive"; // offboard classification (config.intent.offboard)
   onboardOu: string; // AD onboarding target DN (config.onboard.ou) — the field the runner actually uses
+  // FR #119: what "mirror <user>" may copy on this lane (config.onboard.mirrorPolicy)
+  mirrorSecurityOnly: boolean;
+  mirrorExclude: string; // comma-separated group names; * wildcards
   galMode: GalMode; // hide-from-GAL deviation (config.offboard.hideFromGal) — default is hide, this only records opt-outs
   galAttribute: string; // AD-only: the attribute name when galMode === "attribute"
   secretNames: string[];
@@ -57,6 +60,8 @@ const HELP = {
   secrets: "The Delinea secret references this system needs at run time (comma-separated names, e.g. m365-admin). Names only — never the values.",
   config: 'Per-lane JSON settings, nested under onboard / offboard. e.g. { "offboard": { "delete": true } }. Leave blank for defaults.',
   onboardOu: "Where new AD accounts are created (config.onboard.ou). This is the value the runner uses — it overrides any OU set in Roles & rules. Type a full DN or 📁 Browse the folders discovered from the DC. Leave blank to create at the domain default. Refresh the folder list under Roles & rules → “Refresh AD objects from DC”.",
+  mirrorSecurityOnly: "When an onboard says \"mirror <user>\", copy only that user's SECURITY groups on this system — distribution lists and Microsoft 365 groups are skipped.",
+  mirrorExclude: "Groups \"mirror <user>\" must never copy on this system, even if the reference user has them (comma-separated; * matches anything, e.g. ChatGPT*). Anything held back is listed on the step's result.",
   hideFromGal: "Hiding offboarded users from the Global Address List is the default (FR #21). Use this only to record a deviation: “Do NOT hide” opts this client out entirely; “Hide via AD attribute…” (AD only) hides by setting a named attribute (e.g. msExchHideFromAddressLists) to TRUE instead of the default mechanism.",
 };
 
@@ -99,11 +104,35 @@ function rowFromCatalog(key: string): Row {
     captureEvidence: false,
     offboardIntent: "disable",
     onboardOu: "",
+    mirrorSecurityOnly: false,
+    mirrorExclude: "",
     galMode: "default",
     galAttribute: "",
     secretNames: c?.secret ? [c.secret] : [],
     configText: "",
   };
+}
+
+// FR #119: the lanes that copy a reference user's groups ("mirror <user>") and honour a mirror policy.
+const MIRROR_SYSTEMS = new Set(["active-directory", "m365", "exchange"]);
+
+function readMirrorPolicy(config: unknown): { mirrorSecurityOnly: boolean; mirrorExclude: string } {
+  const p = ((config as { onboard?: { mirrorPolicy?: { securityOnly?: unknown; exclude?: unknown } } } | null)?.onboard?.mirrorPolicy) ?? {};
+  return {
+    mirrorSecurityOnly: p.securityOnly === true,
+    mirrorExclude: Array.isArray(p.exclude) ? p.exclude.map(String).join(", ") : "",
+  };
+}
+
+// Write config.onboard.mirrorPolicy from the two controls; an empty policy is removed, not stored.
+function withMirrorPolicy(config: Record<string, unknown>, securityOnly: boolean, excludeText: string): Record<string, unknown> {
+  const onboard = { ...((config.onboard as Record<string, unknown> | undefined) ?? {}) };
+  const exclude = excludeText.split(",").map((s) => s.trim()).filter(Boolean);
+  if (securityOnly || exclude.length) onboard.mirrorPolicy = { ...(securityOnly ? { securityOnly: true } : {}), ...(exclude.length ? { exclude } : {}) };
+  else delete onboard.mirrorPolicy;
+  if (Object.keys(onboard).length) return { ...config, onboard };
+  const { onboard: _drop, ...rest } = config;
+  return rest;
 }
 
 // Reads the GAL deviation out of a system's parsed config.offboard.hideFromGal. Handles both the
@@ -176,6 +205,7 @@ export function SystemsEditor({ slug, open, onClose }: { slug: string | null; op
           captureEvidence: Boolean(sys.captureEvidence),
           offboardIntent: ((sys.config as { intent?: { offboard?: unknown } } | null)?.intent?.offboard) === "destructive" ? "destructive" : "disable",
           onboardOu: String((sys.config as { onboard?: { ou?: unknown } } | null)?.onboard?.ou ?? ""),
+          ...readMirrorPolicy(sys.config),
           ...galFromConfig(sys.config),
           secretNames: Array.isArray(sys.secretNames) ? sys.secretNames : [],
           configText: sys.config ? JSON.stringify(sys.config, null, 2) : "",
@@ -302,6 +332,7 @@ export function SystemsEditor({ slug, open, onClose }: { slug: string | null; op
       // config.onboard.ou (the field the runner reads), so it wins over the raw JSON textarea — the
       // same "structured control beats the blob" contract as offboardIntent above.
       if (r.systemKey === "active-directory") config = withOnboardOu(config, r.onboardOu.trim());
+      if (MIRROR_SYSTEMS.has(r.systemKey)) config = withMirrorPolicy(config, r.mirrorSecurityOnly, r.mirrorExclude);
       // The GAL control is authoritative for the offboard hide-from-GAL deviation: merge it into
       // config.offboard.hideFromGal (the planner flattens config.offboard onto the offboard job, so
       // this becomes the top-level config.hideFromGal the planner/runner read). Preserve any other
@@ -519,6 +550,18 @@ export function SystemsEditor({ slug, open, onClose }: { slug: string | null; op
                     <textarea value={r.configText} onChange={(e) => update(i, { configText: e.target.value })} placeholder={'{ "offboard": { } }'} rows={2} style={{ width: "100%", minWidth: 260, fontFamily: "monospace", fontSize: 12 }} />
                   </Field>
                 </div>
+                {/* FR #119 — mirror policy: what "mirror <user>" may copy on this lane (config.onboard.mirrorPolicy) */}
+                {MIRROR_SYSTEMS.has(r.systemKey) && (
+                  <div style={{ marginTop: "0.55rem", display: "flex", gap: "0.8rem", alignItems: "flex-end", flexWrap: "wrap", maxWidth: 720 }}>
+                    <label className="note" style={{ display: "flex", alignItems: "center", gap: 6, margin: 0 }} title={HELP.mirrorSecurityOnly}>
+                      <input type="checkbox" checked={r.mirrorSecurityOnly} onChange={(e) => update(i, { mirrorSecurityOnly: e.target.checked })} style={{ width: "auto" }} />
+                      Mirror security groups only
+                    </label>
+                    <Field label="Never mirror" help={HELP.mirrorExclude} grow>
+                      <input value={r.mirrorExclude} onChange={(e) => update(i, { mirrorExclude: e.target.value })} placeholder="e.g. ChatGPT*, Board Members" style={{ fontSize: 12 }} />
+                    </Field>
+                  </div>
+                )}
                 {/* Row 3 — AD onboarding OU/folder picker (writes config.onboard.ou, the field the runner uses) */}
                 {r.systemKey === "active-directory" && (
                   <div style={{ marginTop: "0.55rem", maxWidth: 520 }}>

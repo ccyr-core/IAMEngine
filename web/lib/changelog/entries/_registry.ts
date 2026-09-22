@@ -183,6 +183,7 @@ export { entry as mimecastConsoleSigninSecretRef } from "./mimecast-console-sign
 export { entry as mimecastConsoleSigninTest } from "./mimecast-console-signin-test";
 export { entry as mimecastConsoleUrlFix } from "./mimecast-console-url-fix";
 export { entry as mimecastDocProductsPoc } from "./mimecast-doc-products-poc";
+export { entry as mirrorPolicy } from "./mirror-policy";
 export { entry as modelFilesReadwritePerm } from "./model-files-readwrite-perm";
 export { entry as moduleSetupGuidedVault } from "./module-setup-guided-vault";
 export { entry as multipleMailboxDelegates } from "./multiple-mailbox-delegates";
