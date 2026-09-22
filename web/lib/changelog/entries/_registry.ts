@@ -209,6 +209,7 @@ export { entry as offboardUnifiedGroupRemoval } from "./offboard-unified-group-r
 export { entry as onedriveGrantRealError } from "./onedrive-grant-real-error";
 export { entry as optionalCredEmptyLabel } from "./optional-cred-empty-label";
 export { entry as passwordChangeAtFirstLoginOptional } from "./password-change-at-first-login-optional";
+export { entry as passwordDialogControlsWork } from "./password-dialog-controls-work";
 export { entry as passwordResetGuiFix } from "./password-reset-gui-fix";
 export { entry as perContactIntakeRules } from "./per-contact-intake-rules";
 export { entry as personaSystemMembership } from "./persona-system-membership";
