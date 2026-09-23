@@ -50,6 +50,36 @@ if ($HealthCheck) {
 }
 $global:CtgHeartbeatFile = $HeartbeatFile
 
+# FR #0000171: pin the working directory to the runner's own folder before anything else runs.
+#
+# A Store-installed pwsh starts with BOTH its PowerShell location and its process working directory at
+# $PSHOME — C:\Program Files\WindowsApps\Microsoft.PowerShell_<ver>_x64__8wekyb3d8bbwe — which is
+# read-only even to an administrator. Any relative path written from there fails with "Access to the
+# path '...\WindowsApps\...\<name>' is denied", and the reporter of #171 saw exactly that for 'Scripts'
+# while starting this script; moving the working directory somewhere writable by hand fixed it.
+#
+# The relative path is NOT ours. Every write in this repo is anchored ($PSScriptRoot, $InstallDir,
+# GetTempPath) and a clean start from $PSHOME on a Store pwsh 7.6.6 does not reproduce it — so the
+# culprit is inside a dependency we call during startup module installs, whose per-scope path
+# computation degrades to a relative one on some hosts (an account with no resolvable MyDocuments/HOME,
+# which is what a SYSTEM scheduled task is). We cannot anchor a path inside someone else's module. The
+# working directory is the only lever we have over it, so we take it, once, here.
+#
+# BOTH have to be set and they are genuinely independent: PowerShell cmdlets (New-Item, Test-Path)
+# resolve against the provider location that Set-Location moves, while .NET APIs
+# ([System.IO.File], Directory.CreateDirectory) resolve against [Environment]::CurrentDirectory, which
+# Set-Location does NOT touch. Setting only one leaves half the calls still pointing at WindowsApps.
+#
+# Best-effort by design: a runner that cannot set its own directory must still start, and $PSScriptRoot
+# is empty when this file is dot-sourced rather than run, so there is nothing to anchor to then.
+if ($PSScriptRoot) {
+    try {
+        Set-Location -LiteralPath $PSScriptRoot
+        [Environment]::CurrentDirectory = $PSScriptRoot
+    }
+    catch { Write-Warning "could not set the working directory to $PSScriptRoot ($($_.Exception.Message)) - a relative path written by a dependency may fail if this process started somewhere read-only." }
+}
+
 $ErrorActionPreference = 'Stop'
 # This is a non-interactive background service. Suppress progress bars + ANSI cursor control: writing
 # a progress bar / colored output to a redirected or detached stdout (notably right after a self-update
