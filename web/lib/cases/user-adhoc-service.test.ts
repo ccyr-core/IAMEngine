@@ -284,7 +284,7 @@ test("L2: runners older than 1.130.0 (or not reporting a version) are withheld t
 test("L2: a 'skipped' correct/remove result is recorded as failed (not done); other keys are untouched", () => {
   const r = userAdhocResultStatus("m365-correct-user", "skipped");
   assert.equal(r.status, "failed");
-  assert.match(r.error ?? "", /runner 1\.127\.0 or later/);
+  assert.match(r.error ?? "", /runner 1.130.0 or later/);
   assert.deepEqual(userAdhocResultStatus("m365", "skipped"), { status: "skipped" });
   assert.deepEqual(userAdhocResultStatus("ad-remove-user", "succeeded"), { status: "succeeded" });
 });
@@ -373,7 +373,7 @@ test("N3: an AD correct/remove is refused when every runner of the client is old
   const { db, created } = stubDb({ agents: [{ name: "dc01", semver: "1.126.4" }, { name: "dc02", semver: null }] });
   const r = await dispatchUserAdhoc(db, "case", "remove", "t");
   assert.equal(r.ok, false);
-  assert.match(String((r as { error: string }).error), /updated to 1\.127\.0 or later .* dc01 \(1\.126\.4\), dc02 \(version unknown\)/);
+  assert.match(String((r as { error: string }).error), /updated to 1.130.0 or later .* dc01 \(1\.126\.4\), dc02 \(version unknown\)/);
   assert.equal(created.length, 0);
   const ok = stubDb({ agents: [{ name: "dc01", semver: "1.126.4" }, { name: "dc02", semver: "1.130.0" }] });
   assert.equal((await dispatchUserAdhoc(ok.db, "case", "remove", "t")).ok, true);
