@@ -552,12 +552,20 @@ function Resolve-CtgSharePointMirrorUser {
 
 # The account the new hire actually got. The m365/entra step may have created them at a FALLBACK
 # username (the primary belonged to someone else), and the app hands that result on as
-# payload.provisionedUpn. Without it the primary candidate is only safe when it is the ONLY candidate
-# — otherwise the primary may be the other person, and mirroring onto it would grant a stranger access.
+# payload.provisionedUpn. Without it, the primary username is never used while the case HAS a
+# cloud-account step (payload.cloudAccountStep, set by the app): the primary may belong to someone
+# else, e.g. a single-pattern client whose jsmith@ is an existing John Smith while m365 waits on a
+# collision decision. Mirroring onto that account would give a stranger the groups. Only an explicit
+# cloudAccountStep = false (no m365/entra step on the case) allows the primary, and then only as the
+# sole candidate.
 function Resolve-CtgSharePointNewHireUpn {
     param($Payload)
     $provisioned = [string](Get-CtgProp $Payload 'provisionedUpn')
     if ($provisioned) { return $provisioned }
+    # Absent (an app from before this hand-off) is treated as "there may be one": wait, don't guess.
+    if ((Get-CtgProp $Payload 'cloudAccountStep') -ne $false) {
+        throw "the Microsoft 365 step hasn't reported the account it created for the new hire yet (it hasn't succeeded, is waiting on a decision, or was completed by hand), so SharePoint site groups were not mirrored — the username on the case could still belong to someone else. Finish the Microsoft 365 step, then re-run this one."
+    }
     $primary = @(@('UserPrincipalName', 'email', 'workEmail') | ForEach-Object { [string](Get-CtgProp $Payload $_) } | Where-Object { $_ } | Select-Object -First 1)
     $upn = if ($primary.Count) { $primary[0] } else { '' }
     $fallbacks = @(@(Get-CtgProp $Payload 'UserPrincipalNameFallbacks') | Where-Object { $_ -and ([string]$_) -ine $upn })
@@ -600,8 +608,12 @@ function Invoke-CtgSharePointSiteGroupsStep {
     $ctx = & $Context
     $cert = New-CtgPnPCertFile $ctx.CertArgs   # once for the site listing AND the whole walk
     try {
-        Write-CtgSharePointStep "listing SharePoint sites (cached per tenant)"
-        $sites = @(Get-CtgSharePointSiteUrls -AdminUrl $ctx.AdminUrl -AppId $ctx.AppId -Tenant $ctx.Tenant -CertArgs $cert.CertArgs)
+        # Offboard ALWAYS lists fresh (and refreshes the cache): a site created inside the 6 h cache
+        # window would otherwise never be walked, and the leaver would keep access there while the
+        # step reported success. A mirror that misses a brand-new site only grants less, so it may use the cache.
+        $fresh = $Lane -eq 'offboard'
+        Write-CtgSharePointStep "listing SharePoint sites$(if ($fresh) { ' (fresh)' } else { ' (cached per tenant)' })"
+        $sites = @(Get-CtgSharePointSiteUrls -AdminUrl $ctx.AdminUrl -AppId $ctx.AppId -Tenant $ctx.Tenant -CertArgs $cert.CertArgs -NoCache:$fresh)
         if ($Lane -eq 'offboard') {
             Write-CtgSharePointStep "removing $email from site groups on $($sites.Count) site(s)"
             foreach ($a in (Invoke-CtgSharePointSiteGroupsOffboard -Email $email -Sites $sites -AppId $ctx.AppId -Tenant $ctx.Tenant -CertArgs $cert.CertArgs)) { $actions.Add($a) }

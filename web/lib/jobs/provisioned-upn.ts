@@ -23,3 +23,16 @@ export function provisionedUpnFrom(siblings: SiblingResult[]): string | null {
   }
   return null;
 }
+
+// What the sharepoint ONBOARD job is told about the new hire's account (PR #111 second review). Its
+// `cloudAccountStep` is true whenever the case HAS an m365/entra step, whatever that step's status:
+// the runner then refuses to mirror without provisionedUpn instead of falling back to the payload's
+// primary username. That primary can belong to an existing person, for example while m365 is paused
+// on a username-collision decision. Only a case with no cloud-account step at all (false) may use the
+// primary.
+export function sharepointOnboardFields(siblings: SiblingResult[]): { provisionedUpn: string | null; cloudAccountStep: boolean } {
+  return {
+    provisionedUpn: provisionedUpnFrom(siblings),
+    cloudAccountStep: siblings.some((s) => s.systemKey === "m365" || s.systemKey === "entra"),
+  };
+}

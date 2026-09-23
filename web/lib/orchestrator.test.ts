@@ -379,3 +379,23 @@ test("offboard with no exchange system in the plan is unaffected", () => {
   const jobs = planCase(systems, "offboard", {});
   assert.deepEqual(jobs.find((j) => j.systemKey === "entra")!.dependsOn, ["m365"]);
 });
+
+// PR #111 second review (N1): a sharepoint row from the systems editor has dependsOn [], so it was
+// claimed alongside m365 and could mirror onto the primary username's owner before m365 chose one.
+test("onboard: sharepoint always waits for the cloud-account step(s) in the plan", () => {
+  const systems = [sys({ systemKey: "sharepoint", dependsOn: [] }), sys({ systemKey: "m365" })];
+  const jobs = planCase(systems, "onboard", {});
+  assert.deepEqual(jobs.find((j) => j.systemKey === "sharepoint")!.dependsOn, ["m365"]);
+  assert.deepEqual(jobs.map((j) => j.systemKey), ["m365", "sharepoint"]);
+  const withEntra = planCase([sys({ systemKey: "sharepoint" }), sys({ systemKey: "entra" })], "onboard", {});
+  assert.deepEqual(withEntra.find((j) => j.systemKey === "sharepoint")!.dependsOn, ["entra"]);
+});
+
+test("onboard: a declared m365 -> sharepoint edge is dropped rather than forming a cycle; offboard is untouched", () => {
+  const systems = [sys({ systemKey: "sharepoint" }), sys({ systemKey: "m365", dependsOn: ["sharepoint"] })];
+  const jobs = planCase(systems, "onboard", {});
+  assert.deepEqual(jobs.find((j) => j.systemKey === "m365")!.dependsOn, []);
+  assert.deepEqual(jobs.find((j) => j.systemKey === "sharepoint")!.dependsOn, ["m365"]);
+  const off = planCase([sys({ systemKey: "sharepoint" }), sys({ systemKey: "m365" })], "offboard", {});
+  assert.deepEqual(off.find((j) => j.systemKey === "sharepoint")!.dependsOn, []);
+});

@@ -179,32 +179,32 @@ Describe 'review fixes' {
         Should -Invoke Add-PnPGroupMember -ModuleName Coretelligent.SharePoint -Times 0 -Exactly -ParameterFilter { $LoginName -match 'jsmith@' }
     }
     It 'onboard refuses to guess between username candidates when the created account is unknown' {
-        $p = [pscustomobject]@{ UserPrincipalName = 'jsmith@contoso.com'; UserPrincipalNameFallbacks = @('john.smith2@contoso.com') }
+        $p = [pscustomobject]@{ UserPrincipalName = 'jsmith@contoso.com'; UserPrincipalNameFallbacks = @('john.smith2@contoso.com'); cloudAccountStep = $false }
         { Invoke-CtgSharePointSiteGroupsStep -Lane onboard -Payload $p -Config ([pscustomobject]@{ mirrorFromUser = 'ref@contoso.com' }) -Context $script:Ctx } |
             Should -Throw '*which account*'
         Should -Invoke Add-PnPGroupMember -ModuleName Coretelligent.SharePoint -Times 0 -Exactly
     }
-    It 'onboard with a single username candidate uses it' {
-        $r = Invoke-CtgSharePointSiteGroupsStep -Lane onboard -Payload ([pscustomobject]@{ UserPrincipalName = 'new@contoso.com' }) -Config ([pscustomobject]@{ mirrorFromUser = 'ref@contoso.com' }) -Context $script:Ctx
+    It 'onboard with a single username candidate and NO cloud-account step on the case uses it' {
+        $r = Invoke-CtgSharePointSiteGroupsStep -Lane onboard -Payload ([pscustomobject]@{ UserPrincipalName = 'new@contoso.com'; cloudAccountStep = $false }) -Config ([pscustomobject]@{ mirrorFromUser = 'ref@contoso.com' }) -Context $script:Ctx
         $r.Email | Should -Be 'new@contoso.com'
         Should -Invoke Add-PnPGroupMember -ModuleName Coretelligent.SharePoint -Times 2 -Exactly
     }
 
     # Finding 4: the mirror user was resolved by display name with -Top 1 — two people, arbitrary pick.
     It 'a mirror user named by a display name two people share fails with a clear message' {
-        { Invoke-CtgSharePointSiteGroupsStep -Lane onboard -Payload ([pscustomobject]@{ UserPrincipalName = 'new@contoso.com' }) -Config ([pscustomobject]@{ mirrorFromUser = 'Sam Twin' }) -Context $script:Ctx } |
+        { Invoke-CtgSharePointSiteGroupsStep -Lane onboard -Payload ([pscustomobject]@{ UserPrincipalName = 'new@contoso.com'; provisionedUpn = 'new@contoso.com' }) -Config ([pscustomobject]@{ mirrorFromUser = 'Sam Twin' }) -Context $script:Ctx } |
             Should -Throw '*2 or more people*Sam Twin*email*'
         Should -Invoke Add-PnPGroupMember -ModuleName Coretelligent.SharePoint -Times 0 -Exactly
     }
     It 'a mirror user named by a unique display name resolves to their UPN' {
-        $r = Invoke-CtgSharePointSiteGroupsStep -Lane onboard -Payload ([pscustomobject]@{ UserPrincipalName = 'new@contoso.com' }) -Config ([pscustomobject]@{ mirrorFromUser = 'Rita Ref' }) -Context $script:Ctx
+        $r = Invoke-CtgSharePointSiteGroupsStep -Lane onboard -Payload ([pscustomobject]@{ UserPrincipalName = 'new@contoso.com'; provisionedUpn = 'new@contoso.com' }) -Config ([pscustomobject]@{ mirrorFromUser = 'Rita Ref' }) -Context $script:Ctx
         ($r.Actions -join "`n") | Should -Match 'mirrored 2 group\(s\) from ref@contoso.com'
     }
 
     # Finding 6: the mirror policy's exclude list (config.mirrorPolicy.exclude) reaches the step and is honoured.
     It 'the step honours config.mirrorPolicy.exclude' {
         $cfg = [pscustomobject]@{ mirrorFromUser = 'ref@contoso.com'; mirrorPolicy = [pscustomobject]@{ exclude = @('chatgpt*') } }
-        $r = Invoke-CtgSharePointSiteGroupsStep -Lane onboard -Payload ([pscustomobject]@{ UserPrincipalName = 'new@contoso.com' }) -Config $cfg -Context $script:Ctx
+        $r = Invoke-CtgSharePointSiteGroupsStep -Lane onboard -Payload ([pscustomobject]@{ UserPrincipalName = 'new@contoso.com'; provisionedUpn = 'new@contoso.com' }) -Config $cfg -Context $script:Ctx
         Should -Invoke Add-PnPGroupMember -ModuleName Coretelligent.SharePoint -Times 1 -Exactly -ParameterFilter { $Group -eq 'Finance Members' }
         ($r.Actions -join "`n") | Should -Match "not mirrored: site group 'ChatGPT Pilot'"
     }
@@ -213,5 +213,53 @@ Describe 'review fixes' {
         $r = Invoke-CtgSharePointSiteGroupsStep -Lane offboard -Payload ([pscustomobject]@{}) -LeaverUpn 'leaver@contoso.com' -Context $script:Ctx
         $r.Status | Should -Be 'ok'
         Should -Invoke Remove-PnPGroupMember -ModuleName Coretelligent.SharePoint -Times 2 -Exactly
+    }
+}
+
+# Second review of PR #111.
+Describe 'second review fixes' {
+    BeforeEach {
+        $global:SpNewSite = $false
+        Mock Connect-PnPOnline -ModuleName Coretelligent.SharePoint { }
+        Mock Get-PnPGroup -ModuleName Coretelligent.SharePoint { @([pscustomobject]@{ Title = 'Finance Members' }) }
+        Mock Get-PnPUser -ModuleName Coretelligent.SharePoint { if ($Identity -match 'leaver@|ref@') { [pscustomobject]@{ LoginName = $Identity } } }
+        Mock Get-PnPGroupMember -ModuleName Coretelligent.SharePoint { @([pscustomobject]@{ LoginName = 'i:0#.f|membership|leaver@contoso.com' }, [pscustomobject]@{ LoginName = 'i:0#.f|membership|ref@contoso.com' }) }
+        Mock Remove-PnPGroupMember -ModuleName Coretelligent.SharePoint { }
+        Mock Add-PnPGroupMember -ModuleName Coretelligent.SharePoint { }
+        Mock Send-CtgProgress -ModuleName Coretelligent.SharePoint { }
+        # Finance always exists; NewProject appears once $global:SpNewSite is set (created mid-cache-window).
+        Mock Get-PnPTenantSite -ModuleName Coretelligent.SharePoint {
+            @([pscustomobject]@{ Url = 'https://contoso.sharepoint.com/sites/Finance'; Template = 'GROUP#0' })
+            if ($global:SpNewSite) { [pscustomobject]@{ Url = 'https://contoso.sharepoint.com/sites/NewProject'; Template = 'GROUP#0' } }
+        }
+        Mock Get-MgUser -ModuleName Coretelligent.SharePoint { if ($Filter -match 'ref@contoso\.com') { @([pscustomobject]@{ UserPrincipalName = 'ref@contoso.com' }) } }
+        InModuleScope Coretelligent.SharePoint { $script:CtgSiteCache = @{} }
+        $script:Ctx = { @{ AppId = 'app'; Tenant = 'contoso.com'; CertArgs = @{ CertificateThumbprint = 'AB' }; AdminUrl = 'https://contoso-admin.sharepoint.com' } }
+    }
+
+    # N1: a single-pattern client whose primary jsmith@ is an EXISTING John Smith, with m365 paused on a
+    # collision decision. No provisionedUpn yet and no fallbacks, so the first cut mirrored onto him.
+    It 'onboard waits for the created account while the case has a cloud-account step, even with one candidate' {
+        foreach ($p in @(
+                [pscustomobject]@{ UserPrincipalName = 'jsmith@contoso.com'; cloudAccountStep = $true; provisionedUpn = $null },
+                [pscustomobject]@{ UserPrincipalName = 'jsmith@contoso.com' })) {   # flag absent (older app) = wait too
+            { Invoke-CtgSharePointSiteGroupsStep -Lane onboard -Payload $p -Config ([pscustomobject]@{ mirrorFromUser = 'ref@contoso.com' }) -Context $script:Ctx } |
+                Should -Throw "*Microsoft 365 step hasn't reported the account*"
+        }
+        Should -Invoke Add-PnPGroupMember -ModuleName Coretelligent.SharePoint -Times 0 -Exactly
+        Should -Invoke Get-PnPTenantSite -ModuleName Coretelligent.SharePoint -Times 0 -Exactly
+    }
+
+    # N2: a site created inside the 6 h cache window was never walked on offboard.
+    It 'offboard always lists sites fresh (and refreshes the cache); onboard may reuse it' {
+        $null = Invoke-CtgSharePointSiteGroupsStep -Lane offboard -Payload ([pscustomobject]@{}) -LeaverUpn 'leaver@contoso.com' -Context $script:Ctx
+        $global:SpNewSite = $true
+        $null = Invoke-CtgSharePointSiteGroupsStep -Lane offboard -Payload ([pscustomobject]@{}) -LeaverUpn 'leaver@contoso.com' -Context $script:Ctx
+        Should -Invoke Get-PnPTenantSite -ModuleName Coretelligent.SharePoint -Times 2 -Exactly
+        Should -Invoke Connect-PnPOnline -ModuleName Coretelligent.SharePoint -Times 1 -Exactly -ParameterFilter { $Url -match 'NewProject' }
+        # That fresh listing refreshed the cache, so an onboard mirror right after reuses it: no third listing.
+        $null = Invoke-CtgSharePointSiteGroupsStep -Lane onboard -Payload ([pscustomobject]@{ provisionedUpn = 'new@contoso.com' }) -Config ([pscustomobject]@{ mirrorFromUser = 'ref@contoso.com' }) -Context $script:Ctx
+        Should -Invoke Get-PnPTenantSite -ModuleName Coretelligent.SharePoint -Times 2 -Exactly
+        Should -Invoke Connect-PnPOnline -ModuleName Coretelligent.SharePoint -Times 2 -Exactly -ParameterFilter { $Url -match 'NewProject' }
     }
 }
