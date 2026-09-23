@@ -91,3 +91,55 @@ Describe 'Confirm-CtgGoogle — per-case delete' {
         $v.ok | Should -BeFalse
     }
 }
+
+# Review round 3: a held delete fails Confirm on purpose, and a failed Confirm makes the runner re-run the
+# whole executor ($MaxRevalidate times) — which, with the transfer state unreadable, posted the Drive
+# transfer on every pass. The loop is lifted from Start-IamRunner.ps1 (not dot-sourceable) and run for
+# real against the Google executor + validator.
+Describe 'Invoke-JobWithValidation — a held Google delete' {
+    BeforeAll {
+        $runner = Get-Content "$PSScriptRoot/../Start-IamRunner.ps1" -Raw
+        $fn = [regex]::Match($runner, '(?ms)^function Invoke-JobWithValidation\s*\{.*?^\}')
+        $fn.Success | Should -BeTrue -Because 'Start-IamRunner.ps1 must declare Invoke-JobWithValidation'
+        . ([scriptblock]::Create($fn.Value))
+        $max = [regex]::Match($runner, '(?m)^\$MaxRevalidate\s*=\s*(\d+)')
+        $max.Success | Should -BeTrue
+        $script:MaxRevalidate = [int]$max.Groups[1].Value
+        $script:Handler = @{ Validate = { param($job, $creds) Confirm-CtgGoogle -User $job.payload -Config $job.config -Action offboard } }
+        $script:Fn = { param($job, $creds) Invoke-CtgGoogleOffboarding -User $job.payload -Config $job.config }
+        $script:HeldApi = {
+            param($Method, $Path, $Body)
+            if ($Method -eq 'GET' -and $Path -like '*/datatransfer/v1/transfers*') { return $null }   # status unreadable
+            if ($Method -eq 'GET' -and $Path -like '/users/*') { return [pscustomobject]@{ primaryEmail = 'jdoe@brightonpark.com'; id = '1234567890'; suspended = $true; orgUnitPath = '/Email & Calendar/Inactive' } }
+            if ($Method -eq 'GET' -and $Path -like '/groups*') { return [pscustomobject]@{ groups = @() } }
+            return $null
+        }
+    }
+    BeforeEach { InModuleScope Coretelligent.GoogleWorkspace { $script:GoogleTransfersPosted = @{} } }
+    It 'posts the Drive transfer once and does not re-run the executor for a held delete' {
+        Mock Start-Sleep { }
+        Mock Invoke-CtgGoogleApi -ModuleName Coretelligent.GoogleWorkspace -MockWith $script:HeldApi
+        $job = [pscustomobject]@{ payload = $script:User; config = [pscustomobject]@{ deleteUser = $true; transferTarget = 'boss@brightonpark.com'; signOut = $false } }
+        $out = Invoke-JobWithValidation -Job $job -Handler $script:Handler -Fn $script:Fn -Creds $null -DryRun $false
+        $out.Validation.ok | Should -BeFalse
+        Should -Invoke Invoke-CtgGoogleApi -ModuleName Coretelligent.GoogleWorkspace -Times 1 -Exactly -ParameterFilter { $Method -eq 'POST' -and $Path -eq '/dataTransfer' }
+        Should -Invoke Invoke-CtgGoogleApi -ModuleName Coretelligent.GoogleWorkspace -Times 1 -Exactly -ParameterFilter { $Method -eq 'PUT' -and $Body.suspended -eq $true }
+    }
+    It 'an operator re-run on the same runner does not post the transfer again while its status is unreadable' {
+        Mock Start-Sleep { }
+        Mock Invoke-CtgGoogleApi -ModuleName Coretelligent.GoogleWorkspace -MockWith $script:HeldApi
+        $job = [pscustomobject]@{ payload = $script:User; config = [pscustomobject]@{ deleteUser = $true; transferTarget = 'boss@brightonpark.com'; signOut = $false } }
+        $null = Invoke-JobWithValidation -Job $job -Handler $script:Handler -Fn $script:Fn -Creds $null -DryRun $false
+        $second = Invoke-JobWithValidation -Job $job -Handler $script:Handler -Fn $script:Fn -Creds $null -DryRun $false
+        Should -Invoke Invoke-CtgGoogleApi -ModuleName Coretelligent.GoogleWorkspace -Times 1 -Exactly -ParameterFilter { $Method -eq 'POST' -and $Path -eq '/dataTransfer' }
+        ($second.Result.Actions -join "`n") | Should -Match 'already requested'
+    }
+    It 'still revalidates an ordinary miss (the loop is only cut short when re-running cannot help)' {
+        Mock Start-Sleep { }
+        $script:Runs = 0
+        $fn = { param($job, $creds) $script:Runs++; [pscustomobject]@{ Status = 'ok' } }
+        $h = @{ Validate = { param($job, $creds) [pscustomobject]@{ ok = $false; checks = @() } } }
+        $null = Invoke-JobWithValidation -Job ([pscustomobject]@{}) -Handler $h -Fn $fn -Creds $null -DryRun $false
+        $script:Runs | Should -Be (1 + $script:MaxRevalidate)
+    }
+}

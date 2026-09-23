@@ -336,6 +336,12 @@ function Invoke-CtgGoogleOnboarding {
 # transfer from this owner), or 'unknown' when it cannot be read — most often because the domain has not
 # delegated the admin.datatransfer scope. 'unknown' is never read as complete.
 $script:GoogleTransferApiUrl = 'https://admin.googleapis.com/admin/datatransfer/v1'
+# Transfers THIS runner posted, keyed "owner|target" -> when. When Google's own status can't be read (or
+# shows nothing yet), this is what stops a re-run — the runner's revalidation pass, an auto-retry or an
+# operator re-run — posting the same transfer again. Kept for 24h; a different runner process can't see
+# it, so at worst it posts once more there.
+$script:GoogleTransfersPosted = @{}
+$script:GoogleTransferMemoHours = 24
 function Get-CtgGoogleTransferState {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$UserId)
@@ -405,12 +411,17 @@ function Invoke-CtgGoogleOffboarding {
         if ($transferState -in 'inProgress', 'completed') {
             $actions.Add("Drive transfer to $transfer already $(if ($transferState -eq 'completed') { 'complete' } else { 'in progress' }) in Google — not posted again")
         }
+        elseif ($script:GoogleTransfersPosted.ContainsKey("$email|$transfer") -and
+            ([datetime]::UtcNow - $script:GoogleTransfersPosted["$email|$transfer"]).TotalHours -lt $script:GoogleTransferMemoHours) {
+            $actions.Add("Drive transfer to $transfer already requested by this runner at $($script:GoogleTransfersPosted["$email|$transfer"].ToString('u')) — not posted again (Google's transfer status can't be read here)")
+        }
         elseif ($transferState -eq 'failed') {
             $actions.Add("WARN Drive transfer to $transfer FAILED in Google — not posted again. Check the transfer in the Google Admin console.")
         }
         elseif ($PSCmdlet.ShouldProcess($email, "Transfer Drive to $transfer")) {
             Invoke-CtgGoogleApi -Method POST -Path '/dataTransfer' -Body @{ oldOwnerUserId = $email; newOwnerUserId = $transfer } | Out-Null
             $actions.Add("transferred Drive ownership to: $transfer")
+            $script:GoogleTransfersPosted["$email|$transfer"] = [datetime]::UtcNow
             # Just posted: running now, if we can see transfers at all.
             if ($transferState -ne 'unknown') { $transferState = 'inProgress' }
         }
@@ -578,7 +589,14 @@ function Confirm-CtgGoogle {
         }
     }
     $ok = -not ($checks | Where-Object { -not $_.pass })
-    [pscustomobject]@{ ok = [bool]$ok; checks = @($checks) }
+    $v = [pscustomobject]@{ ok = [bool]$ok; checks = @($checks) }
+    # A delete held for a Drive transfer is work left to a human (or to the auto-retry that re-checks the
+    # transfer) — re-running the executor right now cannot finish it, so tell the runner's revalidation
+    # loop not to (it would only repeat the offboard, transfer post included).
+    if (-not $ok -and $Action -eq 'offboard' -and $u -and (Get-CtgProp $Config 'deleteUser') -eq $true -and (Get-CtgProp $Config 'transferTarget')) {
+        $v | Add-Member -NotePropertyName final -NotePropertyValue $true
+    }
+    $v
 }
 
 # ── Ad-hoc password reset (INC0855142) ───────────────────────────────────────────────────────────
