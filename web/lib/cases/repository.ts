@@ -256,6 +256,7 @@ export function makeCaseRepository(db: PrismaClient) {
     async replanInputs(caseId: string): Promise<
       | { serviceNowCaseNumber: string | null; action: Action; payload: Record<string, unknown>;
           emailDomainOverride: string | null;
+          requestedSystems: string[]; skippedSystems: string[];
           client: {
             id: string; slug: string; primaryDomain: string; backbone: string | null;
             emailDomain: string | null; emailDomainLocked: boolean; serviceNowSysId: string | null;
@@ -270,7 +271,7 @@ export function makeCaseRepository(db: PrismaClient) {
       const c = await db.caseRequest.findUnique({
         where: { id: caseId },
         select: {
-          serviceNowCaseNumber: true, action: true, payload: true, emailDomainOverride: true,
+          serviceNowCaseNumber: true, action: true, payload: true, emailDomainOverride: true, requestedSystems: true, skippedSystems: true,
           client: {
             select: {
               // `backbone` must stay in this select: the planner's ad_synced injections (the FR#36
@@ -305,6 +306,7 @@ export function makeCaseRepository(db: PrismaClient) {
         action: c.action,
         payload: (c.payload ?? {}) as Record<string, unknown>,
         emailDomainOverride: c.emailDomainOverride,
+        requestedSystems: c.requestedSystems, skippedSystems: c.skippedSystems,
         client: { ...inherited, notNeededSecrets, wiredOptionalSecrets },
         started: hasStartedJobs(c.jobs),
       };
@@ -583,6 +585,7 @@ export function makeCaseRepository(db: PrismaClient) {
           id: true, action: true, status: true, subject: true, pausedAt: true, pausedReason: true, scheduledFor: true,
           serviceNowCaseNumber: true, createdAt: true, clientId: true, payload: true, secretOverrides: true,
           createdBy: true, createdSource: true,
+          snAssignedTo: true, snAssignedToEmail: true, snAssigneeCheckedAt: true,
           client: { select: { name: true, slug: true, parentId: true } },
           jobs: { select: { systemKey: true, sequence: true, status: true, mode: true, error: true, request: true, startedAt: true, finishedAt: true } },
         },
@@ -762,6 +765,7 @@ export function makeCaseRepository(db: PrismaClient) {
           lastActionBy: lastActionByCase.get(r.id)?.by ?? null,
           createdBy: r.createdBy?.startsWith("user:") ? r.createdBy.slice(5) : (r.createdBy ?? null),
           createdSource: r.createdSource,
+          snAssignedTo: r.snAssignedTo, snAssignedToEmail: r.snAssignedToEmail, snAssigneeCheckedAt: r.snAssigneeCheckedAt,
           readiness, readinessMissing: planMissing,
           clientName: r.client.name, clientSlug: r.client.slug, jobCount: r.jobs.length,
           statusHint: needsInfo
