@@ -3,7 +3,8 @@
 # Coretelligent.GoogleWorkspace
 # Google Workspace user lifecycle via the Admin SDK Directory API. Onboard creates a user,
 # places them in an OU (never Root) and adds group memberships; offboard captures evidence,
-# removes groups, moves to the Inactive OU and SUSPENDS (never deletes — the `archive` module
+# removes groups, moves to the Inactive OU and SUSPENDS (deletes only when a case chose it — FR #128,
+# approval-gated; otherwise the `archive` module
 # handles deletion later). Idempotent: checks state before changing it.
 #
 # Auth: domain-wide-delegated service account. Secret `google-admin` -> a bearer access token
@@ -398,10 +399,19 @@ function Invoke-CtgGoogleOffboarding {
         }
     }
 
-    # 5. Suspend (deactivate) — NEVER delete.
+    # 5. Suspend (deactivate) — the default. FR #128: a case can choose DELETE instead (config.deleteUser,
+    # set per case and always approval-gated with evidence — see the app's offboard-actions). Google keeps
+    # a deleted user restorable for 20 days. A Drive transfer runs asynchronously in Google, and deleting
+    # the owner before it finishes loses the files — so with a transfer requested the delete is HELD:
+    # the user is suspended and the step says to delete once the transfer has completed.
+    $deleteUser = (Get-CtgProp $Config 'deleteUser') -eq $true
+    $holdDelete = $deleteUser -and [bool]$transfer
     if ($PSCmdlet.ShouldProcess($email, "Suspend Google user")) {
         Invoke-CtgGoogleApi -Method PUT -Path "/users/$email" -Body @{ suspended = $true } | Out-Null
         $actions.Add("suspended Google user: $email")
+    }
+    if ($holdDelete) {
+        $actions.Add("WARN delete held — a Drive transfer to $transfer was requested and Google runs it in the background; deleting the account before it finishes would lose the files. The user is suspended. Delete them in the Google Admin console once the transfer shows complete.")
     }
 
     # 6. Sign the user out everywhere — revokes their SESSIONS and OAuth refresh tokens.
@@ -444,6 +454,14 @@ function Invoke-CtgGoogleOffboarding {
         }
     }
 
+    # 7. FR #128: delete, when this case chose it (and no Drive transfer is pending — see step 5). Last,
+    # so everything above ran against a live account; evidence was already captured in step 1.
+    if ($deleteUser -and -not $holdDelete -and $PSCmdlet.ShouldProcess($email, "Delete Google user")) {
+        # A 404 means it's already gone — the idempotent re-run case, not a failure.
+        Invoke-CtgGoogleApi -Method DELETE -Path "/users/$email" | Out-Null
+        $actions.Add("deleted Google user: $email (restorable in the Admin console for 20 days)")
+    }
+
     [pscustomobject]@{
         System   = 'google-workspace'
         Status   = 'ok'
@@ -480,6 +498,10 @@ function Confirm-CtgGoogle {
     if ($Action -eq 'onboard') {
         $checks.Add(@{ name = 'Google user present'; expected = $true; actual = [bool]$u; pass = [bool]$u })
         $checks.Add(@{ name = 'not in Root OU'; expected = $true; actual = ($ou -and $ou -ne '/'); pass = [bool]($ou -and $ou -ne '/') })
+    }
+    elseif ((Get-CtgProp $Config 'deleteUser') -eq $true -and -not (Get-CtgProp $Config 'transferTarget')) {
+        # FR #128: this case chose delete — the only thing to verify is that the account is gone.
+        $checks.Add(@{ name = 'Google user deleted'; expected = $true; actual = (-not $u); pass = (-not $u) })
     }
     else {
         $checks.Add(@{ name = 'Google user suspended (not deleted)'; expected = $true; actual = $suspended; pass = $suspended })

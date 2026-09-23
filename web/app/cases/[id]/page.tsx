@@ -25,6 +25,7 @@ import { LocalDateTime } from "../../_components/local-datetime";
 import { CollapsibleSection } from "../../_components/collapsible-section";
 import { caseEffectiveDate } from "@/lib/cases/schedule";
 import { IntakePanel } from "../_components/intake-panel";
+import { OffboardActionsControl, type OffboardActionRow } from "../_components/offboard-actions-control";
 import { hasStartedJobs } from "@/lib/cases/job-status";
 import { isMilestoneCase } from "@/lib/eggs/occasions";
 import { pickResetSourceJob } from "@/lib/jobs/password-reset";
@@ -101,6 +102,19 @@ export default async function CaseDetailPage({ params }: { params: { id: string 
   // The case's effective date string — the ScheduleButton computes its suggested time from this in
   // the BROWSER (so "08:00" / "+5 min" land in the operator's timezone, not the server's).
   const effectiveDate = caseEffectiveDate(c.action, c.payload, c.subject);
+
+  // FR #128: per-case offboard actions (delete vs keep) for the systems clients ask to vary. The current
+  // choice is read off the planned job's config, so it shows what this case will really do.
+  const offboardActionRows: OffboardActionRow[] = c.action === "offboard"
+    ? (await db.job.findMany({ where: { caseRequestId: c.id, systemKey: { in: ["google-workspace", "exchange", "spanning"] } }, select: { systemKey: true, status: true, request: true } }))
+        .map((j) => {
+          const cfg = ((j.request ?? {}) as { config?: Record<string, unknown> }).config ?? {};
+          const current = j.systemKey === "google-workspace" ? (cfg.deleteUser === true ? "delete" : "suspend")
+            : j.systemKey === "exchange" ? (cfg.convertToShared === false ? "delete" : "convert")
+            : (cfg.removeLicense || cfg.unassign ? "remove" : "archive");
+          return { systemKey: j.systemKey as OffboardActionRow["systemKey"], current, locked: ["dispatched", "running", "succeeded", "failed"].includes(j.status) };
+        })
+    : [];
 
   // Multi-domain clients: the domains this case may onboard under + the persisted per-case pick.
   const domainRow = c.action === "onboard"
@@ -184,6 +198,12 @@ export default async function CaseDetailPage({ params }: { params: { id: string 
       )}
 
       {changePreviewDiffs && <ChangePreview caseId={c.id} diffs={changePreviewDiffs} />}
+
+      {offboardActionRows.length > 0 && (
+        <CollapsibleSection title="Offboard actions">
+          <OffboardActionsControl caseId={c.id} rows={offboardActionRows} canEdit={canRevealPassword} />
+        </CollapsibleSection>
+      )}
 
       {/* Dry run is no longer offered as an option (WhatIf suppresses cmdlet output, producing
           false failures like unset $userId). We still surface an exit path for any case already
