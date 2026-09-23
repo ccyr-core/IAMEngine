@@ -20,6 +20,8 @@ BeforeAll {
 AfterAll { Remove-Module Coretelligent.GoogleWorkspace -Force -ErrorAction SilentlyContinue }
 
 Describe 'Drive ownership transfer on offboard' {
+    # PR #110's per-runner memory of posted transfers would otherwise carry between tests.
+    BeforeEach { InModuleScope Coretelligent.GoogleWorkspace { $script:GoogleTransfersPosted = @{} } }
     It 'requests the transfer from the Data Transfer API with user ids and the Drive app id, on its own token' {
         MockDirectory
         Mock Get-CtgGoogleScopedToken -ModuleName Coretelligent.GoogleWorkspace { 'dt-token' }
