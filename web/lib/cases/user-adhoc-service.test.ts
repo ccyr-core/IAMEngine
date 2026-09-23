@@ -20,7 +20,7 @@ const DEFAULT_JOBS = (): J[] => [
 ];
 
 // An in-memory case: dispatched jobs join the case's job list, so a later dispatch / commit sees them.
-function stubDb(opts: { action?: string; ageDays?: number; jobs?: J[]; payload?: Record<string, unknown>; client?: { backbone: string | null; identity: unknown }; busyInTx?: string; agents?: Array<{ name: string; semver: string | null }> } = {}) {
+function stubDb(opts: { action?: string; ageDays?: number; jobs?: J[]; payload?: Record<string, unknown>; client?: { backbone: string | null; identity: unknown }; busyInTx?: string; agents?: Array<{ name: string; semver: string | null; capabilities?: unknown }> } = {}) {
   const created: Array<Record<string, unknown>> = [];
   const updates: Array<Record<string, unknown>> = [];
   const raw: string[] = [];
@@ -376,5 +376,19 @@ test("N3: an AD correct/remove is refused when every runner of the client is old
   assert.match(String((r as { error: string }).error), /updated to 1\.127\.0 or later .* dc01 \(1\.126\.4\), dc02 \(version unknown\)/);
   assert.equal(created.length, 0);
   const ok = stubDb({ agents: [{ name: "dc01", semver: "1.126.4" }, { name: "dc02", semver: "1.127.0" }] });
+  assert.equal((await dispatchUserAdhoc(ok.db, "case", "remove", "t")).ok, true);
+});
+
+test("N3 (final review): refused when the client has no enabled runner, or none that can run AD", async () => {
+  const none = stubDb({ agents: [] });
+  const r1 = await dispatchUserAdhoc(none.db, "case", "remove", "t");
+  assert.equal(r1.ok, false);
+  assert.match(String((r1 as { error: string }).error), /no enabled runner/);
+  assert.equal(none.created.length, 0);
+  const noAd = stubDb({ agents: [{ name: "fs01", semver: "1.127.0", capabilities: ["directory-sync"] }] });
+  const r2 = await dispatchUserAdhoc(noAd.db, "case", "correct", "t", { firstName: "Jon" });
+  assert.equal(r2.ok, false);
+  assert.match(String((r2 as { error: string }).error), /none of the client's runners can run Active Directory steps \(fs01\)/);
+  const ok = stubDb({ agents: [{ name: "fs01", semver: "1.127.0", capabilities: ["directory-sync"] }, { name: "dc01", semver: "1.127.0", capabilities: ["active-directory"] }] });
   assert.equal((await dispatchUserAdhoc(ok.db, "case", "remove", "t")).ok, true);
 });

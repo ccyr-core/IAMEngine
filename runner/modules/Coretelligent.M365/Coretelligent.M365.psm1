@@ -1099,10 +1099,15 @@ function Invoke-CtgM365Onboarding {
                 $found = $null
                 for ($i = 0; $i -lt 3 -and -not $found; $i++) {
                     if ($i) { Start-Sleep -Seconds (2 * $i) }
-                    $found = Get-MgUser -UserId $upn -ErrorAction SilentlyContinue
+                    $found = Get-MgUser -UserId $upn -Property 'id,userPrincipalName,createdDateTime' -ErrorAction SilentlyContinue
                 }
                 if (-not $found) { throw }
                 $userId = $found.Id
+                # FR #88: this onboard did NOT create it — report it as found, with its creation date, so
+                # the app's date check decides whether it's this case's account (Remove never purges
+                # one that pre-dates the case).
+                $ctgAdopted = $true
+                $ctgAccountCreated = Get-CtgProp $found 'CreatedDateTime'
                 $actions.Add("user already exists ($upn) — confirmed by UPN, continuing to licensing/groups")
             }
         }

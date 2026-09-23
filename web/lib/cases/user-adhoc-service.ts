@@ -24,6 +24,7 @@ import {
   preexistingAccounts, removeDeletedSomething, AD_USER_ADHOC_KEYS, userAdhocVersionExclusions, USER_ADHOC_MIN_RUNNER,
 } from "../jobs/user-adhoc";
 import { adUpnFor, STANDALONE } from "../profiles/ad-domain";
+import { parseCapabilities, onPremExclusions } from "../runner/capabilities";
 import { resolveActor, type ActorInput } from "../auth/actor";
 
 export type UserAdhocResult =
@@ -102,14 +103,23 @@ export async function dispatchUserAdhoc(
       return { ok: false, status: 409, error: `"Remove user" deletes only accounts this case created, and these existed before it (a rehire or an adopted account) — offboard the user instead: ${pre.join("; ")}` };
     }
   }
-  // Round 3 (N3): the AD keys run on the client's own runner. One older than the correct/remove
-  // executors is never offered them, so the job would sit pending forever and block every later
-  // Correct/Remove on the case — refuse now and say what to update.
-  if ([...sources.keys()].some((k) => AD_USER_ADHOC_KEYS.includes(k))) {
-    const agents = await db.agent.findMany({ where: { clientId: c.clientId, enabled: true }, select: { name: true, semver: true } });
-    if (agents.length && agents.every((a) => userAdhocVersionExclusions(a.semver).length > 0)) {
-      const list = agents.map((a) => `${a.name} (${a.semver ?? "version unknown"})`).join(", ");
-      return { ok: false, status: 409, error: `the client's runner must be updated to ${USER_ADHOC_MIN_RUNNER} or later before it can ${kind === "remove" ? "remove" : "correct"} the AD account — ${list}` };
+  // Round 3 (N3): the AD keys run on the client's own runner. If no enabled runner of the client can
+  // claim them — none at all, none with the AD module (the on-prem capability gate), or all older than
+  // the correct/remove executors — the job would sit pending forever and block every later
+  // Correct/Remove on the case. Refuse now and say what to fix.
+  const adKey = [...sources.keys()].find((k) => AD_USER_ADHOC_KEYS.includes(k));
+  if (adKey) {
+    const verb = kind === "remove" ? "remove" : "correct";
+    const agents = await db.agent.findMany({ where: { clientId: c.clientId, enabled: true }, select: { name: true, semver: true, capabilities: true } });
+    const capable = agents.filter((a) => !onPremExclusions(parseCapabilities(a.capabilities)).includes(adKey));
+    if (capable.length === 0) {
+      return { ok: false, status: 409, error: agents.length
+        ? `none of the client's runners can run Active Directory steps (${agents.map((a) => a.name).join(", ")}), so it can't ${verb} the AD account — check the AD module on the client's runner`
+        : `the client has no enabled runner, so it can't ${verb} the AD account — enable or install the client's runner first` };
+    }
+    if (capable.every((a) => userAdhocVersionExclusions(a.semver).length > 0)) {
+      const list = capable.map((a) => `${a.name} (${a.semver ?? "version unknown"})`).join(", ");
+      return { ok: false, status: 409, error: `the client's runner must be updated to ${USER_ADHOC_MIN_RUNNER} or later before it can ${verb} the AD account — ${list}` };
     }
   }
   const previousIdentity = identityOf(payload);
