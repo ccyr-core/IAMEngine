@@ -226,8 +226,21 @@ export function planCase(
     if (key === "exchange") return declared.filter((d) => !OFFBOARD_LICENCE_SYSTEMS.includes(d));
     return declared;
   };
+  // ONBOARD invariant (FR #118): the sharepoint mirror acts on the account the m365/entra step CREATED
+  // (it may be a fallback username), which the app only knows once that step has succeeded. A row added
+  // in the systems editor carries dependsOn [] and would otherwise be claimed in parallel. So sharepoint
+  // always waits for whichever cloud-account step is in the plan, and those drop any declared edge back
+  // onto sharepoint so the rule can't form a cycle.
+  const CLOUD_ACCOUNT_SYSTEMS = ["m365", "entra"];
+  const cloudAccountKeys = action === "onboard" && byKey.has("sharepoint") ? CLOUD_ACCOUNT_SYSTEMS.filter((k) => byKey.has(k)) : [];
+  const onboardOrdered = (key: string, declared: string[]): string[] => {
+    if (cloudAccountKeys.length === 0) return declared;
+    if (key === "sharepoint") return [...new Set([...declared, ...cloudAccountKeys])];
+    if (cloudAccountKeys.includes(key)) return declared.filter((d) => d !== "sharepoint");
+    return declared;
+  };
   const depsOf = (s: ClientSystem): string[] => {
-    const declared = offboardOrdered(s.systemKey, pipelineDeps?.get(s.systemKey) ?? declaredOf(s));
+    const declared = onboardOrdered(s.systemKey, offboardOrdered(s.systemKey, pipelineDeps?.get(s.systemKey) ?? declaredOf(s)));
     if (!runLast(s)) return declared;
     const everyoneElse = active.filter((o) => o.systemKey !== s.systemKey && !runLast(o)).map((o) => o.systemKey);
     return [...new Set([...declared, ...everyoneElse])];
