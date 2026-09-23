@@ -551,26 +551,35 @@ function Resolve-CtgSharePointMirrorUser {
 }
 
 # The account the new hire actually got. The m365/entra step may have created them at a FALLBACK
-# username (the primary belonged to someone else), and the app hands that result on as
-# payload.provisionedUpn. Without it, the primary username is never used while the case HAS a
-# cloud-account step (payload.cloudAccountStep, set by the app): the primary may belong to someone
-# else, e.g. a single-pattern client whose jsmith@ is an existing John Smith while m365 waits on a
-# collision decision. Mirroring onto that account would give a stranger the groups. Only an explicit
-# cloudAccountStep = false (no m365/entra step on the case) allows the primary, and then only as the
-# sole candidate.
+# username (the primary belonged to someone else). In order:
+#   1. payload.provisionedUpn: the app hands on the account a succeeded m365/entra api step reported.
+#   2. payload.awaitCloudAccount = true: an api m365/entra step that CAN report the account hasn't
+#      finished, e.g. it is waiting on a username-collision decision while its primary jsmith@
+#      belongs to an existing John Smith. Refuse and say we're waiting; never guess the primary.
+#      An absent flag (an app from before this hand-off) is treated the same way.
+#   3. Otherwise no step will ever report it (m365 is a manual checklist item, scim, done by hand,
+#      skipped, or succeeded without a Upn). Use the username an OPERATOR set on the case
+#      (fieldSource.userPrincipalName = 'operator', written by the case's field edit and by the
+#      dry-run review's Username override).
+#   4. Else the primary username, but only when it is the SOLE candidate; with fallbacks, refuse and
+#      name the field to set.
 function Resolve-CtgSharePointNewHireUpn {
     param($Payload)
     $provisioned = [string](Get-CtgProp $Payload 'provisionedUpn')
     if ($provisioned) { return $provisioned }
-    # Absent (an app from before this hand-off) is treated as "there may be one": wait, don't guess.
-    if ((Get-CtgProp $Payload 'cloudAccountStep') -ne $false) {
-        throw "the Microsoft 365 step hasn't reported the account it created for the new hire yet (it hasn't succeeded, is waiting on a decision, or was completed by hand), so SharePoint site groups were not mirrored — the username on the case could still belong to someone else. Finish the Microsoft 365 step, then re-run this one."
+    if ((Get-CtgProp $Payload 'awaitCloudAccount') -ne $false) {
+        throw "waiting for the Microsoft 365 step to create the new hire's account — it hasn't finished yet (it may be waiting on a decision), and the username on the case could still belong to someone else. SharePoint site groups were not mirrored; re-run this step once the Microsoft 365 step has succeeded."
     }
-    $primary = @(@('UserPrincipalName', 'email', 'workEmail') | ForEach-Object { [string](Get-CtgProp $Payload $_) } | Where-Object { $_ } | Select-Object -First 1)
-    $upn = if ($primary.Count) { $primary[0] } else { '' }
+    $upn = [string](Get-CtgProp $Payload 'UserPrincipalName')
+    $source = [string](Get-CtgProp (Get-CtgProp $Payload 'fieldSource') 'userPrincipalName')
+    if ($upn -and $source -ieq 'operator') { return $upn }
+    if (-not $upn) {
+        $alt = @(@('email', 'workEmail') | ForEach-Object { [string](Get-CtgProp $Payload $_) } | Where-Object { $_ } | Select-Object -First 1)
+        $upn = if ($alt.Count) { $alt[0] } else { '' }
+    }
     $fallbacks = @(@(Get-CtgProp $Payload 'UserPrincipalNameFallbacks') | Where-Object { $_ -and ([string]$_) -ine $upn })
     if ($upn -and $fallbacks.Count) {
-        throw "can't tell which account the Microsoft 365 step created for the new hire — it tries $upn, then $($fallbacks -join ', '), and its result hasn't reached this step (it hasn't succeeded, or was completed by hand). Complete the Microsoft 365 step (or set the user's UPN on the case) and re-run."
+        throw "can't tell which account the new hire was created with: the Microsoft 365 step didn't report one, and the username could be $upn or $($fallbacks -join ', '). Set Username (userPrincipalName) on the case to the account that was actually created, then re-run this step."
     }
     return $upn
 }

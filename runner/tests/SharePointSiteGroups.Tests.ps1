@@ -179,15 +179,39 @@ Describe 'review fixes' {
         Should -Invoke Add-PnPGroupMember -ModuleName Coretelligent.SharePoint -Times 0 -Exactly -ParameterFilter { $LoginName -match 'jsmith@' }
     }
     It 'onboard refuses to guess between username candidates when the created account is unknown' {
-        $p = [pscustomobject]@{ UserPrincipalName = 'jsmith@contoso.com'; UserPrincipalNameFallbacks = @('john.smith2@contoso.com'); cloudAccountStep = $false }
+        $p = [pscustomobject]@{ UserPrincipalName = 'jsmith@contoso.com'; UserPrincipalNameFallbacks = @('john.smith2@contoso.com'); awaitCloudAccount = $false }
         { Invoke-CtgSharePointSiteGroupsStep -Lane onboard -Payload $p -Config ([pscustomobject]@{ mirrorFromUser = 'ref@contoso.com' }) -Context $script:Ctx } |
-            Should -Throw '*which account*'
+            Should -Throw '*which account*Set Username (userPrincipalName) on the case*'
         Should -Invoke Add-PnPGroupMember -ModuleName Coretelligent.SharePoint -Times 0 -Exactly
     }
-    It 'onboard with a single username candidate and NO cloud-account step on the case uses it' {
-        $r = Invoke-CtgSharePointSiteGroupsStep -Lane onboard -Payload ([pscustomobject]@{ UserPrincipalName = 'new@contoso.com'; cloudAccountStep = $false }) -Config ([pscustomobject]@{ mirrorFromUser = 'ref@contoso.com' }) -Context $script:Ctx
+    It 'onboard with a single username candidate and no step that will report the account uses it' {
+        $r = Invoke-CtgSharePointSiteGroupsStep -Lane onboard -Payload ([pscustomobject]@{ UserPrincipalName = 'new@contoso.com'; awaitCloudAccount = $false }) -Config ([pscustomobject]@{ mirrorFromUser = 'ref@contoso.com' }) -Context $script:Ctx
         $r.Email | Should -Be 'new@contoso.com'
         Should -Invoke Add-PnPGroupMember -ModuleName Coretelligent.SharePoint -Times 2 -Exactly
+    }
+    # Review 3: m365 is a manual checklist item / scim / done by hand, so nothing will ever report the
+    # account. With fallbacks, the Username an operator set on the case is the created account.
+    It 'onboard with no reporting step uses the Username an operator set on the case, even with fallbacks' {
+        $p = [pscustomobject]@{
+            UserPrincipalName = 'john.smith2@contoso.com'; UserPrincipalNameFallbacks = @('jsmith@contoso.com', 'john.smith2@contoso.com')
+            awaitCloudAccount = $false; fieldSource = [pscustomobject]@{ userPrincipalName = 'operator' }
+        }
+        $r = Invoke-CtgSharePointSiteGroupsStep -Lane onboard -Payload $p -Config ([pscustomobject]@{ mirrorFromUser = 'ref@contoso.com' }) -Context $script:Ctx
+        $r.Email | Should -Be 'john.smith2@contoso.com'
+        Should -Invoke Add-PnPGroupMember -ModuleName Coretelligent.SharePoint -Times 2 -Exactly -ParameterFilter { $LoginName -eq 'i:0#.f|membership|john.smith2@contoso.com' }
+    }
+    It 'an intake-derived Username (not operator-set) with fallbacks still refuses, naming the field to set' {
+        $p = [pscustomobject]@{
+            UserPrincipalName = 'jsmith@contoso.com'; UserPrincipalNameFallbacks = @('john.smith2@contoso.com')
+            awaitCloudAccount = $false; fieldSource = [pscustomobject]@{ userPrincipalName = 'intake' }
+        }
+        { Invoke-CtgSharePointSiteGroupsStep -Lane onboard -Payload $p -Config ([pscustomobject]@{ mirrorFromUser = 'ref@contoso.com' }) -Context $script:Ctx } |
+            Should -Throw '*Set Username (userPrincipalName) on the case*'
+    }
+    It 'the provisioned account always wins over an operator-set Username' {
+        $p = [pscustomobject]@{ UserPrincipalName = 'jsmith@contoso.com'; provisionedUpn = 'john.smith2@contoso.com'; fieldSource = [pscustomobject]@{ userPrincipalName = 'operator' } }
+        $r = Invoke-CtgSharePointSiteGroupsStep -Lane onboard -Payload $p -Config ([pscustomobject]@{ mirrorFromUser = 'ref@contoso.com' }) -Context $script:Ctx
+        $r.Email | Should -Be 'john.smith2@contoso.com'
     }
 
     # Finding 4: the mirror user was resolved by display name with -Top 1 — two people, arbitrary pick.
@@ -241,10 +265,10 @@ Describe 'second review fixes' {
     # collision decision. No provisionedUpn yet and no fallbacks, so the first cut mirrored onto him.
     It 'onboard waits for the created account while the case has a cloud-account step, even with one candidate' {
         foreach ($p in @(
-                [pscustomobject]@{ UserPrincipalName = 'jsmith@contoso.com'; cloudAccountStep = $true; provisionedUpn = $null },
+                [pscustomobject]@{ UserPrincipalName = 'jsmith@contoso.com'; awaitCloudAccount = $true; provisionedUpn = $null },
                 [pscustomobject]@{ UserPrincipalName = 'jsmith@contoso.com' })) {   # flag absent (older app) = wait too
             { Invoke-CtgSharePointSiteGroupsStep -Lane onboard -Payload $p -Config ([pscustomobject]@{ mirrorFromUser = 'ref@contoso.com' }) -Context $script:Ctx } |
-                Should -Throw "*Microsoft 365 step hasn't reported the account*"
+                Should -Throw '*waiting for the Microsoft 365 step*'
         }
         Should -Invoke Add-PnPGroupMember -ModuleName Coretelligent.SharePoint -Times 0 -Exactly
         Should -Invoke Get-PnPTenantSite -ModuleName Coretelligent.SharePoint -Times 0 -Exactly

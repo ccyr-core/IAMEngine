@@ -1179,17 +1179,21 @@ export function makeRunnerService(db: PrismaClient) {
 
       // SharePoint site-group mirror (FR #118): the new hire may have been created at a FALLBACK username
       // (the primary belonged to someone else). Hand the sharepoint step the account the m365/entra step
-      // actually created, so the mirror can never land on the other person. Every status is read, not
-      // just succeeded: the runner must also learn that a cloud-account step EXISTS, and it refuses to
-      // mirror until that step has reported the account. See provisioned-upn.ts.
+      // actually created, so the mirror can never land on the other person. Every status and mode is
+      // read, not just succeeded: the runner must also learn whether an api step that WILL report the
+      // account is still unfinished (then it waits) or none ever will (then it uses the operator-set
+      // username or a sole candidate). See provisioned-upn.ts.
       const spCaseIds = [...new Set(claimed.filter((j) => j.systemKey === "sharepoint" && j.case.action === "onboard").map((j) => j.caseRequestId))];
-      const spFieldsByCase = new Map<string, { provisionedUpn: string | null; cloudAccountStep: boolean }>();
+      const spFieldsByCase = new Map<string, ReturnType<typeof sharepointOnboardFields>>();
       if (spCaseIds.length > 0) {
         const cloud = await db.job.findMany({
           where: { caseRequestId: { in: spCaseIds }, systemKey: { in: ["m365", "entra"] } },
-          select: { caseRequestId: true, systemKey: true, status: true, result: true },
+          select: { caseRequestId: true, systemKey: true, status: true, mode: true, result: true },
         });
-        for (const id of spCaseIds) spFieldsByCase.set(id, sharepointOnboardFields(cloud.filter((c) => c.caseRequestId === id)));
+        for (const id of spCaseIds) {
+          const accepted = await acceptedKeysFor(db, id);
+          spFieldsByCase.set(id, sharepointOnboardFields(cloud.filter((c) => c.caseRequestId === id).map((c) => ({ ...c, accepted: accepted.has(c.systemKey) }))));
+        }
       }
 
       // Offboard manager hand-off: exchange grants the departing user's MANAGER Full Access to the

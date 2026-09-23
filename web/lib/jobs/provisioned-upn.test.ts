@@ -25,10 +25,28 @@ test("m365 wins over entra; a failed or result-less step gives nothing", () => {
   assert.equal(provisionedUpnFrom([]), null);
 });
 
-// PR #111 second review (N1): a case whose m365 step is still paused (e.g. on a username-collision
-// decision) must tell the runner a cloud-account step exists, so it waits instead of using the primary.
-test("sharepoint onboard fields: a cloud step that hasn't succeeded yet still counts as present", () => {
-  assert.deepEqual(sharepointOnboardFields([{ systemKey: "m365", status: "needs_decision", result: null }]), { provisionedUpn: null, cloudAccountStep: true });
-  assert.deepEqual(sharepointOnboardFields([{ systemKey: "entra", status: "succeeded", result: { Upn: "a@x.com" } }]), { provisionedUpn: "a@x.com", cloudAccountStep: true });
-  assert.deepEqual(sharepointOnboardFields([]), { provisionedUpn: null, cloudAccountStep: false });
+// PR #111 reviews 2 + 3: wait ONLY while an api cloud-account step that will report the account is
+// unfinished. A step that never will must not make the mirror refuse forever.
+test("sharepoint onboard fields: an unfinished api m365/entra step means wait", () => {
+  for (const status of ["pending", "dispatched", "running", "failed"]) {   // failed = e.g. DECISION_NEEDED, not accepted
+    assert.deepEqual(sharepointOnboardFields([{ systemKey: "m365", mode: "api", status, result: null }]), { provisionedUpn: null, awaitCloudAccount: true }, status);
+  }
+});
+
+test("sharepoint onboard fields: a step that reported the account hands it on (no wait)", () => {
+  assert.deepEqual(sharepointOnboardFields([{ systemKey: "entra", mode: "api", status: "succeeded", result: { Upn: "a@x.com" } }]), { provisionedUpn: "a@x.com", awaitCloudAccount: false });
+});
+
+test("sharepoint onboard fields: a step that will never report the account does not mean wait", () => {
+  const never = [
+    { systemKey: "m365", mode: "manual", status: "manual", result: null },                        // manual checklist item
+    { systemKey: "m365", mode: "api", status: "manual", result: null },                           // planned manual (secrets not needed)
+    { systemKey: "m365", mode: "scim", status: "succeeded", result: null },                       // scim, born succeeded
+    { systemKey: "m365", mode: "api", status: "succeeded", result: { priorStatus: "failed", manualCompletion: true } }, // done by hand
+    { systemKey: "m365", mode: "api", status: "succeeded", result: { Status: "ok" } },             // succeeded without a Upn
+    { systemKey: "m365", mode: "api", status: "skipped", result: null },
+    { systemKey: "m365", mode: "api", status: "failed", result: null, accepted: true },            // operator accepted the failure
+  ];
+  for (const s of never) assert.deepEqual(sharepointOnboardFields([s]), { provisionedUpn: null, awaitCloudAccount: false }, JSON.stringify(s));
+  assert.deepEqual(sharepointOnboardFields([]), { provisionedUpn: null, awaitCloudAccount: false });
 });
