@@ -3,6 +3,7 @@
 import type { ClientSystem, Action, Mode } from "@prisma/client";
 import { OPTIONAL_SECRETS } from "./secrets/optional-secrets";
 import { STANDALONE } from "./profiles/ad-domain";
+import { mergeEntraIntoM365 } from "./entra-merge";
 
 // A step's INTENT — chiefly for offboarding. "disable" = reversible containment (lock the account,
 // isolate the device, revoke sessions); eventually safe to automate. "destructive" = actually deletes
@@ -136,9 +137,10 @@ export function planCase(
   // for standalone clients; undefined means "not standalone", i.e. every caller's existing behaviour.
   backbone?: string | null
 ): PlannedJob[] {
-  const active = systems.filter(
+  // FR #117: entra and m365 are the same executor — one step when both are in this lane.
+  const active = mergeEntraIntoM365(systems.filter(
     (s) => !skipSystems?.has(s.systemKey) && included(s, action, payload, personaSystems)
-  );
+  ));
   // Standalone: AD and the cloud are two separate accounts for one person, managed independently —
   // neither of the synthetic hybrid steps below makes sense there (FR #107).
   const isAdStandalone = STANDALONE.has(String(backbone ?? ""));
