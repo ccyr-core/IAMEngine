@@ -6,6 +6,7 @@
 // A delete/remove choice makes that step approval-gated with an evidence snapshot.
 import { useState } from "react";
 import { useRouter } from "next/navigation";
+import { changedOffboardActions, describeSaveOutcome, type OffboardActions } from "@/lib/cases/offboard-actions";
 
 export type OffboardActionRow = {
   systemKey: "google-workspace" | "exchange" | "spanning";
@@ -19,7 +20,7 @@ const OPTIONS: Record<OffboardActionRow["systemKey"], { label: string; keep: [st
   spanning: { label: "Spanning licence", keep: ["archive", "Archive (keeps the backup)"], destroy: ["remove", "Remove — frees the seat"] },
 };
 
-export function OffboardActionsControl({ caseId, rows, canEdit }: { caseId: string; rows: OffboardActionRow[]; canEdit: boolean }) {
+export function OffboardActionsControl({ caseId, rows, saved, canEdit }: { caseId: string; rows: OffboardActionRow[]; saved: OffboardActions; canEdit: boolean }) {
   const router = useRouter();
   const initial = Object.fromEntries(rows.map((r) => [r.systemKey, r.current]));
   const [choice, setChoice] = useState<Record<string, string>>(initial);
@@ -31,16 +32,23 @@ export function OffboardActionsControl({ caseId, rows, canEdit }: { caseId: stri
   async function save() {
     setBusy(true); setMsg(null);
     try {
-      const r = await fetch(`/api/cases/${caseId}/fields`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ fields: { offboardActions: choice } }) });
+      // Only the rows the operator changed, over the case's earlier choices — an untouched row stays
+      // "client default" rather than being saved as whatever the plan shows today.
+      const offboardActions = changedOffboardActions(saved, rows, choice);
+      const r = await fetch(`/api/cases/${caseId}/fields`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ fields: { offboardActions } }) });
       const d = await r.json().catch(() => ({}));
       if (!r.ok) { setMsg({ ok: false, text: d.error ?? `failed (${r.status})` }); return; }
-      // The fields route only re-plans a case nothing has run on; re-plan explicitly otherwise (it keeps
+      // The fields route re-plans a case nothing has run on and reports how that went (`replanned`:
+      // "replanned" or the error); on a started case it returns null, so re-plan explicitly (it keeps
       // every step that ran).
-      if (d.replanned == null) {
+      const replanned: string | null = typeof d.replanned === "string" ? d.replanned : null;
+      let explicit: { ok: boolean; error?: string } | undefined;
+      if (replanned == null) {
         const rp = await fetch(`/api/cases/${caseId}/replan`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
-        if (!rp.ok) { const e = await rp.json().catch(() => ({})); setMsg({ ok: false, text: `saved, but the re-plan failed: ${e.error ?? rp.status} — use Re-plan in the Actions menu` }); router.refresh(); return; }
+        const e = rp.ok ? {} : await rp.json().catch(() => ({}));
+        explicit = rp.ok ? { ok: true } : { ok: false, error: e.error ?? String(rp.status) };
       }
-      setMsg({ ok: true, text: "Saved — the case was re-planned." });
+      setMsg(describeSaveOutcome(replanned, explicit));
       router.refresh();
     } catch (e) { setMsg({ ok: false, text: (e as Error).message }); }
     finally { setBusy(false); }

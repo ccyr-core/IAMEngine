@@ -26,6 +26,7 @@ import { CollapsibleSection } from "../../_components/collapsible-section";
 import { caseEffectiveDate } from "@/lib/cases/schedule";
 import { IntakePanel } from "../_components/intake-panel";
 import { OffboardActionsControl, type OffboardActionRow } from "../_components/offboard-actions-control";
+import { currentOffboardChoice, readOffboardActions } from "@/lib/cases/offboard-actions";
 import { hasStartedJobs } from "@/lib/cases/job-status";
 import { isMilestoneCase } from "@/lib/eggs/occasions";
 import { pickResetSourceJob } from "@/lib/jobs/password-reset";
@@ -109,9 +110,8 @@ export default async function CaseDetailPage({ params }: { params: { id: string 
     ? (await db.job.findMany({ where: { caseRequestId: c.id, systemKey: { in: ["google-workspace", "exchange", "spanning"] } }, select: { systemKey: true, status: true, request: true } }))
         .map((j) => {
           const cfg = ((j.request ?? {}) as { config?: Record<string, unknown> }).config ?? {};
-          const current = j.systemKey === "google-workspace" ? (cfg.deleteUser === true ? "delete" : "suspend")
-            : j.systemKey === "exchange" ? (cfg.convertToShared === false ? "delete" : "convert")
-            : (cfg.removeLicense || cfg.unassign ? "remove" : "archive");
+          // Read the way the executors read it (e.g. every "don't convert" shape of the mailbox setting).
+          const current = currentOffboardChoice(j.systemKey, cfg);
           return { systemKey: j.systemKey as OffboardActionRow["systemKey"], current, locked: ["dispatched", "running", "succeeded", "failed"].includes(j.status) };
         })
     : [];
@@ -201,7 +201,7 @@ export default async function CaseDetailPage({ params }: { params: { id: string 
 
       {offboardActionRows.length > 0 && (
         <CollapsibleSection title="Offboard actions">
-          <OffboardActionsControl caseId={c.id} rows={offboardActionRows} canEdit={canRevealPassword} />
+          <OffboardActionsControl caseId={c.id} rows={offboardActionRows} saved={readOffboardActions((c.payload ?? {}) as Record<string, unknown>)} canEdit={canRevealPassword} />
         </CollapsibleSection>
       )}
 
