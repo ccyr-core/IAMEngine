@@ -342,6 +342,10 @@ $script:GoogleTransferApiUrl = 'https://admin.googleapis.com/admin/datatransfer/
 # it, so at worst it posts once more there.
 $script:GoogleTransfersPosted = @{}
 $script:GoogleTransferMemoHours = 24
+# Offboards whose delete this runner HELD on its latest run (email -> $true). Confirm-CtgGoogle marks its
+# miss `final` only for these: a delete that DID run may still read back as present for a few seconds
+# (Google replication lag), and the runner's normal revalidation is what absorbs that.
+$script:GoogleDeleteHeld = @{}
 function Get-CtgGoogleTransferState {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$UserId)
@@ -411,12 +415,13 @@ function Invoke-CtgGoogleOffboarding {
         if ($transferState -in 'inProgress', 'completed') {
             $actions.Add("Drive transfer to $transfer already $(if ($transferState -eq 'completed') { 'complete' } else { 'in progress' }) in Google — not posted again")
         }
-        elseif ($script:GoogleTransfersPosted.ContainsKey("$email|$transfer") -and
-            ([datetime]::UtcNow - $script:GoogleTransfersPosted["$email|$transfer"]).TotalHours -lt $script:GoogleTransferMemoHours) {
-            $actions.Add("Drive transfer to $transfer already requested by this runner at $($script:GoogleTransfersPosted["$email|$transfer"].ToString('u')) — not posted again (Google's transfer status can't be read here)")
-        }
+        # Google's own report first; this runner's memory only stands in when that says nothing.
         elseif ($transferState -eq 'failed') {
             $actions.Add("WARN Drive transfer to $transfer FAILED in Google — not posted again. Check the transfer in the Google Admin console.")
+        }
+        elseif ($script:GoogleTransfersPosted.ContainsKey("$email|$transfer") -and
+            ([datetime]::UtcNow - $script:GoogleTransfersPosted["$email|$transfer"]).TotalHours -lt $script:GoogleTransferMemoHours) {
+            $actions.Add("Drive transfer to $transfer already requested by this runner at $($script:GoogleTransfersPosted["$email|$transfer"].ToString('u')) — not posted again ($(if ($transferState -eq 'unknown') { "Google's transfer status can't be read here" } else { 'Google shows no transfer for this user yet' }))")
         }
         elseif ($PSCmdlet.ShouldProcess($email, "Transfer Drive to $transfer")) {
             Invoke-CtgGoogleApi -Method POST -Path '/dataTransfer' -Body @{ oldOwnerUserId = $email; newOwnerUserId = $transfer } | Out-Null
@@ -460,6 +465,7 @@ function Invoke-CtgGoogleOffboarding {
     $deleteUser = (Get-CtgProp $Config 'deleteUser') -eq $true
     $holdDelete = $deleteUser -and [bool]$transfer -and $transferState -ne 'completed'
     $retryAfter = $null
+    if ($holdDelete) { $script:GoogleDeleteHeld[$email] = $true } else { [void]$script:GoogleDeleteHeld.Remove($email) }
     if ($PSCmdlet.ShouldProcess($email, "Suspend Google user")) {
         Invoke-CtgGoogleApi -Method PUT -Path "/users/$email" -Body @{ suspended = $true } | Out-Null
         $actions.Add("suspended Google user: $email")
@@ -593,7 +599,8 @@ function Confirm-CtgGoogle {
     # A delete held for a Drive transfer is work left to a human (or to the auto-retry that re-checks the
     # transfer) — re-running the executor right now cannot finish it, so tell the runner's revalidation
     # loop not to (it would only repeat the offboard, transfer post included).
-    if (-not $ok -and $Action -eq 'offboard' -and $u -and (Get-CtgProp $Config 'deleteUser') -eq $true -and (Get-CtgProp $Config 'transferTarget')) {
+    # Only when the delete was HELD on the latest run — one that ran is left to normal revalidation.
+    if (-not $ok -and $Action -eq 'offboard' -and $u -and (Get-CtgProp $Config 'deleteUser') -eq $true -and $script:GoogleDeleteHeld[$email]) {
         $v | Add-Member -NotePropertyName final -NotePropertyValue $true
     }
     $v

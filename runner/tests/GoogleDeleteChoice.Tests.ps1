@@ -134,6 +134,39 @@ Describe 'Invoke-JobWithValidation — a held Google delete' {
         Should -Invoke Invoke-CtgGoogleApi -ModuleName Coretelligent.GoogleWorkspace -Times 1 -Exactly -ParameterFilter { $Method -eq 'POST' -and $Path -eq '/dataTransfer' }
         ($second.Result.Actions -join "`n") | Should -Match 'already requested'
     }
+    It 'a delete that DID run is revalidated through Google replication lag (not cut off as final)' {
+        Mock Start-Sleep { }
+        $script:Deleted = $false; $script:LagReads = 0
+        Mock Invoke-CtgGoogleApi -ModuleName Coretelligent.GoogleWorkspace -MockWith {
+            param($Method, $Path, $Body)
+            if ($Method -eq 'DELETE' -and $Path -like '/users/*') { $script:Deleted = $true; return $null }
+            if ($Method -eq 'GET' -and $Path -like '*/datatransfer/v1/transfers*') { return [pscustomobject]@{ dataTransfers = @([pscustomobject]@{ overallTransferStatusCode = 'completed' }) } }
+            if ($Method -eq 'GET' -and $Path -like '/users/*') {
+                # Google still returns the account for one read after the DELETE (replication lag).
+                if ($script:Deleted) { $script:LagReads++; if ($script:LagReads -gt 1) { return $null } }
+                return [pscustomobject]@{ primaryEmail = 'jdoe@brightonpark.com'; id = '1234567890'; suspended = $true }
+            }
+            if ($Method -eq 'GET' -and $Path -like '/groups*') { return [pscustomobject]@{ groups = @() } }
+            return $null
+        }
+        $job = [pscustomobject]@{ payload = $script:User; config = [pscustomobject]@{ deleteUser = $true; transferTarget = 'boss@brightonpark.com'; signOut = $false } }
+        $out = Invoke-JobWithValidation -Job $job -Handler $script:Handler -Fn $script:Fn -Creds $null -DryRun $false
+        $out.Validation.ok | Should -BeTrue
+    }
+    It 'a transfer Google reports FAILED says so, even when this runner posted it within the day' {
+        Mock Invoke-CtgGoogleApi -ModuleName Coretelligent.GoogleWorkspace -MockWith {
+            param($Method, $Path, $Body)
+            if ($Method -eq 'GET' -and $Path -like '*/datatransfer/v1/transfers*') { return [pscustomobject]@{ dataTransfers = @([pscustomobject]@{ overallTransferStatusCode = 'failed' }) } }
+            if ($Method -eq 'GET' -and $Path -like '/users/*') { return [pscustomobject]@{ primaryEmail = 'jdoe@brightonpark.com'; id = '1234567890' } }
+            if ($Method -eq 'GET' -and $Path -like '/groups*') { return [pscustomobject]@{ groups = @() } }
+            return $null
+        }
+        InModuleScope Coretelligent.GoogleWorkspace { $script:GoogleTransfersPosted['jdoe@brightonpark.com|boss@brightonpark.com'] = [datetime]::UtcNow.AddMinutes(-5) }
+        $r = Invoke-CtgGoogleOffboarding -User $script:User -Config ([pscustomobject]@{ deleteUser = $true; transferTarget = 'boss@brightonpark.com'; signOut = $false })
+        $text = $r.Actions -join "`n"
+        $text | Should -Match 'WARN Drive transfer to boss@brightonpark.com FAILED'
+        $text | Should -Not -Match 'already requested'
+    }
     It 'still revalidates an ordinary miss (the loop is only cut short when re-running cannot help)' {
         Mock Start-Sleep { }
         $script:Runs = 0
