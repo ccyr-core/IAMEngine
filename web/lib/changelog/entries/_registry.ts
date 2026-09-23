@@ -435,6 +435,7 @@ export { entry as coreidSlugRedirect } from "./coreid-slug-redirect";
 export { entry as coretelligentPostResetRestore } from "./coretelligent-post-reset-restore";
 export { entry as credExpirySettings } from "./cred-expiry-settings";
 export { entry as credPlatform } from "./cred-platform";
+export { entry as customConnectorsAttachable } from "./custom-connectors-attachable";
 export { entry as cvpMailboxAuditing } from "./cvp-mailbox-auditing";
 export { entry as defaultPasswordOnCase } from "./default-password-on-case";
 export { entry as defaultSharedMailboxAccess } from "./default-shared-mailbox-access";
