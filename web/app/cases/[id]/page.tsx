@@ -26,7 +26,7 @@ import { CollapsibleSection } from "../../_components/collapsible-section";
 import { caseEffectiveDate } from "@/lib/cases/schedule";
 import { IntakePanel } from "../_components/intake-panel";
 import { OffboardActionsControl, type OffboardActionRow } from "../_components/offboard-actions-control";
-import { currentOffboardChoice, readOffboardActions } from "@/lib/cases/offboard-actions";
+import { currentOffboardChoice, mailboxDeleteBlocker, readOffboardActions } from "@/lib/cases/offboard-actions";
 import { hasStartedJobs } from "@/lib/cases/job-status";
 import { isMilestoneCase } from "@/lib/eggs/occasions";
 import { pickResetSourceJob } from "@/lib/jobs/password-reset";
@@ -106,15 +106,21 @@ export default async function CaseDetailPage({ params }: { params: { id: string 
 
   // FR #128: per-case offboard actions (delete vs keep) for the systems clients ask to vary. The current
   // choice is read off the planned job's config, so it shows what this case will really do.
-  const offboardActionRows: OffboardActionRow[] = c.action === "offboard"
-    ? (await db.job.findMany({ where: { caseRequestId: c.id, systemKey: { in: ["google-workspace", "exchange", "spanning"] } }, select: { systemKey: true, status: true, request: true } }))
-        .map((j) => {
-          const cfg = ((j.request ?? {}) as { config?: Record<string, unknown> }).config ?? {};
-          // Read the way the executors read it (e.g. every "don't convert" shape of the mailbox setting).
-          const current = currentOffboardChoice(j.systemKey, cfg);
-          return { systemKey: j.systemKey as OffboardActionRow["systemKey"], current, locked: ["dispatched", "running", "succeeded", "failed"].includes(j.status) };
-        })
+  const offboardJobs = c.action === "offboard"
+    ? (await db.job.findMany({ where: { caseRequestId: c.id, systemKey: { in: ["google-workspace", "exchange", "spanning", "m365", "entra"] } }, select: { systemKey: true, status: true, request: true } }))
+        .map((j) => ({ ...j, config: ((j.request ?? {}) as { config?: Record<string, unknown> }).config ?? {} }))
     : [];
+  // Deleting the mailbox needs a licence step that takes the licence off; without one it's unavailable.
+  const mailboxBlocker = mailboxDeleteBlocker(offboardJobs);
+  const offboardActionRows: OffboardActionRow[] = offboardJobs
+    .filter((j) => j.systemKey === "google-workspace" || j.systemKey === "exchange" || j.systemKey === "spanning")
+    .map((j) => ({
+      systemKey: j.systemKey as OffboardActionRow["systemKey"],
+      // Read the way the executors read it (e.g. every "don't convert" shape of the mailbox setting).
+      current: currentOffboardChoice(j.systemKey, j.config),
+      locked: ["dispatched", "running", "succeeded", "failed"].includes(j.status),
+      ...(j.systemKey === "exchange" && mailboxBlocker ? { destroyUnavailable: mailboxBlocker } : {}),
+    }));
 
   // Multi-domain clients: the domains this case may onboard under + the persisted per-case pick.
   const domainRow = c.action === "onboard"

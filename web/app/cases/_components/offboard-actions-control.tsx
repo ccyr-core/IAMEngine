@@ -12,6 +12,7 @@ export type OffboardActionRow = {
   systemKey: "google-workspace" | "exchange" | "spanning";
   current: string; // the choice the plan carries now
   locked: boolean; // the step already ran on this case
+  destroyUnavailable?: string; // why the delete/remove choice can't be made on this plan
 };
 
 const OPTIONS: Record<OffboardActionRow["systemKey"], { label: string; keep: [string, string]; destroy: [string, string] }> = {
@@ -64,8 +65,9 @@ export function OffboardActionsControl({ caseId, rows, saved, canEdit }: { caseI
               <span>{o.label}{r.locked ? " — already ran" : ""}</span>
               <select value={choice[r.systemKey]} disabled={!canEdit || busy || r.locked} onChange={(e) => { setChoice((c) => ({ ...c, [r.systemKey]: e.target.value })); setMsg(null); }}>
                 <option value={o.keep[0]}>{o.keep[1]}</option>
-                <option value={o.destroy[0]}>{o.destroy[1]}</option>
+                <option value={o.destroy[0]} disabled={!!r.destroyUnavailable && r.current !== o.destroy[0]}>{o.destroy[1]}{r.destroyUnavailable && r.current !== o.destroy[0] ? " (unavailable)" : ""}</option>
               </select>
+              {r.destroyUnavailable && r.current !== o.destroy[0] && <span>Delete unavailable: {r.destroyUnavailable}.</span>}
             </label>
           );
         })}

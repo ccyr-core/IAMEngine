@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { withOffboardActions, readOffboardActions, changedOffboardActions, describeSaveOutcome, currentOffboardChoice } from "./offboard-actions";
+import { withOffboardActions, readOffboardActions, changedOffboardActions, describeSaveOutcome, currentOffboardChoice, mailboxDeleteBlocker } from "./offboard-actions";
 import type { PlannedJob } from "../orchestrator";
 
 const job = (systemKey: string, config: Record<string, unknown> | null = null, mode = "api") =>
@@ -138,7 +138,6 @@ test("mailbox delete respects removeLicense:false and never adds a licence remov
   assert.equal(by(jobs, "m365").requiresApproval, false);
   assert.deepEqual(by(jobs, "entra").config, { blockSignIn: true });
   assert.equal(by(jobs, "entra").intent, "disable");
-  assert.equal(by(jobs, "exchange").requiresApproval, true);
 });
 
 test("mailbox delete leaves a deferred licence step alone and opens the step that removes it", () => {
@@ -150,4 +149,24 @@ test("mailbox delete leaves a deferred licence step alone and opens the step tha
   assert.equal(by(jobs, "m365").requiresApproval, false);
   assert.deepEqual(by(jobs, "entra").config, { removeLicense: { allowWithoutConvert: true } });
   assert.equal(by(jobs, "entra").requiresApproval, true);
+});
+
+// Review N2: with no step in the plan that takes the licence off, "delete the mailbox" can't happen —
+// not converting would just leave a licensed user mailbox. The option is unavailable, and a saved
+// choice is ignored: the mailbox stays at the client default.
+test("mailbox delete is ignored when no licence step in the plan removes the licence", () => {
+  const cases: PlannedJob[][] = [
+    [job("m365", { removeLicense: false })],
+    [job("m365", { blockSignIn: true })],
+    [job("m365", { removeLicense: { defer: true, removedBy: "entra" } })], // deferred to a step not in the plan
+  ];
+  for (const licence of cases) {
+    const ex = job("exchange", { convertToShared: true });
+    const out = withOffboardActions([ex, ...licence], { offboardActions: { exchange: "delete" } });
+    assert.deepEqual(by(out, "exchange"), ex);
+    assert.notEqual(mailboxDeleteBlocker([ex, ...licence]), null);
+  }
+  const ok = [job("exchange", { convertToShared: true }), job("m365", { removeLicense: { defer: true, removedBy: "entra" } }), job("entra", { removeLicense: true })];
+  assert.equal(mailboxDeleteBlocker(ok), null);
+  assert.equal(by(withOffboardActions(ok, { offboardActions: { exchange: "delete" } }), "exchange").requiresApproval, true);
 });

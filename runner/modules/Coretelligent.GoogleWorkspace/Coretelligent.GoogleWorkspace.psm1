@@ -174,7 +174,8 @@ function Invoke-CtgGoogleApi {
     if (-not $script:GoogleToken) { throw "Call Connect-CtgGoogle first." }
     $p = @{
         Method      = $Method
-        Uri         = "$script:GoogleApiUrl$Path"
+        # An absolute URL reaches a sibling Admin API (the Data Transfer API, FR #128); a path is Directory.
+        Uri         = if ($Path -match '^https://') { $Path } else { "$script:GoogleApiUrl$Path" }
         Headers     = @{ Authorization = "Bearer $script:GoogleToken" }
         ContentType = 'application/json'
     }
@@ -329,6 +330,27 @@ function Invoke-CtgGoogleOnboarding {
     [pscustomobject]@{ System = 'google-workspace'; Status = 'ok'; Email = $email; Ou = $ou; Actions = $actions.ToArray() }
 }
 
+# FR #128: the state of this user's Drive transfer, read from the Data Transfer API — so a re-run does
+# not post a second transfer on top of one Google is still running, and a held delete can go ahead once
+# Google reports it complete. Returns 'inProgress' (new or running), 'completed', 'failed', 'none' (no
+# transfer from this owner), or 'unknown' when it cannot be read — most often because the domain has not
+# delegated the admin.datatransfer scope. 'unknown' is never read as complete.
+$script:GoogleTransferApiUrl = 'https://admin.googleapis.com/admin/datatransfer/v1'
+function Get-CtgGoogleTransferState {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$UserId)
+    try {
+        $r = Invoke-CtgGoogleApi -Method GET -Path "$script:GoogleTransferApiUrl/transfers?oldOwnerUserId=$([uri]::EscapeDataString($UserId))"
+    }
+    catch { return 'unknown' }
+    if ($null -eq $r) { return 'unknown' }
+    $codes = @(@(Get-CtgProp $r 'dataTransfers') | Where-Object { $_ } | ForEach-Object { [string](Get-CtgProp $_ 'overallTransferStatusCode') })
+    if ($codes -contains 'inProgress' -or $codes -contains 'new') { return 'inProgress' }
+    if ($codes -contains 'completed') { return 'completed' }
+    if ($codes -contains 'failed') { return 'failed' }
+    return 'none'
+}
+
 function Invoke-CtgGoogleOffboarding {
     <#
     .SYNOPSIS
@@ -346,7 +368,8 @@ function Invoke-CtgGoogleOffboarding {
     $email = [string](@('UserPrincipalName', 'email', 'WorkEmail', 'userToOffboard') | ForEach-Object { Get-CtgProp $User $_ } | Where-Object { $_ -match '@' } | Select-Object -First 1)
     if (-not $email) { throw "google: the case carries no email/UPN for the user to offboard — set the user's email on the case and re-run." }
 
-    if (-not (Get-CtgGoogleUser -Email $email)) {
+    $gUser = Get-CtgGoogleUser -Email $email
+    if (-not $gUser) {
         return [pscustomobject]@{ System = 'google-workspace'; Status = 'ok'; Email = $email; Actions = @("Google user not found ($email)"); Evidence = @{ Groups = @() } }
     }
 
@@ -371,10 +394,26 @@ function Invoke-CtgGoogleOffboarding {
     }
 
     # 4. On request: transfer Drive ownership to the delegate (only valid once moved out of Active Users).
+    # FR #128: read the transfer's state first — a re-run must not post a second transfer on top of one
+    # Google is still running (or has finished). A FAILED transfer is not re-posted blind either — it is
+    # reported for a human to fix. Only 'none' and unreadable ('unknown') post, as before.
     $transfer = Get-CtgProp $Config 'transferTarget'
-    if ($transfer -and $PSCmdlet.ShouldProcess($email, "Transfer Drive to $transfer")) {
-        Invoke-CtgGoogleApi -Method POST -Path '/dataTransfer' -Body @{ oldOwnerUserId = $email; newOwnerUserId = $transfer } | Out-Null
-        $actions.Add("transferred Drive ownership to: $transfer")
+    $transferState = 'none'
+    if ($transfer) {
+        $gUserId = [string](Get-CtgProp $gUser 'id')
+        $transferState = if ($gUserId) { Get-CtgGoogleTransferState -UserId $gUserId } else { 'unknown' }
+        if ($transferState -in 'inProgress', 'completed') {
+            $actions.Add("Drive transfer to $transfer already $(if ($transferState -eq 'completed') { 'complete' } else { 'in progress' }) in Google — not posted again")
+        }
+        elseif ($transferState -eq 'failed') {
+            $actions.Add("WARN Drive transfer to $transfer FAILED in Google — not posted again. Check the transfer in the Google Admin console.")
+        }
+        elseif ($PSCmdlet.ShouldProcess($email, "Transfer Drive to $transfer")) {
+            Invoke-CtgGoogleApi -Method POST -Path '/dataTransfer' -Body @{ oldOwnerUserId = $email; newOwnerUserId = $transfer } | Out-Null
+            $actions.Add("transferred Drive ownership to: $transfer")
+            # Just posted: running now, if we can see transfers at all.
+            if ($transferState -ne 'unknown') { $transferState = 'inProgress' }
+        }
     }
 
     # 4b. Hide from the directory / GAL (FR #21) — Google calls it "contact sharing".
@@ -404,14 +443,24 @@ function Invoke-CtgGoogleOffboarding {
     # a deleted user restorable for 20 days. A Drive transfer runs asynchronously in Google, and deleting
     # the owner before it finishes loses the files — so with a transfer requested the delete is HELD:
     # the user is suspended and the step says to delete once the transfer has completed.
+    # A held delete is NOT a finished step: it leaves a MANUAL checklist line, Confirm-CtgGoogle fails
+    # while the account exists (so the step lands "warning", never green), and — when the transfer's
+    # state can be read — RetryAfterMinutes re-runs it, deleting once Google reports the transfer done.
     $deleteUser = (Get-CtgProp $Config 'deleteUser') -eq $true
-    $holdDelete = $deleteUser -and [bool]$transfer
+    $holdDelete = $deleteUser -and [bool]$transfer -and $transferState -ne 'completed'
+    $retryAfter = $null
     if ($PSCmdlet.ShouldProcess($email, "Suspend Google user")) {
         Invoke-CtgGoogleApi -Method PUT -Path "/users/$email" -Body @{ suspended = $true } | Out-Null
         $actions.Add("suspended Google user: $email")
     }
     if ($holdDelete) {
-        $actions.Add("WARN delete held — a Drive transfer to $transfer was requested and Google runs it in the background; deleting the account before it finishes would lose the files. The user is suspended. Delete them in the Google Admin console once the transfer shows complete.")
+        $why = switch ($transferState) {
+            'inProgress' { "Google is still running the Drive transfer to $transfer, and deleting the account before it finishes would lose the files. Re-checking automatically; the account is deleted once Google reports the transfer complete" }
+            'failed'     { "Google reports the Drive transfer to $transfer FAILED, and deleting the account now would lose the files. Fix the transfer in the Admin console first" }
+            default      { "a Drive transfer to $transfer was requested and its status cannot be read here (the admin.datatransfer scope is not delegated), so it cannot be proven complete" }
+        }
+        $actions.Add("MANUAL: delete $email in the Google Admin console (Directory -> Users -> the user -> Delete user) once the Drive transfer to $transfer shows complete — delete held: $why. The user is suspended.")
+        if ($transferState -eq 'inProgress') { $retryAfter = 15 }
     }
 
     # 6. Sign the user out everywhere — revokes their SESSIONS and OAuth refresh tokens.
@@ -462,13 +511,16 @@ function Invoke-CtgGoogleOffboarding {
         $actions.Add("deleted Google user: $email (restorable in the Admin console for 20 days)")
     }
 
-    [pscustomobject]@{
+    $out = [pscustomobject]@{
         System   = 'google-workspace'
         Status   = 'ok'
         Email    = $email
         Evidence = @{ Groups = @($groupEvidence) }
         Actions  = $actions.ToArray()
     }
+    # RetryAfterMinutes: the app re-queues this job automatically (capped) — see sweepAutoRetries.
+    if ($retryAfter) { $out | Add-Member -NotePropertyName RetryAfterMinutes -NotePropertyValue $retryAfter }
+    $out
 }
 
 function Confirm-CtgGoogle {
@@ -499,8 +551,9 @@ function Confirm-CtgGoogle {
         $checks.Add(@{ name = 'Google user present'; expected = $true; actual = [bool]$u; pass = [bool]$u })
         $checks.Add(@{ name = 'not in Root OU'; expected = $true; actual = ($ou -and $ou -ne '/'); pass = [bool]($ou -and $ou -ne '/') })
     }
-    elseif ((Get-CtgProp $Config 'deleteUser') -eq $true -and -not (Get-CtgProp $Config 'transferTarget')) {
-        # FR #128: this case chose delete — the only thing to verify is that the account is gone.
+    elseif ((Get-CtgProp $Config 'deleteUser') -eq $true) {
+        # FR #128: this case chose delete — the only thing to verify is that the account is gone. A delete
+        # HELD for a Drive transfer fails here on purpose: the approved step has not done what it was for.
         $checks.Add(@{ name = 'Google user deleted'; expected = $true; actual = (-not $u); pass = (-not $u) })
     }
     else {

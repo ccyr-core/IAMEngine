@@ -106,6 +106,17 @@ function removesLicenseHere(systemKey: string, rl: unknown): boolean {
   return !(typeof o.removedBy === "string" && o.removedBy !== "" && o.removedBy !== systemKey);
 }
 
+// Why the mailbox can't be deleted on this plan, or null when it can. Not converting only deletes the
+// mailbox because a licence step then takes the licence off (Exchange purges it after the grace). With
+// no m365/entra step in the plan that removes it — removeLicense false or absent, or deferred to a step
+// the plan doesn't have — not converting would just leave a licensed user mailbox: neither kept as
+// shared nor deleted. So the option is unavailable, and withOffboardActions ignores a saved "delete".
+export function mailboxDeleteBlocker(jobs: { systemKey: string; config?: unknown }[]): string | null {
+  const removes = jobs.some((j) => (j.systemKey === "m365" || j.systemKey === "entra")
+    && removesLicenseHere(j.systemKey, ((j.config as Record<string, unknown> | null) ?? {}).removeLicense));
+  return removes ? null : "no step in this plan removes the licence, so the mailbox would not be deleted";
+}
+
 export function withOffboardActions(jobs: PlannedJob[], payload: Record<string, unknown>): PlannedJob[] {
   const a = readOffboardActions(payload);
   if (Object.keys(a).length === 0) return jobs;
@@ -113,7 +124,10 @@ export function withOffboardActions(jobs: PlannedJob[], payload: Record<string, 
   // default can never add a gate, flatten a client's convert threshold, or strip a licence.
   const differs = (j: PlannedJob, want: string | undefined) => want !== undefined && want !== currentOffboardChoice(j.systemKey, cfgOf(j));
   // Only a mailbox this case actually switched from convert to delete opens the licence steps.
-  const deleteMailbox = a.exchange === "delete" && jobs.some((j) => j.systemKey === "exchange" && differs(j, "delete"));
+  // And only when a licence step will actually take the licence off — otherwise "delete" is ignored and
+  // the mailbox stays at the client default (see mailboxDeleteBlocker).
+  const deleteMailbox = a.exchange === "delete" && mailboxDeleteBlocker(jobs) === null
+    && jobs.some((j) => j.systemKey === "exchange" && differs(j, "delete"));
   return jobs.map((j) => {
     const key = j.systemKey as SystemWithChoice | string;
     const cfg = cfgOf(j);
@@ -121,10 +135,10 @@ export function withOffboardActions(jobs: PlannedJob[], payload: Record<string, 
       if (a["google-workspace"] === "delete") return destructive(j, { ...cfg, deleteUser: true });
       return { ...j, config: { ...cfg, deleteUser: false } };
     }
-    if (key === "exchange" && differs(j, a.exchange)) {
+    if (key === "exchange" && differs(j, a.exchange) && (a.exchange !== "delete" || deleteMailbox)) {
       // Not converting leaves a user mailbox; once the licence comes off, Exchange purges it after its
       // 30-day grace — that IS the delete. Keep: convert to shared.
-      if (a.exchange === "delete") return destructive(j, { ...cfg, convertToShared: false });
+      if (deleteMailbox) return destructive(j, { ...cfg, convertToShared: false });
       return { ...j, config: { ...cfg, convertToShared: true } };
     }
     if ((key === "m365" || key === "entra") && deleteMailbox && removesLicenseHere(key, cfg.removeLicense)) {
