@@ -137,10 +137,9 @@ export function planCase(
   // for standalone clients; undefined means "not standalone", i.e. every caller's existing behaviour.
   backbone?: string | null
 ): PlannedJob[] {
-  // FR #117: entra and m365 are the same executor — one step when both are in this lane.
-  const active = mergeEntraIntoM365(systems.filter(
+  const active = systems.filter(
     (s) => !skipSystems?.has(s.systemKey) && included(s, action, payload, personaSystems)
-  ));
+  );
   // Standalone: AD and the cloud are two separate accounts for one person, managed independently —
   // neither of the synthetic hybrid steps below makes sense there (FR #107).
   const isAdStandalone = STANDALONE.has(String(backbone ?? ""));
@@ -149,6 +148,9 @@ export function planCase(
   // per-client ClientSystem row or migration. It depends on the cloud consumers present (m365/exchange)
   // so it runs after them; the actual address is resolved + injected at dispatch time (runner-service
   // claim), since it isn't known until those run. Routed on-prem via ALWAYS_ON_PREM_SYSTEMS.
+  // FR #117: entra and m365 are the same executor — one step when both are in this lane. In place, so
+  // every use of `active` below (synthetic steps, ordering) sees the merged set.
+  active.splice(0, active.length, ...mergeEntraIntoM365(active));
   const activeKeys = new Set(active.map((s) => s.systemKey));
   // NOT for ad-standalone: there, AD and the cloud are two separate accounts for one person, managed
   // independently — so writing the CLOUD mailbox address into on-prem `mail` is wrong, not helpful
