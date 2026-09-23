@@ -1895,7 +1895,7 @@ $script:ConnectedTenant = @{}
 $script:ConnectionGroups = @{
     graph  = @('m365', 'entra', 'm365-password-reset', 'tap', 'notify', 'm365-remove-user', 'm365-correct-user')
     google = @('google-workspace', 'google-password-reset', 'google-remove-user', 'google-correct-user')
-    # FR #88: exchange-correct-user reuses the Exchange Online session (process-wide), like the resets above reuse theirs.
+    # FR #88: exchange-correct-user reuses the Exchange Online session, which is process-wide.
     exchange = @('exchange', 'exchange-correct-user')
 }
 
