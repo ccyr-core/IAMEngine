@@ -603,3 +603,11 @@ test("requested shared mailboxes are not planned on an OFFBOARD", () => {
   const resolved = resolvePlannedConfigs(client, { ...payload, sharedMailboxes: ["info@acme.com"] }, "offboard", planned);
   assert.equal((resolved[0].config as Record<string, unknown>).defaultSharedMailboxes, undefined);
 });
+
+// FR #118: the sharepoint step mirrors the reference user's SITE groups, so it needs the mirror user too.
+test("mirror is injected into the sharepoint job as well", () => {
+  const planned = [job("sharepoint", null), job("zoom", null)];
+  const resolved = resolvePlannedConfigs({ personas: null, globals: null, locations: null }, { ...payload, mirrorPermissionsFromUser: "Jane Boss" }, "onboard", planned);
+  assert.deepEqual(resolved.find((j) => j.systemKey === "sharepoint")!.config, { mirrorFromUser: "Jane Boss" });
+  assert.equal(resolved.find((j) => j.systemKey === "zoom")!.config, null);
+});

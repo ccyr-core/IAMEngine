@@ -20,6 +20,9 @@
 #   Invoke-CtgSharePointOffboardGrant - the offboard hand-off itself: resolve the delegate name to an
 #                                        email/UPN, then grant OneDrive + configured SharePoint sites
 #                                        (offboard-review Fix 2)
+#   Get-CtgSharePointSiteUrls         - the tenant's sites (not OneDrives/system sites), cached per tenant (FR #118)
+#   Invoke-CtgSharePointSiteGroupsOffboard / -Mirror - remove a leaver from / mirror a reference user's
+#                                        SITE groups across those sites (FR #118)
 #   Test-CtgDelegateUnambiguous       - does a display-name delegate resolve to exactly ONE Entra user?
 #                                        fails safe (skip, don't guess) on 2+ matches (offboard-review Fix 5)
 
@@ -242,6 +245,132 @@ function Invoke-CtgSharePointOffboardGrant {
 # everything from "/Documents" onward, keeping "https://TENANT-my.sharepoint.com/personal/<user>".
 # Returns $null when the URL doesn't look like a OneDrive personal-site URL (caller then skips the grant
 # rather than handing PnP a document-library path it can't resolve to a site).
+# ── FR #118: SharePoint SITE groups across every site in the tenant ─────────────────────────────────
+# A site's own groups (Owners / Members / Visitors and any custom ones) are SharePoint's, not Entra's,
+# so neither the m365 lane nor AD touches them. Offboard removes the leaver from every site group they
+# are in; onboard with "mirror <user>" adds the new user to the reference user's site groups.
+#
+# "Every site" is the scope the FR owner chose. Two things keep it affordable on a big tenant:
+#   - the tenant's site list is cached per tenant (6 h) — it changes rarely, and listing it is one
+#     admin-centre call that would otherwise repeat on every case;
+#   - per site, ONE lookup (Get-PnPUser) says whether the person has ever been on it (the site's user
+#     information list). Sites where they never appeared are skipped without enumerating groups.
+$script:CtgSiteCache = @{}
+$script:CtgSiteCacheHours = 6
+
+function ConvertTo-CtgClaimsLogin {
+    param([Parameter(Mandatory)][string]$Email)
+    "i:0#.f|membership|$Email"
+}
+
+# The tenant's SharePoint sites worth checking: every site collection except personal OneDrives (the
+# OneDrive hand-off handles those) and system sites. Cached per tenant.
+function Get-CtgSharePointSiteUrls {
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param(
+        [Parameter(Mandatory)][string]$AdminUrl,
+        [Parameter(Mandatory)][string]$AppId,
+        [Parameter(Mandatory)][string]$Tenant,
+        [hashtable]$CertArgs = @{},
+        [switch]$NoCache
+    )
+    $hit = $script:CtgSiteCache[$Tenant]
+    if (-not $NoCache -and $hit -and ((Get-Date) - $hit.At).TotalHours -lt $script:CtgSiteCacheHours) { return @($hit.Urls) }
+    Connect-CtgSharePointPnP -Url $AdminUrl -AppId $AppId -Tenant $Tenant @CertArgs
+    $urls = @(Get-PnPTenantSite -ErrorAction Stop |
+        Where-Object { $_.Url -and $_.Url -notmatch '-my\.sharepoint\.com' -and ([string]$_.Template) -notmatch '^(SRCHCEN|SPSMSITEHOST|APPCATALOG|POINTPUBLISHINGHUB|EDISC|TEAMCHANNEL)' } |
+        ForEach-Object { [string]$_.Url } | Sort-Object -Unique)
+    $script:CtgSiteCache[$Tenant] = @{ At = Get-Date; Urls = $urls }
+    return $urls
+}
+
+# The site groups $Email is in on the CURRENTLY connected site, as group titles. Empty when the person
+# has never been on the site (not in its user information list) — the cheap early exit.
+function Get-CtgSiteGroupsForUser {
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param([Parameter(Mandatory)][string]$Email)
+    $login = ConvertTo-CtgClaimsLogin $Email
+    $u = Get-PnPUser -Identity $login -ErrorAction SilentlyContinue
+    if (-not $u) { return @() }
+    $in = foreach ($g in @(Get-PnPGroup -ErrorAction Stop)) {
+        $members = @(Get-PnPGroupMember -Group $g -ErrorAction SilentlyContinue)
+        if ($members | Where-Object { ([string](Get-CtgProp $_ 'LoginName')) -ieq $login -or ([string](Get-CtgProp $_ 'Email')) -ieq $Email }) { [string]$g.Title }
+    }
+    return @($in)
+}
+
+# Offboard: remove $Email from every site group, on every site in $Sites. Per-site failures WARN and the
+# loop carries on — one locked or throttled site must not cost the removals on the rest.
+function Invoke-CtgSharePointSiteGroupsOffboard {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)][string]$Email,
+        [Parameter(Mandatory)][string[]]$Sites,
+        [Parameter(Mandatory)][string]$AppId,
+        [Parameter(Mandatory)][string]$Tenant,
+        [hashtable]$CertArgs = @{}
+    )
+    $actions = [System.Collections.Generic.List[string]]::new()
+    $login = ConvertTo-CtgClaimsLogin $Email
+    $removed = 0; $sitesWith = 0
+    foreach ($site in $Sites) {
+        try {
+            Connect-CtgSharePointPnP -Url $site -AppId $AppId -Tenant $Tenant @CertArgs
+            $groups = @(Get-CtgSiteGroupsForUser -Email $Email)
+            if ($groups.Count -eq 0) { continue }
+            $sitesWith++
+            foreach ($g in $groups) {
+                if ($PSCmdlet.ShouldProcess("$site / $g", "remove $Email")) {
+                    Remove-PnPGroupMember -Group $g -LoginName $login -ErrorAction Stop
+                    $actions.Add("removed from site group '$g' on $site"); $removed++
+                }
+            }
+        }
+        catch { $actions.Add("WARN SharePoint site $site not cleaned: $($_.Exception.Message)") }
+    }
+    $actions.Add("SharePoint site groups: removed $Email from $removed group(s) on $sitesWith of $($Sites.Count) site(s)")
+    return $actions.ToArray()
+}
+
+# Onboard mirror: add $NewEmail to each site group $ReferenceEmail is in, on every site in $Sites.
+# $Exclude takes the mirror policy's exclude wildcards (FR #119), matched against the group title.
+function Invoke-CtgSharePointSiteGroupsMirror {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)][string]$NewEmail,
+        [Parameter(Mandatory)][string]$ReferenceEmail,
+        [Parameter(Mandatory)][string[]]$Sites,
+        [Parameter(Mandatory)][string]$AppId,
+        [Parameter(Mandatory)][string]$Tenant,
+        [hashtable]$CertArgs = @{},
+        [string[]]$Exclude = @()
+    )
+    $actions = [System.Collections.Generic.List[string]]::new()
+    $newLogin = ConvertTo-CtgClaimsLogin $NewEmail
+    $added = 0; $held = 0
+    foreach ($site in $Sites) {
+        try {
+            Connect-CtgSharePointPnP -Url $site -AppId $AppId -Tenant $Tenant @CertArgs
+            $refGroups = @(Get-CtgSiteGroupsForUser -Email $ReferenceEmail)
+            if ($refGroups.Count -eq 0) { continue }
+            $already = @(Get-CtgSiteGroupsForUser -Email $NewEmail)
+            foreach ($g in $refGroups) {
+                if (@($Exclude | Where-Object { $_ -and $g -like $_ }).Count) { $held++; $actions.Add("not mirrored: site group '$g' on $site — excluded by the client's mirror policy"); continue }
+                if ($already -contains $g) { $actions.Add("already in site group '$g' on $site"); continue }
+                if ($PSCmdlet.ShouldProcess("$site / $g", "add $NewEmail")) {
+                    Add-PnPGroupMember -Group $g -LoginName $newLogin -ErrorAction Stop
+                    $actions.Add("added to site group '$g' on $site (mirrored from $ReferenceEmail)"); $added++
+                }
+            }
+        }
+        catch { $actions.Add("WARN SharePoint site $site not mirrored: $($_.Exception.Message)") }
+    }
+    $actions.Add("SharePoint site groups: mirrored $added group(s) from $ReferenceEmail$(if ($held) { ", $held held back by the mirror policy" })")
+    return $actions.ToArray()
+}
+
 function Get-CtgOneDriveSiteUrl {
     [CmdletBinding()]
     param([Parameter(Mandatory)][AllowEmptyString()][string]$WebUrl)
@@ -251,4 +380,4 @@ function Get-CtgOneDriveSiteUrl {
     $m.Groups[1].Value
 }
 
-Export-ModuleMember -Function Connect-CtgSharePointPnP, Grant-CtgSharePointSiteAccess, Get-CtgOneDriveSiteUrl, Test-CtgOffboardResolved, Invoke-CtgSharePointOffboardGrant, Test-CtgDelegateUnambiguous
+Export-ModuleMember -Function Connect-CtgSharePointPnP, Get-CtgSharePointSiteUrls, Invoke-CtgSharePointSiteGroupsOffboard, Invoke-CtgSharePointSiteGroupsMirror, Grant-CtgSharePointSiteAccess, Get-CtgOneDriveSiteUrl, Test-CtgOffboardResolved, Invoke-CtgSharePointOffboardGrant, Test-CtgDelegateUnambiguous

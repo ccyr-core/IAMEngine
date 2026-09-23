@@ -1618,6 +1618,53 @@ $DISPATCH = @{
 # moduleName = Coretelligent.M365). Alias it so an `entra` job isn't left without an executor.
 $DISPATCH['entra'] = $DISPATCH['m365']
 
+# FR #118: SharePoint SITE groups across every site in the tenant — offboard removes the leaver from
+# them, onboard with "mirror <user>" copies the reference user's. PnP app-only on the SAME m365-admin
+# cert as the OneDrive hand-off; Graph (the m365 Connect) is used only to find the tenant's SharePoint
+# root, from which the admin-centre URL is derived (config.rootUrl overrides it for an odd tenant).
+function Invoke-CtgSharePointSiteGroupsLane {
+    param($Job, $Creds, [ValidateSet('onboard', 'offboard')][string]$Lane)
+    if (-not $pnpAvail) { throw "PnP.PowerShell isn't available on this runner, so the SharePoint site-group step can't run here — it runs on a runner with PnP.PowerShell installed (the central runner installs it at startup when it can reach the gallery)." }
+    $certArgs = Get-CtgExoCertArgs $Creds['m365-admin']
+    if ($certArgs.Count -eq 0) { throw "the m365-admin secret has no certificate (CertificateBase64 or CertificateThumbprint) — SharePoint app-only access needs one, the same cert the Exchange step uses." }
+    $appId = Get-CtgM365AppId $Creds
+    $tenant = Get-CtgTenantDomain $Job $Creds
+    $root = [string](Get-CtgProp $Job.config 'rootUrl')
+    if (-not $root) { $root = [string](Get-CtgProp (Invoke-MgGraphRequest -Method GET -Uri 'v1.0/sites/root?$select=webUrl' -ErrorAction Stop) 'webUrl') }
+    if ($root -notmatch '^https://([^./]+)\.sharepoint\.com') { throw "couldn't work out this tenant's SharePoint address (got '$root') — set config.rootUrl on the sharepoint system, e.g. https://contoso.sharepoint.com" }
+    $adminUrl = "https://$($Matches[1])-admin.sharepoint.com"
+    Set-CtgPhase $Job.id "listing SharePoint sites (cached per tenant)"
+    $sites = @(Get-CtgSharePointSiteUrls -AdminUrl $adminUrl -AppId $appId -Tenant $tenant -CertArgs $certArgs)
+    $email = Resolve-CtgM365Upn -User $Job.payload
+    if (-not $email) { throw "the case carries no email/UPN for the user — set it on the case and re-run." }
+    $actions = [System.Collections.Generic.List[string]]::new()
+    if ($Lane -eq 'offboard') {
+        Set-CtgPhase $Job.id "removing $email from site groups on $($sites.Count) site(s)"
+        foreach ($a in (Invoke-CtgSharePointSiteGroupsOffboard -Email $email -Sites $sites -AppId $appId -Tenant $tenant -CertArgs $certArgs)) { $actions.Add($a) }
+    }
+    else {
+        $mirror = [string](Get-CtgProp $Job.config 'mirrorFromUser')
+        if (-not $mirror) { $actions.Add("no mirror user on this onboard — no SharePoint site groups to copy") }
+        else {
+            # The intake names the reference user by display name as often as by email — resolve it.
+            $ref = Resolve-CtgEntraUser -Identity $mirror
+            if (-not $ref) { $actions.Add("WARN mirror user not found in Entra: $mirror — SharePoint site groups not mirrored") }
+            else {
+                $exclude = @(Get-CtgProp (Get-CtgProp $Job.config 'mirrorPolicy') 'exclude')
+                Set-CtgPhase $Job.id "mirroring $($ref.UserPrincipalName)'s site groups across $($sites.Count) site(s)"
+                foreach ($a in (Invoke-CtgSharePointSiteGroupsMirror -NewEmail $email -ReferenceEmail ([string]$ref.UserPrincipalName) -Sites $sites -AppId $appId -Tenant $tenant -CertArgs $certArgs -Exclude $exclude)) { $actions.Add($a) }
+            }
+        }
+    }
+    [pscustomobject]@{ System = 'sharepoint'; Status = 'ok'; Email = $email; Actions = $actions.ToArray() }
+}
+
+$DISPATCH['sharepoint'] = @{
+    Connect  = $DISPATCH['m365'].Connect
+    Onboard  = { param($job, $creds) Invoke-CtgSharePointSiteGroupsLane -Job $job -Creds $creds -Lane onboard }
+    Offboard = { param($job, $creds) Invoke-CtgSharePointSiteGroupsLane -Job $job -Creds $creds -Lane offboard }
+}
+
 # Ad-hoc "Generate random password" (INC0855142): dispatched on demand from a case's account line,
 # never planned. The app generates the value, injects it as config.newPassword at claim, and reveals
 # it once operator-side — the executors never return it. One executor per system serves both lanes
@@ -1880,7 +1927,7 @@ $script:ConnectedTenant = @{}
 # ConnectedTenant['m365'] still == A's key, SKIPS Connect, and provisions/offboards A's user inside
 # B's tenant. Whenever a shared session is (re)bound, forget the SIBLING keys so they reconnect.
 $script:ConnectionGroups = @{
-    graph  = @('m365', 'entra', 'm365-password-reset', 'tap', 'notify')
+    graph  = @('m365', 'entra', 'm365-password-reset', 'tap', 'notify', 'sharepoint')
     google = @('google-workspace', 'google-password-reset')
 }
 

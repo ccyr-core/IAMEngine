@@ -465,7 +465,8 @@ export function resolvePlannedConfigs(
   const withMirror = !mirror
     ? withSharedMailboxes
     : withSharedMailboxes.map((j) =>
-        DIRECTORY_SYSTEMS.has(j.systemKey)
+        // FR #118: sharepoint mirrors the reference user's SITE groups (the directory lanes cover the rest).
+        DIRECTORY_SYSTEMS.has(j.systemKey) || j.systemKey === "sharepoint"
           ? { ...j, config: { ...((j.config as Record<string, unknown> | null) ?? {}), mirrorFromUser: mirror } }
           : j
       );
