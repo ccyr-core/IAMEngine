@@ -55,7 +55,7 @@ export function CorrectUserButton({ caseId, current }: { caseId: string; current
       {open && (
         <Dialog onClose={() => setOpen(false)}>
           <h2 style={{ margin: "0 0 0.25rem" }}>Correct the user</h2>
-          <p className="note" style={{ marginTop: 0 }}>Changes are made on every system this onboard set up. A new email becomes the primary address and sign-in name; the old one is kept as an alias so mail still arrives.</p>
+          <p className="note" style={{ marginTop: 0 }}>Changes are made on every system this onboard set up. A new email becomes the primary address and sign-in name; the old one is kept as an alias so mail still arrives. The case shows the new details once every system has taken the change.</p>
           {field("firstName", "First name")}
           {field("lastName", "Last name")}
           {field("displayName", "Display name")}

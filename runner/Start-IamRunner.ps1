@@ -1644,7 +1644,16 @@ $DISPATCH['ad-remove-user']        = @{ Onboard = { param($job, $creds) Invoke-C
 $DISPATCH['ad-correct-user']       = @{ Onboard = { param($job, $creds) Invoke-CtgADCorrectUser -User (Get-CtgLookupUser $job) -Config $job.config -AdConnection (New-CtgAdConnection $creds) } }
 $DISPATCH['m365-remove-user']      = @{ Connect = $DISPATCH['m365'].Connect; Onboard = { param($job, $creds) Invoke-CtgM365RemoveUser -User $job.payload -Config $job.config } }
 $DISPATCH['m365-correct-user']     = @{ Connect = $DISPATCH['m365'].Connect; Onboard = { param($job, $creds) Invoke-CtgM365CorrectUser -User (Get-CtgLookupUser $job) -Config $job.config } }
-$DISPATCH['exchange-correct-user'] = @{ Connect = $DISPATCH['exchange'].Connect; Onboard = { param($job, $creds) Invoke-CtgExchangeCorrectAddress -User (Get-CtgLookupUser $job) -Config $job.config } }
+# exchange-correct-user runs on the CENTRAL runner against Exchange Online only: a hybrid mailbox is
+# readdressed by the AD step (directory sync carries it), so the on-prem Exchange session the exchange
+# lane opens when `exchange-onprem` is brokered is never wanted here (and unreachable from the cloud).
+# The app doesn't broker it; the Connect drops it too, for a job queued by an older app. Its session is
+# closed when the job ends, like the exchange lane's (the job loop's finally calls Disconnect).
+$DISPATCH['exchange-correct-user'] = @{
+    Connect    = { param($job, $creds) $exo = @{} + $creds; [void]$exo.Remove('exchange-onprem'); & $DISPATCH['exchange'].Connect $job $exo }
+    Disconnect = { Disconnect-CtgExchange }
+    Onboard    = { param($job, $creds) Invoke-CtgExchangeCorrectAddress -User (Get-CtgLookupUser $job) -Config $job.config }
+}
 $DISPATCH['google-remove-user']    = @{ Connect = $DISPATCH['google-workspace'].Connect; Onboard = { param($job, $creds) Invoke-CtgGoogleRemoveUser -User $job.payload -Config $job.config } }
 $DISPATCH['google-correct-user']   = @{ Connect = $DISPATCH['google-workspace'].Connect; Onboard = { param($job, $creds) Invoke-CtgGoogleCorrectUser -User (Get-CtgLookupUser $job) -Config $job.config } }
 foreach ($k in 'ad-remove-user', 'ad-correct-user', 'm365-remove-user', 'm365-correct-user', 'exchange-correct-user', 'google-remove-user', 'google-correct-user') { $DISPATCH[$k].Offboard = $DISPATCH[$k].Onboard }
@@ -1895,7 +1904,8 @@ $script:ConnectedTenant = @{}
 $script:ConnectionGroups = @{
     graph  = @('m365', 'entra', 'm365-password-reset', 'tap', 'notify', 'm365-remove-user', 'm365-correct-user')
     google = @('google-workspace', 'google-password-reset', 'google-remove-user', 'google-correct-user')
-    # FR #88: exchange-correct-user reuses the Exchange Online session, which is process-wide.
+    # FR #88: exchange-correct-user connects through the exchange lane's Connect (EXO only), and the
+    # Exchange Online session is process-wide.
     exchange = @('exchange', 'exchange-correct-user')
 }
 

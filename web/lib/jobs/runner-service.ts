@@ -16,6 +16,8 @@ import { jobResultEnvelope } from "./job-result";
 import { cloudObjectFor, type CloudObject } from "./cloud-object";
 import { PASSWORD_RESET_SYSTEM_KEYS } from "./password-reset";
 import { ADHOC_SYSTEM_KEYS } from "./adhoc";
+import { CORRECT_USER_SYSTEM_KEYS } from "./user-adhoc";
+import { commitUserCorrectionIfComplete } from "../cases/user-adhoc-service";
 import { HttpError, type BrokeredCredential, type ResultInput, type RunnerJob } from "./types";
 import { resolveSecretFields, delineaConfigFromEnv, delineaConfigured, getDelineaToken, getOneTimePasswordCode } from "../secrets/delinea";
 import { checkFieldShape } from "../secrets/field-requirements";
@@ -1929,6 +1931,16 @@ export function makeRunnerService(db: PrismaClient) {
           ...(PASSWORD_RESET_SYSTEM_KEYS.includes(job.systemKey) && (status !== "succeeded" || (job.request as Record<string, unknown> | null)?.manualPassword === true) ? { oneTimePassword: null } : {}),
         },
       });
+
+      // FR #88: a "Correct user" job that succeeded may have been the last one its correction was
+      // waiting on — only then does the case payload take the corrected identity. Never fatal to the
+      // result itself (the job outcome is already recorded); a miss is audited so it can be re-applied.
+      if (status === "succeeded" && CORRECT_USER_SYSTEM_KEYS.includes(job.systemKey)) {
+        try { await commitUserCorrectionIfComplete(db, jobId); }
+        catch (e) {
+          await db.auditLog.create({ data: { actor: "system:user-correction", action: "case.user.correct_commit_failed", jobId, caseRequestId: job.caseRequestId, clientId: job.case.clientId, detail: { error: (e as Error).message } } }).catch(() => undefined);
+        }
+      }
 
       const isAdhoc = ADHOC_SYSTEM_KEYS.includes(job.systemKey);
       // AUTO-RETRY: a succeeded result carrying RetryAfterMinutes (e.g. Spanning/Mimecast "user not

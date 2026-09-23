@@ -1106,11 +1106,38 @@ function Get-CtgAdCaseUser {
 # Both are ad-hoc jobs dispatched from an onboard case (never planned), and both find the account the
 # way the onboard left it: by sAMAccountName, then UPN.
 
+# Every (sam, UPN) pair the case has given this user, in the order to try them: the job's own identity
+# first, then the app-supplied config.knownIdentities (the old AND the corrected identity of any
+# correction on the case, finished or not), then the correction's own target (newSam/newUpn).
+function Get-CtgAdCaseIdentities {
+    param([pscustomobject]$User, [pscustomobject]$Config)
+    $out = [System.Collections.Generic.List[object]]::new()
+    $add = { param($s, $u) $s = [string]$s; $u = [string]$u; if ($s -or $u) { $out.Add([pscustomobject]@{ Sam = $s; Upn = $u }) } }
+    & $add (Get-CtgProp $User 'SamAccountName') (Get-CtgProp $User 'UserPrincipalName')
+    foreach ($i in @(Get-CtgProp $Config 'knownIdentities')) { if ($i) { & $add (Get-CtgProp $i 'SamAccountName') (Get-CtgProp $i 'UserPrincipalName') } }
+    & $add (Get-CtgProp $Config 'newSam') (Get-CtgProp $Config 'newUpn')
+    $out.ToArray()
+}
+
+# The first AD account matching any of those identities, by sam then UPN — never by display name.
+function Find-CtgAdUserByIdentities {
+    param([object[]]$Identities, [string[]]$Properties, [hashtable]$AdConnection = @{})
+    foreach ($id in $Identities) {
+        $u = $null
+        if ($id.Sam) { try { $u = Get-ADUser -Identity $id.Sam -Properties $Properties -ErrorAction SilentlyContinue @AdConnection } catch { $u = $null } }
+        if (-not $u -and $id.Upn) { $u = @(Get-ADUser -Filter "UserPrincipalName -eq '$($id.Upn -replace "'", "''")'" -Properties $Properties -ErrorAction SilentlyContinue @AdConnection)[0] }
+        if ($u) { return $u }
+    }
+    $null
+}
+
 # Remove (hard delete) a user the onboard created — e.g. the hire fell through. Identity is matched on
 # sam/UPN ONLY: the display-name fallback other ad-hoc steps use could, on a unique-but-wrong match,
-# delete a different person, and a delete can't be taken back. Group memberships are captured first as
-# evidence. -Recursive removes child objects (e.g. ActiveSync device containers) that would otherwise
-# block the delete. Not found = already removed (the idempotent re-run).
+# delete a different person, and a delete can't be taken back. It tries every identity the case has
+# given the user (a correction may have landed here but not elsewhere). Group memberships are captured
+# first as evidence. -Recursive removes child objects (e.g. ActiveSync device containers) that would
+# otherwise block the delete. Found under NONE of them = a WARN, not a quiet success: nothing was
+# deleted, and an operator has to confirm the account is really gone.
 function Invoke-CtgADRemoveUser {
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -1119,15 +1146,13 @@ function Invoke-CtgADRemoveUser {
         [hashtable]$AdConnection = @{}
     )
     $actions = [System.Collections.Generic.List[string]]::new()
-    $sam = [string](Get-CtgProp $User 'SamAccountName')
-    $upn = [string](Get-CtgProp $User 'UserPrincipalName')
-    if (-not $sam -and -not $upn) { throw "no sAMAccountName or UPN on the case — refusing to look the user up by display name for a delete" }
+    $ids = @(Get-CtgAdCaseIdentities -User $User -Config $Config)
+    if ($ids.Count -eq 0) { throw "no sAMAccountName or UPN on the case — refusing to look the user up by display name for a delete" }
     $props = @('SamAccountName', 'DistinguishedName', 'MemberOf', 'UserPrincipalName')
-    $u = $null
-    if ($sam) { $u = Get-ADUser -Identity $sam -Properties $props -ErrorAction SilentlyContinue @AdConnection }
-    if (-not $u -and $upn) { $u = @(Get-ADUser -Filter "UserPrincipalName -eq '$($upn -replace "'", "''")'" -Properties $props -ErrorAction SilentlyContinue @AdConnection)[0] }
+    $u = Find-CtgAdUserByIdentities -Identities $ids -Properties $props -AdConnection $AdConnection
     if (-not $u) {
-        $actions.Add("AD user not found ($(@($sam, $upn) | Where-Object { $_ } | Select-Object -First 1)) — nothing deleted (already removed, or renamed outside this case — check before assuming it is gone)")
+        $tried = @($ids | ForEach-Object { @($_.Sam, $_.Upn) } | Where-Object { $_ } | Select-Object -Unique) -join ', '
+        $actions.Add("WARN AD user not found under any identity this case gave it ($tried) — nothing deleted. Already removed, or renamed outside this case: check AD before assuming it is gone")
         return [pscustomobject]@{ System = 'active-directory'; Status = 'ok'; Actions = $actions.ToArray(); Evidence = @{ Groups = @() } }
     }
     $groups = @(@(Get-CtgProp $u 'MemberOf') | ForEach-Object { [string]$_ })
@@ -1155,6 +1180,8 @@ function Invoke-CtgADCorrectUser {
     $actions = [System.Collections.Generic.List[string]]::new()
     $props = @('SamAccountName', 'DistinguishedName', 'GivenName', 'Surname', 'DisplayName', 'UserPrincipalName', 'mail', 'proxyAddresses', 'Name')
     $u = Get-CtgAdCaseUser -User $User -Properties $props -AdConnection $AdConnection
+    # A re-run after a partial first run: the account may already carry the corrected sam/UPN.
+    if (-not $u) { $u = Find-CtgAdUserByIdentities -Identities @(Get-CtgAdCaseIdentities -User ([pscustomobject]@{}) -Config $Config) -Properties $props -AdConnection $AdConnection }
     if (-not $u) { throw "AD user not found — nothing corrected (check the case's username/UPN)" }
     $sam = [string]$u.SamAccountName
     $first = [string](Get-CtgProp $Config 'firstName'); $last = [string](Get-CtgProp $Config 'lastName')

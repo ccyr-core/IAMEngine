@@ -121,3 +121,131 @@ Describe 'Google correct / remove' {
         Should -Invoke Invoke-CtgGoogleApi -ModuleName Coretelligent.GoogleWorkspace -Times 1 -Exactly -ParameterFilter { $Method -eq 'PUT' -and $Path -eq '/users/jsmyth@acme.com' -and $Body.primaryEmail -eq 'jsmith@acme.com' -and $Body.name.familyName -eq 'Smith' -and -not $Body.name.ContainsKey('givenName') }
     }
 }
+
+# ── Review fixes ──────────────────────────────────────────────────────────────────────────────────────
+# The app no longer moves the case to the corrected identity until every correction job has succeeded,
+# so a Remove (or a re-run correction) can meet an account under EITHER name. config.knownIdentities
+# carries every identity the case has given the user; executors try them all, and a Remove that finds
+# nothing says WARN instead of reporting a clean success.
+Describe 'review fix: Remove searches every identity the case gave the user' {
+    BeforeAll {
+        $script:Known = [pscustomobject]@{ knownIdentities = @(
+                [pscustomobject]@{ SamAccountName = 'jsmyth'; UserPrincipalName = 'jsmyth@acme.com' },
+                [pscustomobject]@{ SamAccountName = 'jsmith'; UserPrincipalName = 'jsmith@acme.com' }) }
+    }
+    It 'AD: deletes the account under its CORRECTED name when the old one is gone' {
+        Mock Get-ADUser -ModuleName Coretelligent.ActiveDirectory { $null }
+        Mock Get-ADUser -ModuleName Coretelligent.ActiveDirectory -ParameterFilter { $Identity -eq 'jsmith' } { [pscustomobject]@{ SamAccountName = 'jsmith'; DistinguishedName = 'CN=John Smith,DC=acme,DC=com'; MemberOf = @() } }
+        Mock Remove-ADObject -ModuleName Coretelligent.ActiveDirectory { }
+        $null = Invoke-CtgADRemoveUser -User $script:Case -Config $script:Known
+        Should -Invoke Remove-ADObject -ModuleName Coretelligent.ActiveDirectory -Times 1 -Exactly -ParameterFilter { $Identity -eq 'CN=John Smith,DC=acme,DC=com' }
+    }
+    It 'AD: found under none of them is a WARN, not a clean success' {
+        Mock Get-ADUser -ModuleName Coretelligent.ActiveDirectory { $null }
+        Mock Remove-ADObject -ModuleName Coretelligent.ActiveDirectory { }
+        $r = Invoke-CtgADRemoveUser -User $script:Case -Config $script:Known
+        Should -Invoke Remove-ADObject -ModuleName Coretelligent.ActiveDirectory -Times 0 -Exactly
+        ($r.Actions -join ' ') | Should -Match '^WARN .*jsmith@acme\.com'
+    }
+    It 'M365: deletes the account under its corrected UPN when the old one is gone' {
+        Mock Get-MgUser -ModuleName Coretelligent.M365 { $null }
+        Mock Get-MgUser -ModuleName Coretelligent.M365 -ParameterFilter { $UserId -eq 'jsmith@acme.com' } { [pscustomobject]@{ Id = 'u2'; UserPrincipalName = 'jsmith@acme.com'; OnPremisesSyncEnabled = $null } }
+        Mock Remove-MgUser -ModuleName Coretelligent.M365 { }
+        Mock Remove-MgDirectoryDeletedItem -ModuleName Coretelligent.M365 { }
+        $r = Invoke-CtgM365RemoveUser -User $script:Case -Config $script:Known
+        Should -Invoke Remove-MgUser -ModuleName Coretelligent.M365 -Times 1 -Exactly -ParameterFilter { $UserId -eq 'u2' }
+        ($r.Actions -join ' ') | Should -Match 'deleted Entra user jsmith@acme\.com'
+    }
+    It 'M365: found under none of them is a WARN' {
+        Mock Get-MgUser -ModuleName Coretelligent.M365 { $null }
+        Mock Remove-MgUser -ModuleName Coretelligent.M365 { }
+        $r = Invoke-CtgM365RemoveUser -User $script:Case -Config $script:Known
+        Should -Invoke Remove-MgUser -ModuleName Coretelligent.M365 -Times 0 -Exactly
+        ($r.Actions -join ' ') | Should -Match '^WARN '
+    }
+    It 'Google: deletes the account under its corrected address, by its primary email' {
+        Mock Get-CtgGoogleUser -ModuleName Coretelligent.GoogleWorkspace { $null }
+        Mock Get-CtgGoogleUser -ModuleName Coretelligent.GoogleWorkspace -ParameterFilter { $Email -eq 'jsmith@acme.com' } { [pscustomobject]@{ primaryEmail = 'jsmith@acme.com' } }
+        Mock Invoke-CtgGoogleApi -ModuleName Coretelligent.GoogleWorkspace { }
+        $null = Invoke-CtgGoogleRemoveUser -User $script:Case -Config $script:Known
+        Should -Invoke Invoke-CtgGoogleApi -ModuleName Coretelligent.GoogleWorkspace -Times 1 -Exactly -ParameterFilter { $Method -eq 'DELETE' -and $Path -eq '/users/jsmith@acme.com' }
+    }
+}
+
+Describe 'review fix: a correction re-run after a partial first run' {
+    It 'AD: finds the account under the corrected sam and reports it already correct' {
+        Mock Get-ADUser -ModuleName Coretelligent.ActiveDirectory { $null }
+        Mock Get-ADUser -ModuleName Coretelligent.ActiveDirectory -ParameterFilter { $Identity -eq 'jsmith' } {
+            [pscustomobject]@{ SamAccountName = 'jsmith'; DistinguishedName = 'CN=John Smith,DC=acme,DC=com'; GivenName = 'John'; Surname = 'Smith'; DisplayName = 'John Smith'; Name = 'John Smith'
+                UserPrincipalName = 'jsmith@acme.com'; mail = 'jsmith@acme.com'; proxyAddresses = @('SMTP:jsmith@acme.com', 'smtp:jsmyth@acme.com') }
+        }
+        Mock Set-ADUser -ModuleName Coretelligent.ActiveDirectory { }
+        Mock Rename-ADObject -ModuleName Coretelligent.ActiveDirectory { }
+        $r = Invoke-CtgADCorrectUser -User $script:Case -Config ([pscustomobject]@{ lastName = 'Smith'; displayName = 'John Smith'; newUpn = 'jsmith@acme.com'; newSam = 'jsmith' })
+        Should -Invoke Set-ADUser -ModuleName Coretelligent.ActiveDirectory -Times 0 -Exactly
+        ($r.Actions -join ' ') | Should -Match 'already correct'
+    }
+    It 'M365: an account the first run already renamed is found by the new UPN and is already correct' {
+        Mock Get-MgUser -ModuleName Coretelligent.M365 { $null }
+        Mock Get-MgUser -ModuleName Coretelligent.M365 -ParameterFilter { $UserId -eq 'jsmith@acme.com' } { [pscustomobject]@{ Id = 'u1'; UserPrincipalName = 'jsmith@acme.com'; GivenName = 'John'; Surname = 'Smith'; DisplayName = 'John Smyth'; OnPremisesSyncEnabled = $null } }
+        Mock Update-MgUser -ModuleName Coretelligent.M365 { }
+        $r = Invoke-CtgM365CorrectUser -User $script:Case -Config ([pscustomobject]@{ lastName = 'Smith'; newUpn = 'jsmith@acme.com' })
+        Should -Invoke Update-MgUser -ModuleName Coretelligent.M365 -Times 0 -Exactly
+        ($r.Actions -join ' ') | Should -Match 'already correct'
+    }
+    It 'M365: a synced user that directory sync already renamed is left to AD, not a failure' {
+        Mock Get-MgUser -ModuleName Coretelligent.M365 { $null }
+        Mock Get-MgUser -ModuleName Coretelligent.M365 -ParameterFilter { $UserId -eq 'jsmith@acme.com' } { [pscustomobject]@{ Id = 'u1'; UserPrincipalName = 'jsmith@acme.com'; OnPremisesSyncEnabled = $true } }
+        Mock Update-MgUser -ModuleName Coretelligent.M365 { }
+        $r = Invoke-CtgM365CorrectUser -User $script:Case -Config ([pscustomobject]@{ newUpn = 'jsmith@acme.com' })
+        Should -Invoke Update-MgUser -ModuleName Coretelligent.M365 -Times 0 -Exactly
+        ($r.Actions -join ' ') | Should -Match 'synced from AD'
+    }
+    It 'M365: a UPN that differs only in case is already at the target' {
+        Mock Get-MgUser -ModuleName Coretelligent.M365 { [pscustomobject]@{ Id = 'u1'; UserPrincipalName = 'JSmith@acme.com'; OnPremisesSyncEnabled = $null } }
+        Mock Update-MgUser -ModuleName Coretelligent.M365 { }
+        $null = Invoke-CtgM365CorrectUser -User $script:Case -Config ([pscustomobject]@{ newUpn = 'jsmith@acme.com' })
+        Should -Invoke Update-MgUser -ModuleName Coretelligent.M365 -Times 0 -Exactly
+    }
+}
+
+Describe 'review fix: the Exchange address correction' {
+    It 'a mailbox-optional job (queued off the M365 line) warns when the user has no mailbox' {
+        Mock Get-Mailbox -ModuleName Coretelligent.Exchange { $null }
+        Mock Set-Mailbox -ModuleName Coretelligent.Exchange { }
+        $r = Invoke-CtgExchangeCorrectAddress -User $script:Case -Config ([pscustomobject]@{ newUpn = 'jsmith@acme.com'; mailboxOptional = $true })
+        Should -Invoke Set-Mailbox -ModuleName Coretelligent.Exchange -Times 0 -Exactly
+        ($r.Actions -join ' ') | Should -Match '^WARN no Exchange Online mailbox'
+    }
+    It 'a planned exchange line with no mailbox still fails' {
+        Mock Get-Mailbox -ModuleName Coretelligent.Exchange { $null }
+        { Invoke-CtgExchangeCorrectAddress -User $script:Case -Config ([pscustomobject]@{ newUpn = 'jsmith@acme.com' }) } | Should -Throw '*mailbox not found*'
+    }
+}
+
+# Start-IamRunner.ps1 isn't dot-sourceable: lift the exchange-correct-user handler literal out of it
+# via the AST and exercise it against a stub exchange lane.
+Describe 'review fix: the exchange-correct-user runner lane' {
+    BeforeAll {
+        $path = Join-Path (Split-Path $PSScriptRoot -Parent) 'Start-IamRunner.ps1'
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$null, [ref]$null)
+        $assign = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq "`$DISPATCH['exchange-correct-user']" }, $true) | Select-Object -First 1
+        $assign | Should -Not -BeNullOrEmpty
+        $global:CtgTestSeenCreds = $null
+        $global:DISPATCH = @{ exchange = @{ Connect = { param($job, $creds) $global:CtgTestSeenCreds = $creds } } }
+        $script:Handler = & ([scriptblock]::Create($assign.Right.Extent.Text))
+    }
+    AfterAll { Remove-Variable -Name DISPATCH, CtgTestSeenCreds -Scope Global -ErrorAction SilentlyContinue }
+    It 'connects to Exchange Online only — never the on-prem Exchange session (hybrid)' {
+        $creds = @{ 'm365-admin' = 'exo'; 'exchange-onprem' = 'onprem' }
+        & $script:Handler.Connect ([pscustomobject]@{ id = 'j' }) $creds
+        $global:CtgTestSeenCreds | Should -Not -BeNullOrEmpty
+        $global:CtgTestSeenCreds.ContainsKey('m365-admin') | Should -BeTrue
+        $global:CtgTestSeenCreds.ContainsKey('exchange-onprem') | Should -BeFalse
+        $creds.ContainsKey('exchange-onprem') | Should -BeTrue -Because 'the job''s own brokered creds are not mutated'
+    }
+    It 'closes its Exchange Online session when the job ends' {
+        $script:Handler.ContainsKey('Disconnect') | Should -BeTrue
+        $script:Handler.Disconnect.ToString() | Should -Match 'Disconnect-CtgExchange'
+    }
+}

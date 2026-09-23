@@ -523,10 +523,15 @@ function Invoke-CtgGoogleRemoveUser {
     [CmdletBinding(SupportsShouldProcess)]
     param([Parameter(Mandatory)][pscustomobject]$User, [Parameter(Mandatory)][pscustomobject]$Config)
     $actions = [System.Collections.Generic.List[string]]::new()
-    $email = Get-CtgGoogleCaseEmail $User
-    if (-not $email) { throw "no email/UPN on the case — refusing to guess which Google user to delete" }
-    $u = Get-CtgGoogleUser -Email $email
-    if (-not $u) { $actions.Add("Google user $email not found — nothing deleted (already removed, or renamed outside this case — check before assuming it is gone)") }
+    # Every address the case has given the user (config.knownIdentities: the old AND corrected identity
+    # of any correction on the case, finished or not), the case's own first.
+    $emails = @(@(Get-CtgGoogleCaseEmail $User) + @(@(Get-CtgProp $Config 'knownIdentities') | ForEach-Object { if ($_) { Get-CtgProp $_ 'UserPrincipalName' } }) |
+        ForEach-Object { [string]$_ } | Where-Object { $_ -match '@' } | Select-Object -Unique)
+    if ($emails.Count -eq 0) { throw "no email/UPN on the case — refusing to guess which Google user to delete" }
+    $u = $null
+    foreach ($e in $emails) { $u = Get-CtgGoogleUser -Email $e; if ($u) { break } }
+    $email = if ($u -and (Get-CtgProp $u 'primaryEmail')) { [string](Get-CtgProp $u 'primaryEmail') } else { $emails[0] }
+    if (-not $u) { $actions.Add("WARN Google user not found under any address this case gave it ($($emails -join ', ')) — nothing deleted. Already removed, or renamed outside this case: check before assuming it is gone") }
     elseif ($PSCmdlet.ShouldProcess($email, "Delete Google user")) {
         Invoke-CtgGoogleApi -Method DELETE -Path "/users/$email" | Out-Null
         $actions.Add("deleted Google user $email (Google keeps it restorable for 20 days; there is no API to purge it sooner)")

@@ -1643,8 +1643,16 @@ function Invoke-CtgExchangeCorrectAddress {
     $old = [string](@('UserPrincipalName', 'workEmail', 'email') | ForEach-Object { Get-CtgProp $User $_ } | Where-Object { ([string]$_) -match '@' } | Select-Object -First 1)
     # Either address resolves the mailbox (any proxy address does) — the old one before, the new one on a re-run.
     $mbx = $null
-    foreach ($id in @($old, $newUpn) | Where-Object { $_ }) { $mbx = Get-Mailbox -Identity $id -ErrorAction SilentlyContinue; if ($mbx) { break } }
-    if (-not $mbx) { throw "mailbox not found for $old or $newUpn — address not changed" }
+    foreach ($id in @($old, $newUpn) | Where-Object { $_ }) { try { $mbx = Get-Mailbox -Identity $id -ErrorAction SilentlyContinue } catch { $mbx = $null }; if ($mbx) { break } }
+    if (-not $mbx) {
+        # Queued off the M365 line (the plan has no exchange line; the licence made the mailbox): a user
+        # with no mailbox (unlicensed) has no address to move — a warning, not a failed correction.
+        if ((Get-CtgProp $Config 'mailboxOptional') -eq $true) {
+            $actions.Add("WARN no Exchange Online mailbox found for $old or $newUpn — no primary address to change (is the user licensed?)")
+            return [pscustomobject]@{ System = 'exchange'; Status = 'ok'; Actions = $actions.ToArray() }
+        }
+        throw "mailbox not found for $old or $newUpn — address not changed"
+    }
     if ((Get-CtgProp $mbx 'IsDirSynced') -eq $true) {
         $actions.Add("the mailbox is synced from AD — the AD step sets the new primary address and directory sync carries it")
     }

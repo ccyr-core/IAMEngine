@@ -2850,20 +2850,42 @@ function Get-CtgCaseUpnExact {
     [string](@('UserPrincipalName', 'workEmail', 'email') | ForEach-Object { Get-CtgProp $User $_ } | Where-Object { ([string]$_) -match '@' } | Select-Object -First 1)
 }
 
+# Every UPN the case has given this user, in the order to try: the job's own, then config.knownIdentities
+# (the old AND corrected identity of any correction on the case, finished or not), then the correction's
+# own target (newUpn) — so a re-run after the first run already renamed the account still finds it.
+function Get-CtgCaseUpnCandidates {
+    param([pscustomobject]$User, [pscustomobject]$Config)
+    $all = @(Get-CtgCaseUpnExact $User) + @(@(Get-CtgProp $Config 'knownIdentities') | ForEach-Object { if ($_) { Get-CtgProp $_ 'UserPrincipalName' } }) + @(Get-CtgProp $Config 'newUpn')
+    @($all | ForEach-Object { [string]$_ } | Where-Object { $_ -match '@' } | Select-Object -Unique)
+}
+
+# The first Entra user found under any of those UPNs (exact lookups only — never a name search).
+function Find-CtgM365UserByUpns {
+    param([string[]]$Upns, [string]$Property)
+    foreach ($upn in $Upns) {
+        $u = $null
+        try { $u = Get-MgUser -UserId $upn -Property $Property -ErrorAction SilentlyContinue } catch { $u = $null }
+        if ($u) { return $u }
+    }
+    $null
+}
+
 # Hard-delete a cloud-mastered user: delete, then permanently purge from Deleted users (Graph keeps a
 # deleted user restorable for 30 days otherwise). Licences are released by the delete. The purge can
-# briefly 404 while the delete propagates, so it retries for up to ~30 s before warning.
+# briefly 404 while the delete propagates, so it retries for up to ~30 s before warning. Found under
+# none of the case's identities = a WARN (nothing was deleted), never a quiet success.
 function Invoke-CtgM365RemoveUser {
     [CmdletBinding(SupportsShouldProcess)]
     param([Parameter(Mandatory)][pscustomobject]$User, [Parameter(Mandatory)][pscustomobject]$Config)
     $actions = [System.Collections.Generic.List[string]]::new()
-    $upn = Get-CtgCaseUpnExact $User
-    if (-not $upn) { throw "no UPN/email on the case — refusing to look the user up by display name for a delete" }
-    $u = Get-MgUser -UserId $upn -Property 'id,userPrincipalName,onPremisesSyncEnabled' -ErrorAction SilentlyContinue
+    $upns = @(Get-CtgCaseUpnCandidates -User $User -Config $Config)
+    if ($upns.Count -eq 0) { throw "no UPN/email on the case — refusing to look the user up by display name for a delete" }
+    $u = Find-CtgM365UserByUpns -Upns $upns -Property 'id,userPrincipalName,onPremisesSyncEnabled'
     if (-not $u) {
-        $actions.Add("Entra user $upn not found — nothing deleted (already removed, or renamed outside this case — check before assuming it is gone)")
+        $actions.Add("WARN Entra user not found under any identity this case gave it ($($upns -join ', ')) — nothing deleted. Already removed, or renamed outside this case: check Entra before assuming it is gone")
         return [pscustomobject]@{ System = 'm365'; Status = 'ok'; Actions = $actions.ToArray() }
     }
+    $upn = [string](Get-CtgProp $u 'UserPrincipalName'); if (-not $upn) { $upn = $upns[0] }
     if ((Get-CtgProp $u 'OnPremisesSyncEnabled') -eq $true) {
         $actions.Add("$upn is synced from AD — the AD step deletes it and directory sync removes the cloud copy (Microsoft then keeps it in Deleted users for 30 days; purge it there if it must go at once)")
         return [pscustomobject]@{ System = 'm365'; Status = 'ok'; Actions = $actions.ToArray() }
@@ -2884,14 +2906,18 @@ function Invoke-CtgM365RemoveUser {
 
 # Correct names / UPN on a cloud-mastered user. Config: firstName, lastName, displayName, newUpn.
 # The mailbox's primary address is Exchange's to change (Invoke-CtgExchangeCorrectAddress).
+# Re-run safe: the account is looked up by the old UPN, then the corrected one (a first run that
+# renamed it, or directory sync that already carried an AD rename here); one already at the target is
+# "already correct". A synced user is left to the AD step — found under either name, it never throws.
 function Invoke-CtgM365CorrectUser {
     [CmdletBinding(SupportsShouldProcess)]
     param([Parameter(Mandatory)][pscustomobject]$User, [Parameter(Mandatory)][pscustomobject]$Config)
     $actions = [System.Collections.Generic.List[string]]::new()
-    $upn = Get-CtgCaseUpnExact $User
-    if (-not $upn) { throw "no UPN/email on the case — can't find the user to correct" }
-    $u = Get-MgUser -UserId $upn -Property 'id,userPrincipalName,givenName,surname,displayName,onPremisesSyncEnabled' -ErrorAction SilentlyContinue
-    if (-not $u) { throw "Entra user $upn not found — nothing corrected" }
+    $upns = @(Get-CtgCaseUpnCandidates -User $User -Config $Config)
+    if ($upns.Count -eq 0) { throw "no UPN/email on the case — can't find the user to correct" }
+    $u = Find-CtgM365UserByUpns -Upns $upns -Property 'id,userPrincipalName,givenName,surname,displayName,onPremisesSyncEnabled'
+    if (-not $u) { throw "Entra user not found under $($upns -join ' or ') — nothing corrected" }
+    $upn = [string](Get-CtgProp $u 'UserPrincipalName'); if (-not $upn) { $upn = $upns[0] }
     if ((Get-CtgProp $u 'OnPremisesSyncEnabled') -eq $true) {
         $actions.Add("$upn is synced from AD — the AD step makes the change and directory sync carries it to Entra")
         return [pscustomobject]@{ System = 'm365'; Status = 'ok'; Actions = $actions.ToArray() }
@@ -2899,7 +2925,10 @@ function Invoke-CtgM365CorrectUser {
     $body = @{}
     foreach ($pair in @(@('firstName', 'GivenName', 'givenName'), @('lastName', 'Surname', 'surname'), @('displayName', 'DisplayName', 'displayName'), @('newUpn', 'UserPrincipalName', 'userPrincipalName'))) {
         $want = [string](Get-CtgProp $Config $pair[0])
-        if ($want -and $want -cne [string](Get-CtgProp $u $pair[1])) { $body[$pair[2]] = $want }
+        $have = [string](Get-CtgProp $u $pair[1])
+        # A UPN is case-insensitive (Entra would reject a case-only rename as a conflict with itself).
+        $differs = if ($pair[0] -eq 'newUpn') { $want -ine $have } else { $want -cne $have }
+        if ($want -and $differs) { $body[$pair[2]] = $want }
     }
     if ($body.Count -eq 0) { $actions.Add("already correct — nothing to change") }
     elseif ($PSCmdlet.ShouldProcess($upn, "Update $($body.Keys -join ', ')")) {
