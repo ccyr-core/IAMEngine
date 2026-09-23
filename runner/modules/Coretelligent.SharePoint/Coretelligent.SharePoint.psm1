@@ -551,35 +551,44 @@ function Resolve-CtgSharePointMirrorUser {
 }
 
 # The account the new hire actually got. The m365/entra step may have created them at a FALLBACK
-# username (the primary belonged to someone else). In order:
-#   1. payload.provisionedUpn: the app hands on the account a succeeded m365/entra api step reported.
-#   2. payload.awaitCloudAccount = true: an api m365/entra step that CAN report the account hasn't
-#      finished, e.g. it is waiting on a username-collision decision while its primary jsmith@
-#      belongs to an existing John Smith. Refuse and say we're waiting; never guess the primary.
-#      An absent flag (an app from before this hand-off) is treated the same way.
-#   3. Otherwise no step will ever report it (m365 is a manual checklist item, scim, done by hand,
-#      skipped, or succeeded without a Upn). Use the username an OPERATOR set on the case
-#      (fieldSource.userPrincipalName = 'operator', written by the case's field edit and by the
-#      dry-run review's Username override).
-#   4. Else the primary username, but only when it is the SOLE candidate; with fallbacks, refuse and
-#      name the field to set.
+# username (the primary belonged to someone else). The app decides WHICH rule applies
+# (sharepointAccountDecision in web/lib/jobs/provisioned-upn.ts) and hands it on as payload.accountRule:
+#   reported           payload.provisionedUpn, the account a succeeded m365/entra api step reported.
+#   wait               an api m365/entra step can still report it (unfinished, or failed without an
+#                      acceptance for its latest run, e.g. waiting on a username-collision decision
+#                      while jsmith@ belongs to an existing John Smith). Refuse and say we're waiting.
+#                      An absent rule (an app from before this hand-off) waits too.
+#   operator-required  an api step did NOT report it (failure accepted, done by hand, skipped, no Upn).
+#                      It may have failed BECAUSE the primary is someone else's, so the primary is never
+#                      used: only payload.confirmedUpn, a Username an operator set on the case after that
+#                      step last ran. Otherwise refuse, naming the field and why.
+#   planned-manual     the step is manual/scim by plan: confirmedUpn (operator-set) if present, else
+#                      the sole candidate.
+#   no-cloud-step      the sole candidate.
 function Resolve-CtgSharePointNewHireUpn {
     param($Payload)
+    $rule = [string](Get-CtgProp $Payload 'accountRule')
     $provisioned = [string](Get-CtgProp $Payload 'provisionedUpn')
+    $confirmed = [string](Get-CtgProp $Payload 'confirmedUpn')
     if ($provisioned) { return $provisioned }
-    if ((Get-CtgProp $Payload 'awaitCloudAccount') -ne $false) {
+    if (-not $rule -or $rule -eq 'wait' -or $rule -eq 'reported') {
         throw "waiting for the Microsoft 365 step to create the new hire's account — it hasn't finished yet (it may be waiting on a decision), and the username on the case could still belong to someone else. SharePoint site groups were not mirrored; re-run this step once the Microsoft 365 step has succeeded."
     }
+    if ($rule -eq 'operator-required') {
+        if ($confirmed) { return $confirmed }
+        $why = [string](Get-CtgProp $Payload 'accountReason'); if (-not $why) { $why = "the Microsoft 365 step didn't report the account it created" }
+        throw "can't tell which account the new hire was created with: $why, and it may have failed because the username on the case ($([string](Get-CtgProp $Payload 'UserPrincipalName'))) belongs to someone else. Set Username (userPrincipalName) on the case to the account the new hire actually has — after the Microsoft 365 step last ran, so an earlier value isn't trusted — then re-run this step."
+    }
+    if ($rule -eq 'planned-manual' -and $confirmed) { return $confirmed }
+    if ($rule -notin @('planned-manual', 'no-cloud-step')) { throw "unknown account rule '$rule' for the SharePoint mirror — SharePoint site groups were not mirrored." }
     $upn = [string](Get-CtgProp $Payload 'UserPrincipalName')
-    $source = [string](Get-CtgProp (Get-CtgProp $Payload 'fieldSource') 'userPrincipalName')
-    if ($upn -and $source -ieq 'operator') { return $upn }
     if (-not $upn) {
         $alt = @(@('email', 'workEmail') | ForEach-Object { [string](Get-CtgProp $Payload $_) } | Where-Object { $_ } | Select-Object -First 1)
         $upn = if ($alt.Count) { $alt[0] } else { '' }
     }
     $fallbacks = @(@(Get-CtgProp $Payload 'UserPrincipalNameFallbacks') | Where-Object { $_ -and ([string]$_) -ine $upn })
     if ($upn -and $fallbacks.Count) {
-        throw "can't tell which account the new hire was created with: the Microsoft 365 step didn't report one, and the username could be $upn or $($fallbacks -join ', '). Set Username (userPrincipalName) on the case to the account that was actually created, then re-run this step."
+        throw "can't tell which account the new hire was created with: no automated Microsoft 365 step reports it on this case, and the username could be $upn or $($fallbacks -join ', '). Set Username (userPrincipalName) on the case to the account that was actually created, then re-run this step."
     }
     return $upn
 }
