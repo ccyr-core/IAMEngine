@@ -42,7 +42,7 @@ test("approval, evidence and destructive intent survive if either side had them"
   assert.equal(m.captureEvidence, true);
   assert.deepEqual(m.secretNames, ["m365-admin", "entra-extra"]);
   assert.equal((m.config as { intent: { offboard: string } }).intent.offboard, "destructive");
-  assert.deepEqual((m.config as { requiresApproval: unknown }).requiresApproval, { offboard: true });
+  assert.deepEqual((m.config as { requiresApproval: unknown }).requiresApproval, { onboard: false, offboard: true });
 });
 
 test("a step that waited on entra now waits on m365 (shared and per-lane deps)", () => {
@@ -67,4 +67,68 @@ test("only systems in THIS lane merge: entra offboard-only doesn't touch an m365
   assert.deepEqual(planCase(systems, "onboard", {}).map((j) => j.systemKey), ["m365"]);
   const off = planCase(systems, "offboard", {});
   assert.deepEqual(off.map((j) => j.systemKey), ["m365"]);
+});
+
+// ---- review fixes ----
+
+test("onboard: entra depending on exchange (which depends on m365) doesn't make a cycle", () => {
+  // MarketScience's dependency shape, on a lane where entra is active.
+  const systems = [
+    sys({ systemKey: "servicenow", mode: "manual", secretNames: [] }),
+    sys({ systemKey: "m365", dependsOn: ["servicenow"] }),
+    sys({ systemKey: "exchange", dependsOn: ["m365"] }),
+    sys({ systemKey: "entra", dependsOn: ["exchange", "m365"] }),
+  ];
+  const jobs = planCase(systems, "onboard", {});
+  assert.deepEqual(jobs.map((j) => j.systemKey), ["servicenow", "m365", "exchange"]);
+  assert.deepEqual(jobs.find((j) => j.systemKey === "m365")!.dependsOn, ["servicenow"]);
+  // ...and the offboard of the same shape still converts the mailbox first.
+  const off = planCase(systems, "offboard", {}).map((j) => j.systemKey);
+  assert.ok(off.indexOf("exchange") < off.indexOf("m365"), `${off}`);
+});
+
+test("a column approval/evidence flag (no per-lane map) survives a merge with a side that has the map", () => {
+  const jobs = planCase([
+    sys({ systemKey: "m365", config: { requiresApproval: { onboard: false, offboard: false }, captureEvidence: { onboard: false, offboard: false } } }),
+    sys({ systemKey: "entra", requiresApproval: true, captureEvidence: true, config: null }), // a systems-editor row
+  ], "offboard", {});
+  assert.equal(jobs[0].requiresApproval, true);
+  assert.equal(jobs[0].captureEvidence, true);
+});
+
+test("a per-lane dependsOn on one side is unioned with the other side's shared deps", () => {
+  const jobs = planCase([
+    sys({ systemKey: "servicenow", mode: "manual", secretNames: [] }),
+    sys({ systemKey: "mimecast" }),
+    sys({ systemKey: "m365", dependsOn: ["servicenow"] }),
+    sys({ systemKey: "entra", config: { dependsOn: { offboard: ["mimecast"] } } }),
+  ], "offboard", {});
+  assert.deepEqual([...jobs.find((j) => j.systemKey === "m365")!.dependsOn].sort(), ["mimecast", "servicenow"]);
+});
+
+test("the merged step is automated if either side was", () => {
+  const [a] = mergeEntraIntoM365([sys({ systemKey: "m365", mode: "manual" }), sys({ systemKey: "entra", mode: "api" })]);
+  assert.equal(a.mode, "api");
+  const [b] = mergeEntraIntoM365([sys({ systemKey: "m365", mode: "api" }), sys({ systemKey: "entra", mode: "manual" })]);
+  assert.equal(b.mode, "api");
+  const [c] = mergeEntraIntoM365([sys({ systemKey: "m365", mode: "manual" }), sys({ systemKey: "entra", mode: "manual" })]);
+  assert.equal(c.mode, "manual");
+});
+
+test("a licence deferral onto entra (or m365) on EITHER side means the merged step removes it", () => {
+  const lic = (m: object, e: object) => {
+    const [s] = mergeEntraIntoM365([
+      sys({ systemKey: "m365", config: { offboard: m } as ClientSystem["config"] }),
+      sys({ systemKey: "entra", config: { offboard: e } as ClientSystem["config"] }),
+    ]);
+    return (s.config as { offboard: { removeLicense?: unknown } }).offboard.removeLicense;
+  };
+  const toEntra = { defer: true, removedBy: "entra" };
+  assert.equal(lic({ blockSignIn: true }, { removeLicense: toEntra }), true);
+  assert.equal(lic({ removeLicense: toEntra }, { removeLicense: toEntra }), true);
+  assert.equal(lic({ removeLicense: { defer: true, removedBy: "m365" } }, { revokeActiveSessions: true }), true);
+  // A real removal on the other side is kept over the deferral.
+  assert.deepEqual(lic({ removeLicense: { skus: ["E5"] } }, { removeLicense: toEntra }), { skus: ["E5"] });
+  // A deferral to some OTHER step (e.g. an AD licensing group) is left alone.
+  assert.deepEqual(lic({ removeLicense: { defer: true, removedBy: "active-directory" } }, {}), { defer: true, removedBy: "active-directory" });
 });

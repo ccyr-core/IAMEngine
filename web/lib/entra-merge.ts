@@ -31,39 +31,70 @@ function mergeInto(loser: unknown, winner: unknown): unknown {
   return winner === undefined ? loser : winner;
 }
 
+const PAIR = new Set(["m365", "entra"]);
+const LANES: Lane[] = ["onboard", "offboard"];
+
+// `removeLicense: { removedBy: "entra" | "m365" }` hands the licence to the other half of the pair — which,
+// once merged, is this very step. The runner defers on any removedBy other than its own system key (and on
+// defer: true), so left in place it would keep the licence on the leaver with no step to remove it.
+const defersToPair = (rl: unknown) => isObj(rl) && PAIR.has(String(rl.removedBy ?? ""));
+
 function mergeLane(m365Lane: unknown, entraLane: unknown): unknown {
   if (entraLane == null) return m365Lane;
-  if (m365Lane == null) return entraLane;
+  if (m365Lane == null) return isObj(entraLane) && defersToPair(entraLane.removeLicense) ? { ...entraLane, removeLicense: true } : entraLane;
   const merged = mergeInto(entraLane, m365Lane) as Obj;
-  // Licence timing (see the header): a removal m365 deferred to entra is now entra's to decide.
-  const rl = isObj(m365Lane) ? m365Lane.removeLicense : undefined;
-  if (isObj(rl) && String(rl.removedBy ?? "") === "entra") {
-    const entraRl = isObj(entraLane) ? entraLane.removeLicense : undefined;
-    merged.removeLicense = entraRl ?? true;
+  // Licence timing (see the header): a removal either side deferred to the pair is the merged step's.
+  // Take whichever side actually removes it (m365 first), else plain removal. Not deep-merged: that
+  // would carry the deferral's defer/removedBy into the real removal.
+  const mRl = isObj(m365Lane) ? m365Lane.removeLicense : undefined;
+  const eRl = isObj(entraLane) ? entraLane.removeLicense : undefined;
+  if (defersToPair(mRl) || defersToPair(eRl)) {
+    merged.removeLicense = [mRl, eRl].find((v) => v !== undefined && !defersToPair(v)) ?? true;
   }
   return merged;
 }
 
-function orMap(a: unknown, b: unknown): Obj | undefined {
-  if (!isObj(a) && !isObj(b)) return undefined;
-  const out: Obj = {};
-  for (const src of [a, b]) if (isObj(src)) for (const [k, v] of Object.entries(src)) out[k] = Boolean(out[k]) || Boolean(v);
+// A side's approval/evidence flag for a lane: its per-lane map is authoritative when it has one (as in
+// planCase), otherwise the column — a systems-editor row carries only the column.
+const laneFlag = (map: unknown, column: boolean, lane: Lane) => (isObj(map) ? Boolean(map[lane]) : column);
+
+// A side's deps for a lane, as planCase reads them: the per-lane override, else the shared column.
+function laneDeps(s: ClientSystem, lane: Lane): string[] {
+  const l = (s.config as Obj | null)?.dependsOn;
+  return isObj(l) && Array.isArray(l[lane]) ? (l[lane] as unknown[]).map(String) : s.dependsOn;
+}
+
+// The systems that (transitively) wait on m365 or entra in this lane. Entra can't inherit a dep on one of
+// these: m365 already runs before it (e.g. exchange dependsOn m365, entra dependsOn exchange), so the
+// merged step would wait on itself. m365's position wins, as its config does.
+function dependentsOfPair(active: ClientSystem[], lane: Lane): Set<string> {
+  const out = new Set<string>();
+  for (let grew = true; grew; ) {
+    grew = false;
+    for (const s of active) {
+      if (PAIR.has(s.systemKey) || out.has(s.systemKey)) continue;
+      if (laneDeps(s, lane).some((d) => PAIR.has(d) || out.has(d))) { out.add(s.systemKey); grew = true; }
+    }
+  }
   return out;
 }
+
+// api > browser > scim > manual: the merged step is automated if either side was. Both sides run the same
+// M365 executor with the same m365-admin secret, so this grants nothing new — while demoting would turn
+// automated containment (revoke sessions, block sign-in) into a checklist item. planCase still plans it
+// manual when its secrets are marked not needed.
+const MODE_RANK: ClientSystem["mode"][] = ["api", "browser", "scim", "manual"];
+const mergedMode = (a: ClientSystem["mode"], b: ClientSystem["mode"]) =>
+  MODE_RANK.indexOf(a) <= MODE_RANK.indexOf(b) ? a : b;
 
 function mergeConfig(m365: unknown, entra: unknown): Obj | null {
   if (!isObj(m365) && !isObj(entra)) return null;
   const m = isObj(m365) ? m365 : {};
   const e = isObj(entra) ? entra : {};
   const out: Obj = { ...(mergeInto(e, m) as Obj) };
-  for (const lane of ["onboard", "offboard"] as Lane[]) {
+  for (const lane of LANES) {
     const v = mergeLane(m[lane], e[lane]);
     if (v === undefined) delete out[lane]; else out[lane] = v;
-  }
-  // Per-lane flag maps: set if EITHER side set it — merging must never drop an approval or evidence gate.
-  for (const key of ["requiresApproval", "captureEvidence"]) {
-    const v = orMap(m[key], e[key]);
-    if (v) out[key] = v;
   }
   // Intent: destructive on a lane if either side was.
   if (isObj(m.intent) || isObj(e.intent)) {
@@ -83,18 +114,31 @@ export function mergeEntraIntoM365(active: ClientSystem[]): ClientSystem[] {
   const m365 = active.find((s) => s.systemKey === "m365");
   const entra = active.find((s) => s.systemKey === "entra");
   if (!m365 || !entra) return active;
-  const mergedConfig = mergeConfig(m365.config, entra.config);
-  // The merged step's own deps: both sides', minus the two of them.
-  const deps = [...new Set([...m365.dependsOn, ...entra.dependsOn])].filter((d) => d !== "m365" && d !== "entra");
-  if (mergedConfig && isObj(mergedConfig.dependsOn)) {
-    const lanes: Obj = {};
-    for (const [lane, list] of Object.entries(mergedConfig.dependsOn)) {
-      lanes[lane] = Array.isArray(list) ? list.map(String).filter((d) => d !== "m365" && d !== "entra") : list;
-    }
-    mergedConfig.dependsOn = lanes;
+  const mergedConfig = mergeConfig(m365.config, entra.config) ?? {};
+  // The merged step's own deps, per lane: each side's EFFECTIVE deps (its lane override, else its shared
+  // deps — a lane override on one side must not drop the other side's shared ones), minus the pair, minus
+  // any entra dep that itself waits on the pair (see dependentsOfPair). Written as explicit lane lists so
+  // planCase reads exactly this; the column is their union.
+  const laneLists: Obj = {};
+  for (const lane of LANES) {
+    const after = dependentsOfPair(active, lane);
+    laneLists[lane] = [...new Set([...laneDeps(m365, lane), ...laneDeps(entra, lane).filter((d) => !after.has(d))])].filter((d) => !PAIR.has(d));
+  }
+  mergedConfig.dependsOn = laneLists;
+  const deps = [...new Set(LANES.flatMap((l) => laneLists[l] as string[]))];
+  // Approval/evidence: per lane, set if EITHER side set it (map or column) — merging must never drop a gate.
+  const mc = isObj(m365.config) ? m365.config : {};
+  const ec = isObj(entra.config) ? entra.config : {};
+  for (const [key, mCol, eCol] of [
+    ["requiresApproval", m365.requiresApproval, entra.requiresApproval],
+    ["captureEvidence", m365.captureEvidence, entra.captureEvidence],
+  ] as const) {
+    if (!isObj(mc[key]) && !isObj(ec[key])) continue; // neither has a map: planCase reads the OR'd column
+    mergedConfig[key] = Object.fromEntries(LANES.map((l) => [l, laneFlag(mc[key], mCol, l) || laneFlag(ec[key], eCol, l)]));
   }
   const merged: ClientSystem = {
     ...m365,
+    mode: mergedMode(m365.mode, entra.mode),
     dependsOn: deps,
     requiresApproval: m365.requiresApproval || entra.requiresApproval,
     captureEvidence: m365.captureEvidence || entra.captureEvidence,
