@@ -94,6 +94,9 @@ export default async function CaseDetailPage({ params }: { params: { id: string 
   // FR #81: the Google OU this case will use (the planned google-workspace job's config), editable
   // per case. Only for cases that have a Google step.
   const googleJob = await db.job.findFirst({ where: { caseRequestId: c.id, systemKey: "google-workspace" }, select: { status: true, request: true } });
+  const googleOuOptions = googleJob
+    ? (((await db.caseRequest.findUnique({ where: { id: c.id }, select: { client: { select: { googleOus: true } } } }))?.client.googleOus ?? {}) as { ous?: string[] }).ous ?? []
+    : [];
   const googleOu = googleJob && (c.action === "onboard" || c.action === "offboard")
     ? (() => {
         const cfg = ((googleJob.request ?? {}) as { config?: Record<string, unknown> }).config ?? {};
@@ -203,7 +206,7 @@ export default async function CaseDetailPage({ params }: { params: { id: string 
 
       {googleOu && (
         <GoogleOuControl caseId={c.id} action={googleOu.action} current={googleOu.current} overridden={googleOu.overridden}
-          locked={googleOu.locked} canEdit={canRevealPassword} />
+          locked={googleOu.locked} canEdit={canRevealPassword} options={googleOuOptions} />
       )}
 
       {changePreviewDiffs && <ChangePreview caseId={c.id} diffs={changePreviewDiffs} />}

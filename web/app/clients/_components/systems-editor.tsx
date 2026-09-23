@@ -110,6 +110,16 @@ function rowFromCatalog(key: string): Row {
   };
 }
 
+type GoogleOuState = { ous: string[]; discoveredAt: string | null; error: string | null; pending: boolean; busy: boolean };
+
+// The one-line status under "Refresh Google OUs".
+function googleOuNote(g: GoogleOuState): string {
+  if (g.pending) return "Requested — the runner reads them on its next poll…";
+  if (g.error) return `Last refresh failed: ${g.error}`;
+  if (g.discoveredAt) return `${g.ous.length} OUs · ${new Date(g.discoveredAt).toLocaleString()}`;
+  return "Not read yet — type a path, or refresh to pick from the tenant's OUs";
+}
+
 // Reads the GAL deviation out of a system's parsed config.offboard.hideFromGal. Handles both the
 // canonical casing and the "hideFromGAL" variant seen in some hand-edited configs.
 function galFromConfig(config: unknown): { galMode: GalMode; galAttribute: string } {
@@ -133,6 +143,8 @@ export function SystemsEditor({ slug, open, onClose }: { slug: string | null; op
   // AD folders the agent discovered from the DC (client.adObjects.ous) — feeds the onboarding-OU tree
   // picker on the active-directory row. `ouPickerRow` tracks which row has its Browse tree open.
   const [adOus, setAdOus] = useState<string[]>([]);
+  // FR #81: the tenant's Google OU paths (discovered by the central runner) for the Google OU fields.
+  const [googleOus, setGoogleOus] = useState<GoogleOuState>({ ous: [], discoveredAt: null, error: null, pending: false, busy: false });
   const [ouPickerRow, setOuPickerRow] = useState<number | null>(null);
   const [addKey, setAddKey] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -168,6 +180,7 @@ export function SystemsEditor({ slug, open, onClose }: { slug: string | null; op
       const ad = (c.adObjects ?? {}) as { ous?: unknown };
       setAdOus(Array.isArray(ad.ous) ? (ad.ous as string[]) : []);
       setOuPickerRow(null);
+      if ((c.systems ?? []).some((sys: { systemKey?: string }) => sys.systemKey === "google-workspace")) void loadGoogleOus(s);
       setRows(
         (c.systems ?? []).map((sys: Record<string, unknown>) => ({
           systemKey: sys.systemKey,
@@ -189,6 +202,32 @@ export function SystemsEditor({ slug, open, onClose }: { slug: string | null; op
     } finally {
       setLoading(false);
     }
+  }
+
+  async function loadGoogleOus(s: string) {
+    try {
+      const r = await fetch(`/api/clients/${s}/google-ous`);
+      if (!r.ok) return;
+      const d = await r.json();
+      setGoogleOus((g) => ({ ...g, ous: Array.isArray(d.ous) ? d.ous : [], discoveredAt: d.discoveredAt ?? null, error: d.error ?? null, pending: Boolean(d.pending) }));
+    } catch { /* best-effort: the fields still take a typed path */ }
+  }
+
+  // Queue a discovery; the central runner picks it up on its next poll (seconds to a minute), so check
+  // back a few times rather than making the operator reopen the dialog.
+  async function refreshGoogleOus() {
+    if (!slug) return;
+    setGoogleOus((g) => ({ ...g, busy: true, error: null }));
+    try {
+      const r = await fetch(`/api/clients/${slug}/google-ous`, { method: "POST" });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) { setGoogleOus((g) => ({ ...g, busy: false, error: d.error ?? `failed (${r.status})` })); return; }
+      setGoogleOus((g) => ({ ...g, busy: false, pending: true }));
+      for (const wait of [5000, 10000, 20000, 30000]) {
+        await new Promise((res) => setTimeout(res, wait));
+        await loadGoogleOus(slug);
+      }
+    } catch (e) { setGoogleOus((g) => ({ ...g, busy: false, error: (e as Error).message })); }
   }
 
   function update(i: number, patch: Partial<Row>) {
@@ -553,15 +592,21 @@ export function SystemsEditor({ slug, open, onClose }: { slug: string | null; op
                 )}
                 {/* FR #81 — Google Workspace OUs (config.onboard.ou / config.offboard.inactiveOu, what the runner reads) */}
                 {r.systemKey === "google-workspace" && (
-                  <div style={{ marginTop: "0.55rem", display: "flex", gap: "0.8rem", flexWrap: "wrap", maxWidth: 720 }}>
+                  <div style={{ marginTop: "0.55rem", display: "flex", gap: "0.8rem", flexWrap: "wrap", alignItems: "flex-end", maxWidth: 820 }}>
                     <Field label="Onboarding OU" help={HELP.googleOu} grow>
-                      <input value={r.onboardOu} onChange={(e) => update(i, { onboardOu: e.target.value })}
+                      <input value={r.onboardOu} onChange={(e) => update(i, { onboardOu: e.target.value })} list="google-ou-options"
                         placeholder="/Active Users" style={{ fontFamily: "monospace", fontSize: 12 }} />
                     </Field>
                     <Field label="Offboarding OU" help={HELP.googleInactiveOu} grow>
-                      <input value={r.googleInactiveOu} onChange={(e) => update(i, { googleInactiveOu: e.target.value })}
+                      <input value={r.googleInactiveOu} onChange={(e) => update(i, { googleInactiveOu: e.target.value })} list="google-ou-options"
                         placeholder="/Email & Calendar/Inactive" style={{ fontFamily: "monospace", fontSize: 12 }} />
                     </Field>
+                    {/* The tenant's OUs, discovered by the central runner (FR #81) — suggestions, not a lock-in. */}
+                    <datalist id="google-ou-options">{googleOus.ous.map((o) => <option key={o} value={o} />)}</datalist>
+                    <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                      <button type="button" onClick={refreshGoogleOus} disabled={googleOus.busy}>{googleOus.busy ? "Requesting…" : "↻ Refresh Google OUs"}</button>
+                      <span className="note" style={{ fontSize: 11 }}>{googleOuNote(googleOus)}</span>
+                    </div>
                   </div>
                 )}
               </div>

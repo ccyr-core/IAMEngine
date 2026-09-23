@@ -120,6 +120,12 @@ model Client {
   cloudGroups            Json?
   cloudGroupsRequestedAt DateTime?
   cloudGroupsRequestedById  String? // who requested the last cloud discovery — see adDiscoverRequestedById
+  // Google Workspace OU paths discovered from the tenant (FR #81) to back the Google OU pickers —
+  // { ous: string[], discoveredAt, error? }. Same request-flag shape as cloudGroups: "Refresh Google
+  // OUs" sets googleOusRequestedAt, the CENTRAL runner claims it, reads orgunits and posts the result.
+  googleOus              Json?
+  googleOusRequestedAt   DateTime?
+  googleOusRequestedById String?
   // Shared mailboxes discovered from Exchange Online alongside the cloud groups (same "Refresh"
   // request flag; the central runner enumerates Get-Mailbox -RecipientTypeDetails SharedMailbox when
   // the m365-admin secret carries an EXO cert). Backs the per-client "default shared-mailbox access"

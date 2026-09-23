@@ -7,13 +7,14 @@ import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { checkGoogleOu, GOOGLE_OU_FIELD } from "@/lib/profiles/google-ou";
 
-export function GoogleOuControl({ caseId, action, current, overridden, locked, canEdit }: {
+export function GoogleOuControl({ caseId, action, current, overridden, locked, canEdit, options = [] }: {
   caseId: string;
   action: "onboard" | "offboard";
   current: string; // the OU the planned Google job will use now
   overridden: boolean; // true when this case already carries its own pick
   locked: boolean; // the Google step already ran — a new OU would change nothing
   canEdit: boolean; // the viewer may edit case fields (case.dispatch, the fields route gate)
+  options?: string[]; // the tenant's OU paths, if discovered (FR #81) — suggestions for the input
 }) {
   const router = useRouter();
   const [value, setValue] = useState(current);
@@ -51,10 +52,11 @@ export function GoogleOuControl({ caseId, action, current, overridden, locked, c
     <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", margin: "0.4rem 0" }}>
       <span className="note" style={{ margin: 0 }}>{label}</span>
       <input value={value} onChange={(e) => { setValue(e.target.value); setMsg(null); }} disabled={busy || locked || !canEdit}
-        placeholder={action === "onboard" ? "/Active Users" : "/Email & Calendar/Inactive"}
+        placeholder={action === "onboard" ? "/Active Users" : "/Email & Calendar/Inactive"} list={`google-ou-${caseId}`}
         style={{ fontFamily: "monospace", fontSize: 12, minWidth: 260, width: "auto" }} />
       <button onClick={() => save(value)} disabled={busy || locked || !canEdit || value.trim() === current}>{busy ? "Saving…" : "Save"}</button>
       {overridden && !locked && canEdit && <button onClick={() => save("")} disabled={busy} title="Use the client's OU for this case">Use client default</button>}
+      <datalist id={`google-ou-${caseId}`}>{options.map((o) => <option key={o} value={o} />)}</datalist>
       {locked && <span className="note">The Google step already ran on this case.</span>}
       {msg && <span className="note" style={{ color: msg.ok ? undefined : "#b3261e" }}>{msg.text}</span>}
     </div>
