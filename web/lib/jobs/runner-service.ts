@@ -35,6 +35,7 @@ import { purgeCutoff } from "./agent-trash";
 import { generateInitialPassword } from "../auth/password";
 import { sweepProcurementWatches } from "./procurement-watch";
 import { sweepServiceNowIntake } from "./intake-sweep";
+import { sweepServiceNowAssignees } from "./assignee-sweep";
 import { postWorkNote, writeBackEnabled } from "../servicenow/worknote";
 import { snConfigFromEnv } from "../servicenow/gateway";
 import { jobOutcome } from "../cases/run-report";
@@ -594,6 +595,8 @@ export function makeRunnerService(db: PrismaClient) {
       void sweepProcurementWatches(db).catch(() => {});
       // Same pulse: auto-import new ServiceNow intake tickets (off unless enabled; self-throttles to ~15 min).
       void sweepServiceNowIntake(db).catch(() => {});
+      // Same pulse: mirror each open case's ServiceNow assignee for the Cases list (self-throttles to ~5 min).
+      void sweepServiceNowAssignees(db).catch(() => {});
       // Same pulse: the scheduled credential-health sweep + expiry alerts (off unless enabled;
       // durable AppSetting throttle, one client batch per tick). Reuses the operator enqueue path.
       const svc = this;
