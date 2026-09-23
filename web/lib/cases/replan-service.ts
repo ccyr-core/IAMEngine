@@ -44,6 +44,12 @@ export function mergeOperatorEdits(
     if (k in persistedPayload) merged[k] = persistedPayload[k];
   }
   merged.fieldSource = fieldSource;
+  // fieldEditedAt (FR #118) is the same bookkeeping's clock: the SharePoint step only trusts an
+  // operator Username set after the M365 step last ran, so dropping it here re-asks for an edit
+  // the operator already made.
+  if (persistedPayload.fieldEditedAt && typeof persistedPayload.fieldEditedAt === "object") {
+    merged.fieldEditedAt = persistedPayload.fieldEditedAt;
+  }
   return merged;
 }
 
