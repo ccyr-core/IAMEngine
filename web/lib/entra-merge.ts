@@ -64,9 +64,11 @@ function laneDeps(s: ClientSystem, lane: Lane): string[] {
   return isObj(l) && Array.isArray(l[lane]) ? (l[lane] as unknown[]).map(String) : s.dependsOn;
 }
 
-// The systems that (transitively) wait on m365 or entra in this lane. Entra can't inherit a dep on one of
-// these: m365 already runs before it (e.g. exchange dependsOn m365, entra dependsOn exchange), so the
-// merged step would wait on itself. m365's position wins, as its config does.
+// The systems that (transitively) wait on m365 or entra in this lane. The merged step can't keep a dep on
+// one of these from EITHER side — it would wait on itself (exchange dependsOn m365 + entra dependsOn
+// exchange; or m365 dependsOn exchange + exchange dependsOn entra). Dropping them, and nothing else, keeps
+// the merge cycle-free for any acyclic input: every path back to the merged step runs through one of them.
+// Whichever half ran first sets the position — its dependents still run after the merged step.
 function dependentsOfPair(active: ClientSystem[], lane: Lane): Set<string> {
   const out = new Set<string>();
   for (let grew = true; grew; ) {
@@ -78,14 +80,6 @@ function dependentsOfPair(active: ClientSystem[], lane: Lane): Set<string> {
   }
   return out;
 }
-
-// api > browser > scim > manual: the merged step is automated if either side was. Both sides run the same
-// M365 executor with the same m365-admin secret, so this grants nothing new — while demoting would turn
-// automated containment (revoke sessions, block sign-in) into a checklist item. planCase still plans it
-// manual when its secrets are marked not needed.
-const MODE_RANK: ClientSystem["mode"][] = ["api", "browser", "scim", "manual"];
-const mergedMode = (a: ClientSystem["mode"], b: ClientSystem["mode"]) =>
-  MODE_RANK.indexOf(a) <= MODE_RANK.indexOf(b) ? a : b;
 
 function mergeConfig(m365: unknown, entra: unknown): Obj | null {
   if (!isObj(m365) && !isObj(entra)) return null;
@@ -109,20 +103,23 @@ function mergeConfig(m365: unknown, entra: unknown): Obj | null {
 
 const swapEntra = (keys: string[]) => [...new Set(keys.map((k) => (k === "entra" ? "m365" : k)))];
 
-// Returns the active systems with entra folded into m365 (or unchanged when not both present).
+// Returns the active systems with entra folded into m365 — or unchanged when not both present, or when
+// their modes differ: a manual m365 (a human strips the licence and groups) folded into an automated entra
+// would run that whole lane unattended, and the reverse would stop automated work being automated. Either
+// way the two steps stay exactly as they were before FR #117.
 export function mergeEntraIntoM365(active: ClientSystem[]): ClientSystem[] {
   const m365 = active.find((s) => s.systemKey === "m365");
   const entra = active.find((s) => s.systemKey === "entra");
-  if (!m365 || !entra) return active;
+  if (!m365 || !entra || m365.mode !== entra.mode) return active;
   const mergedConfig = mergeConfig(m365.config, entra.config) ?? {};
   // The merged step's own deps, per lane: each side's EFFECTIVE deps (its lane override, else its shared
   // deps — a lane override on one side must not drop the other side's shared ones), minus the pair, minus
-  // any entra dep that itself waits on the pair (see dependentsOfPair). Written as explicit lane lists so
+  // any dep that itself waits on the pair (see dependentsOfPair). Written as explicit lane lists so
   // planCase reads exactly this; the column is their union.
   const laneLists: Obj = {};
   for (const lane of LANES) {
     const after = dependentsOfPair(active, lane);
-    laneLists[lane] = [...new Set([...laneDeps(m365, lane), ...laneDeps(entra, lane).filter((d) => !after.has(d))])].filter((d) => !PAIR.has(d));
+    laneLists[lane] = [...new Set([...laneDeps(m365, lane), ...laneDeps(entra, lane)])].filter((d) => !PAIR.has(d) && !after.has(d));
   }
   mergedConfig.dependsOn = laneLists;
   const deps = [...new Set(LANES.flatMap((l) => laneLists[l] as string[]))];
@@ -138,7 +135,6 @@ export function mergeEntraIntoM365(active: ClientSystem[]): ClientSystem[] {
   }
   const merged: ClientSystem = {
     ...m365,
-    mode: mergedMode(m365.mode, entra.mode),
     dependsOn: deps,
     requiresApproval: m365.requiresApproval || entra.requiresApproval,
     captureEvidence: m365.captureEvidence || entra.captureEvidence,

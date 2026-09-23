@@ -106,13 +106,54 @@ test("a per-lane dependsOn on one side is unioned with the other side's shared d
   assert.deepEqual([...jobs.find((j) => j.systemKey === "m365")!.dependsOn].sort(), ["mimecast", "servicenow"]);
 });
 
-test("the merged step is automated if either side was", () => {
-  const [a] = mergeEntraIntoM365([sys({ systemKey: "m365", mode: "manual" }), sys({ systemKey: "entra", mode: "api" })]);
-  assert.equal(a.mode, "api");
-  const [b] = mergeEntraIntoM365([sys({ systemKey: "m365", mode: "api" }), sys({ systemKey: "entra", mode: "manual" })]);
-  assert.equal(b.mode, "api");
-  const [c] = mergeEntraIntoM365([sys({ systemKey: "m365", mode: "manual" }), sys({ systemKey: "entra", mode: "manual" })]);
-  assert.equal(c.mode, "manual");
+test("modes differ: entra and m365 stay two steps, each with its own mode, config and deps", () => {
+  // m365 manual on purpose (a human strips licence + groups); merging it into an automated entra step
+  // would run that whole lane with nothing gating it.
+  const systems = [
+    sys({ systemKey: "servicenow", mode: "manual", secretNames: [] }),
+    sys({ systemKey: "m365", mode: "manual", dependsOn: ["servicenow"], config: { offboard: { removeLicense: true, removeAllGroups: true } } }),
+    sys({ systemKey: "entra", mode: "api", dependsOn: ["m365"], config: { offboard: { revokeActiveSessions: true } } }),
+  ];
+  assert.equal(mergeEntraIntoM365(systems), systems);
+  const jobs = planCase(systems, "offboard", {});
+  const job = (k: string) => jobs.find((j) => j.systemKey === k)!;
+  assert.deepEqual(jobs.map((j) => j.systemKey), ["servicenow", "m365", "entra"]);
+  assert.equal(job("m365").mode, "manual");
+  assert.equal(job("entra").mode, "api");
+  assert.deepEqual(job("m365").config, { removeLicense: true, removeAllGroups: true });
+  assert.deepEqual(job("entra").dependsOn, ["m365"]);
+  // Same mode: merged, as before.
+  const [m] = mergeEntraIntoM365([sys({ systemKey: "m365", mode: "manual" }), sys({ systemKey: "entra", mode: "manual" })]);
+  assert.equal(m.mode, "manual");
+});
+
+test("onboard: m365 -> exchange -> entra (acyclic) doesn't become a cycle once merged", () => {
+  const systems = [
+    sys({ systemKey: "entra" }),
+    sys({ systemKey: "exchange", dependsOn: ["entra"] }),
+    sys({ systemKey: "m365", dependsOn: ["exchange"] }),
+  ];
+  const jobs = planCase(systems, "onboard", {});
+  assert.deepEqual(jobs.map((j) => j.systemKey), ["m365", "exchange"]);
+});
+
+test("property: any acyclic m365/entra graph plans without a cycle once merged", () => {
+  // Deterministic PRNG; random DAGs over the pair plus four others, edges only "backwards" in a random
+  // order (so the input is acyclic), with some shared and some per-lane deps.
+  let seed = 117;
+  const rnd = () => ((seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648);
+  const keys = ["m365", "entra", "a", "b", "c", "d"];
+  for (let n = 0; n < 400; n++) {
+    const order = [...keys].sort(() => rnd() - 0.5);
+    const earlier = (i: number) => order.slice(0, i).filter(() => rnd() < 0.4);
+    const systems = order.map((k, i) => {
+      const lane = rnd() < 0.3 ? { dependsOn: { onboard: earlier(i), offboard: earlier(i) } } : null;
+      return sys({ systemKey: k, dependsOn: earlier(i), config: lane });
+    });
+    for (const action of ["onboard", "offboard"] as const) {
+      assert.doesNotThrow(() => planCase(systems, action, {}), `${action}: ${JSON.stringify(systems.map((s) => [s.systemKey, s.dependsOn, s.config]))}`);
+    }
+  }
 });
 
 test("a licence deferral onto entra (or m365) on EITHER side means the merged step removes it", () => {
