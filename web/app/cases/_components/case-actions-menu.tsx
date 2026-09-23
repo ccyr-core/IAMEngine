@@ -37,7 +37,9 @@ type Props = {
   domain: DomainInfo | null; // onboard multi-domain clients only
   // FR #88: correct / remove the user this onboard created (null = not offered: not an onboard, no step
   // has run, or the viewer can't run cases). canRemove is false once the onboard is past its window.
-  userFix?: { current: UserIdentity; canRemove: boolean } | null;
+  // canCorrect is false once a Remove has succeeded. removeConfirm / removeAccounts name the accounts
+  // the onboard actually created (which may be fallback usernames), not the payload's name.
+  userFix?: { current: UserIdentity; canCorrect: boolean; canRemove: boolean; removeConfirm: string; removeAccounts: string[] } | null;
 };
 
 export function CaseActionsMenu(props: Props) {
@@ -80,8 +82,8 @@ export function CaseActionsMenu(props: Props) {
           {action === "onboard" && domain && (
             <div className="case-actions-row"><CaseDomainSelect caseId={caseId} options={domain.options} defaultDomain={domain.defaultDomain} override={domain.override} started={started} /></div>
           )}
-          {props.userFix && <div className="case-actions-row"><CorrectUserButton caseId={caseId} current={props.userFix.current} /></div>}
-          {props.userFix?.canRemove && props.userFix.current.email && <div className="case-actions-row"><RemoveUserButton caseId={caseId} email={props.userFix.current.email} /></div>}
+          {props.userFix?.canCorrect && <div className="case-actions-row"><CorrectUserButton caseId={caseId} current={props.userFix.current} /></div>}
+          {props.userFix?.canRemove && props.userFix.removeConfirm && <div className="case-actions-row"><RemoveUserButton caseId={caseId} email={props.userFix.removeConfirm} accounts={props.userFix.removeAccounts} /></div>}
           <div className="actions-menu-sep" />
           <div className="case-actions-row">                                  <ReplanButton caseId={caseId} canReplan={true} started={started} /></div>
         </div>

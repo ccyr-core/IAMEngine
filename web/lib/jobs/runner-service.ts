@@ -16,7 +16,7 @@ import { jobResultEnvelope } from "./job-result";
 import { cloudObjectFor, type CloudObject } from "./cloud-object";
 import { PASSWORD_RESET_SYSTEM_KEYS } from "./password-reset";
 import { ADHOC_SYSTEM_KEYS } from "./adhoc";
-import { CORRECT_USER_SYSTEM_KEYS } from "./user-adhoc";
+import { CORRECT_USER_SYSTEM_KEYS, userAdhocVersionExclusions, userAdhocResultStatus } from "./user-adhoc";
 import { commitUserCorrectionIfComplete } from "../cases/user-adhoc-service";
 import { HttpError, type BrokeredCredential, type ResultInput, type RunnerJob } from "./types";
 import { resolveSecretFields, delineaConfigFromEnv, delineaConfigured, getDelineaToken, getOneTimePasswordCode } from "../secrets/delinea";
@@ -763,7 +763,7 @@ export function makeRunnerService(db: PrismaClient) {
 
     // Atomically claim up to `batchSize` eligible api jobs for this agent.
     async claim(agentId: string, batchSize: number, version?: string | null): Promise<RunnerJob[]> {
-      const agent = await db.agent.findUnique({ where: { id: agentId }, select: { id: true, clientId: true, enabled: true, version: true, capabilities: true, priority: true } });
+      const agent = await db.agent.findUnique({ where: { id: agentId }, select: { id: true, clientId: true, enabled: true, version: true, capabilities: true, priority: true, semver: true } });
       if (!agent) throw new HttpError(404, "unknown agent");
       if (!agent.enabled) throw new HttpError(403, "agent disabled");
 
@@ -887,7 +887,8 @@ export function makeRunnerService(db: PrismaClient) {
       // capability (Node+Playwright installed). browserExclusions returns the built-in browser systems
       // when the cap is absent (empty when present) — so when it fires, the connector keys go too.
       const builtinBrowserExcluded = browserExclusions(caps); // BROWSER_SYSTEMS when cap absent, else []
-      const excluded = [...new Set([...onPremExclude, ...builtinBrowserExcluded, ...(builtinBrowserExcluded.length ? browserConnectorKeys : [])])];
+      // FR #88 (L2): a runner older than the correct/remove executors would post "skipped" for them.
+      const excluded = [...new Set([...onPremExclude, ...builtinBrowserExcluded, ...(builtinBrowserExcluded.length ? browserConnectorKeys : []), ...userAdhocVersionExclusions(agent.semver)])];
       const candidates = await db.job.findMany({
         where: {
           status: "pending",
@@ -1907,7 +1908,10 @@ export function makeRunnerService(db: PrismaClient) {
       const candidates = offboardCandidatesOf(result);
       const needsTargetDecision = input.status === "succeeded" && candidates.length > 0 && job.case.action === "offboard";
 
-      const status = needsTargetDecision ? "failed" : input.status === "succeeded" ? "succeeded" : input.status === "skipped" ? "skipped" : "failed";
+      const rawStatus = needsTargetDecision ? "failed" : input.status === "succeeded" ? "succeeded" : input.status === "skipped" ? "skipped" : "failed";
+      // FR #88 (L2): a correct/remove "skipped" (no executor on that runner) did NOT happen — record it failed.
+      const adhocStatus = userAdhocResultStatus(job.systemKey, rawStatus);
+      const status = adhocStatus.status as typeof rawStatus;
       if (job.status !== "dispatched" && job.status !== "running") {
         // idempotent: a lost-ack retry of the same outcome succeeds; a conflicting re-post 409s.
         if (job.status === status) {
@@ -1921,7 +1925,7 @@ export function makeRunnerService(db: PrismaClient) {
         where: { id: jobId },
         data: {
           status, result: (result ?? undefined) as Prisma.InputJsonValue | undefined, evidence: (input.evidence ?? undefined) as Prisma.InputJsonValue | undefined, validation: (input.validation ?? undefined) as Prisma.InputJsonValue | undefined,
-          error: needsTargetDecision ? offboardDecisionError(result, candidates.length) : (input.error ?? null),
+          error: needsTargetDecision ? offboardDecisionError(result, candidates.length) : (adhocStatus.error ?? input.error ?? null),
           finishedAt: new Date(), singleRun: false,
           // A password reset that didn't land never shows its value — wipe it so a plaintext that was
           // never set on the account can't linger. A GENERATED reset keeps its value on success until

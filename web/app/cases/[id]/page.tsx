@@ -27,7 +27,7 @@ import { caseEffectiveDate } from "@/lib/cases/schedule";
 import { IntakePanel } from "../_components/intake-panel";
 import { hasStartedJobs } from "@/lib/cases/job-status";
 import { isMilestoneCase } from "@/lib/eggs/occasions";
-import { REMOVE_USER_WINDOW_DAYS } from "@/lib/jobs/user-adhoc";
+import { REMOVE_USER_WINDOW_DAYS, REMOVE_USER_SYSTEM_KEYS, removeConfirmKey, removalAccounts } from "@/lib/jobs/user-adhoc";
 import { pickResetSourceJob } from "@/lib/jobs/password-reset";
 
 export const dynamic = "force-dynamic";
@@ -103,14 +103,22 @@ export default async function CaseDetailPage({ params }: { params: { id: string 
   // the BROWSER (so "08:00" / "+5 min" land in the operator's timezone, not the server's).
   // FR #88: correct / remove the user this onboard created — offered once a directory step has run
   // (there's an account to act on), to roles that run cases. Remove only within the recent window.
-  const userFix = c.action === "onboard" && !c.dryRun && canRevealPassword
+  // Remove names the accounts the onboard actually CREATED (possibly fallback usernames), and Correct
+  // is hidden once a Remove has succeeded (the server refuses it too).
+  const fixJobs = c.action === "onboard" && !c.dryRun && canRevealPassword
     && c.jobs.some((j) => ["active-directory", "m365", "entra", "google-workspace"].includes(j.systemKey) && j.status === "succeeded")
+    ? await db.job.findMany({ where: { caseRequestId: c.id }, select: { systemKey: true, status: true, sequence: true, result: true } })
+    : null;
+  const userFix = fixJobs
     ? {
         current: {
           firstName: String(c.payload.firstName ?? ""), lastName: String(c.payload.lastName ?? ""),
           displayName: String(c.payload.displayName ?? ""), email: String(c.payload.userPrincipalName ?? c.payload.workEmail ?? ""),
         },
+        canCorrect: !fixJobs.some((j) => REMOVE_USER_SYSTEM_KEYS.includes(j.systemKey) && j.status === "succeeded"),
         canRemove: Date.now() - c.createdAt.getTime() <= REMOVE_USER_WINDOW_DAYS * 86_400_000,
+        removeConfirm: removeConfirmKey(fixJobs, c.payload),
+        removeAccounts: removalAccounts(fixJobs, c.payload),
       }
     : null;
   const effectiveDate = caseEffectiveDate(c.action, c.payload, c.subject);

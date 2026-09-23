@@ -1,37 +1,53 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import type { PrismaClient } from "@prisma/client";
-import { dispatchUserAdhoc, commitUserCorrectionIfComplete } from "./user-adhoc-service";
-import { checkCorrection } from "../jobs/user-adhoc";
+import { dispatchUserAdhoc, commitUserCorrectionIfComplete, userAdhocRequeueCheck } from "./user-adhoc-service";
+import {
+  checkCorrection, resolveTarget, removeConfirmKey, removalAccounts, userAdhocVersionExclusions, userAdhocResultStatus, USER_ADHOC_SYSTEM_KEYS,
+} from "../jobs/user-adhoc";
+import { adUpnFor } from "../profiles/ad-domain";
+import { buildRunReport } from "./run-report";
 
-type J = { id: string; systemKey: string; status: string; request: unknown };
+type J = { id: string; systemKey: string; status: string; request: unknown; result?: unknown; sequence?: number };
+// The onboard created a FALLBACK username for this hire: the payload says jsmyth (someone else's), the
+// systems report jmsmyth with their immutable ids.
 const DEFAULT_JOBS = (): J[] => [
-  { id: "a", systemKey: "active-directory", status: "succeeded", request: { secretNames: ["ad-dc"] } },
-  { id: "m", systemKey: "m365", status: "succeeded", request: { secretNames: ["m365-admin"] } },
-  { id: "e", systemKey: "entra", status: "succeeded", request: { secretNames: ["m365-admin"] } },
-  { id: "x", systemKey: "exchange", status: "succeeded", request: { secretNames: ["m365-admin"] } },
-  { id: "g", systemKey: "google-workspace", status: "pending", request: {} },
+  { id: "a", systemKey: "active-directory", status: "succeeded", sequence: 0, request: { secretNames: ["ad-dc"] }, result: { System: "active-directory", Sam: "jmsmyth", Upn: "jmsmyth@acme.com", ObjectGuid: "guid-1" } },
+  { id: "m", systemKey: "m365", status: "succeeded", sequence: 1, request: { secretNames: ["m365-admin"] }, result: { System: "m365", UserId: "entra-1", Upn: "jmsmyth@acme.com", OnPremSyncEnabled: false } },
+  { id: "e", systemKey: "entra", status: "succeeded", sequence: 2, request: { secretNames: ["m365-admin"] }, result: {} },
+  { id: "x", systemKey: "exchange", status: "succeeded", sequence: 3, request: { secretNames: ["m365-admin"] }, result: {} },
+  { id: "g", systemKey: "google-workspace", status: "pending", sequence: 4, request: {} },
 ];
 
 // An in-memory case: dispatched jobs join the case's job list, so a later dispatch / commit sees them.
-function stubDb(opts: { action?: string; ageDays?: number; jobs?: J[]; payload?: Record<string, unknown>; client?: { backbone: string | null; identity: unknown } } = {}) {
+function stubDb(opts: { action?: string; ageDays?: number; jobs?: J[]; payload?: Record<string, unknown>; client?: { backbone: string | null; identity: unknown }; busyInTx?: string } = {}) {
   const created: Array<Record<string, unknown>> = [];
   const updates: Array<Record<string, unknown>> = [];
+  const raw: string[] = [];
   const state = {
     payload: opts.payload ?? ({ samAccountName: "jsmyth", userPrincipalName: "jsmyth@acme.com", displayName: "John Smyth" } as Record<string, unknown>),
     jobs: opts.jobs ?? DEFAULT_JOBS(),
   };
+  const createdAt = new Date(Date.now() - (opts.ageDays ?? 1) * 86_400_000);
   const updateCase = async (args: { data: { payload: Record<string, unknown> } }) => { updates.push(args.data); state.payload = args.data.payload; return {}; };
+  let seq = 100;
   const tx = {
+    $queryRaw: async (strings: TemplateStringsArray) => { raw.push(strings.join("?")); return []; },
     job: {
-      findFirst: async () => null,
+      // The in-transaction busy check: anything in flight among the correct/remove keys.
+      findFirst: async (args: { where: { systemKey?: { in: string[] }; status?: { in: string[] } } }) => {
+        if (opts.busyInTx) return { systemKey: opts.busyInTx };
+        const keys = args.where.systemKey?.in; const sts = args.where.status?.in;
+        const hit = keys && sts ? state.jobs.find((j) => keys.includes(j.systemKey) && sts.includes(j.status)) : null;
+        return hit ? { systemKey: hit.systemKey } : null;
+      },
       aggregate: async () => ({ _max: { sequence: 10 } }),
       findMany: async () => [],
       updateMany: async () => ({ count: 0 }),
       create: async (args: { data: Record<string, unknown> }) => {
         created.push(args.data);
         const id = `j${created.length}`;
-        state.jobs.push({ id, systemKey: String(args.data.systemKey), status: "pending", request: args.data.request });
+        state.jobs.push({ id, systemKey: String(args.data.systemKey), status: "pending", request: args.data.request, sequence: seq++ });
         return { id, systemKey: args.data.systemKey };
       },
     },
@@ -40,27 +56,39 @@ function stubDb(opts: { action?: string; ageDays?: number; jobs?: J[]; payload?:
   const db = {
     caseRequest: {
       findUnique: async () => ({
-        action: opts.action ?? "onboard", createdAt: new Date(Date.now() - (opts.ageDays ?? 1) * 86_400_000), dryRun: false, clientId: "c1",
-        client: opts.client ?? { backbone: "ad_synced", identity: {} },
+        action: opts.action ?? "onboard", createdAt, dryRun: false, clientId: "c1",
+        client: opts.client ?? { backbone: "entra", identity: {} },
         payload: state.payload,
         jobs: state.jobs,
       }),
       update: updateCase,
     },
-    job: { findUnique: async (args: { where: { id: string } }) => { const j = state.jobs.find((x) => x.id === args.where.id); return j ? { caseRequestId: "case", ...j } : null; } },
+    job: {
+      findUnique: async (args: { where: { id: string } }) => { const j = state.jobs.find((x) => x.id === args.where.id); return j ? { caseRequestId: "case", ...j } : null; },
+      findMany: async () => state.jobs,
+    },
     $transaction: async (fn: (t: typeof tx) => unknown) => fn(tx),
     auditLog: { create: async () => ({}) },
   } as unknown as PrismaClient;
-  const finish = (systemKey: string, status: string) => { const j = state.jobs.find((x) => x.systemKey === systemKey && x.status === "pending")!; j.status = status; return j.id; };
-  return { db, created, updates, state, finish };
+  const finish = (systemKey: string, status: string, result?: unknown) => { const j = state.jobs.find((x) => x.systemKey === systemKey && x.status === "pending")!; j.status = status; if (result) j.result = result; return j.id; };
+  return { db, created, updates, state, finish, raw, createdAt };
 }
 const cfgOf = (c: Record<string, unknown>) => (c.request as { config: Record<string, unknown> }).config;
 
-test("remove: one approval-gated, evidence-capturing job per system that RAN (m365/entra share one)", async () => {
-  const { db, created } = stubDb();
+// ── H1: the account a job acts on comes from that system's own onboard result ─────────────────────
+test("H1: remove jobs target the account each system's onboard REPORTED (fallback name + immutable id), not the payload's username", async () => {
+  const { db, created, createdAt } = stubDb();
   const r = await dispatchUserAdhoc(db, "case", "remove", "test");
   assert.equal(r.ok, true);
-  assert.deepEqual(created.map((c) => c.systemKey), ["ad-remove-user", "m365-remove-user"]); // google never ran; exchange has no remove
+  assert.deepEqual(created.map((c) => c.systemKey), ["ad-remove-user", "m365-remove-user"]); // google never ran
+  const ad = cfgOf(created[0]); const m = cfgOf(created[1]);
+  assert.deepEqual(ad.target, { sam: "jmsmyth", upn: "jmsmyth@acme.com", objectGuid: "guid-1", source: "onboard" });
+  assert.deepEqual(m.target, { upn: "jmsmyth@acme.com", id: "entra-1", syncEnabled: false, source: "onboard" });
+  assert.equal(ad.caseCreatedAt, createdAt.toISOString());
+  assert.equal("knownIdentities" in ad, false, "no bag of every name the case ever mentioned");
+  // The approver sees exactly which account each step deletes.
+  assert.equal(ad.approvalTarget, "Active Directory: jmsmyth (id guid-1)");
+  assert.equal(m.approvalTarget, "Microsoft 365: jmsmyth@acme.com (id entra-1)");
   for (const c of created) {
     const req = c.request as { requiresApproval: boolean; captureEvidence: boolean };
     assert.equal(req.requiresApproval, true);
@@ -69,39 +97,78 @@ test("remove: one approval-gated, evidence-capturing job per system that RAN (m3
   }
 });
 
-test("remove jobs carry the case's creation time, and M365's the Entra id the onboard reported (fallback-match proof)", async () => {
-  const jobs = DEFAULT_JOBS();
-  (jobs[1] as J & { result?: unknown }).result = { System: "m365", UserId: "entra-obj-1" };
-  const { db, created } = stubDb({ jobs, ageDays: 2 });
+test("H1: an onboard that recorded no identity (manual/old job) falls back to the payload — and says so to the approver", async () => {
+  const jobs: J[] = [{ id: "a", systemKey: "active-directory", status: "succeeded", request: {}, result: { priorStatus: "failed", manualCompletion: true } }];
+  const { db, created } = stubDb({ jobs });
   await dispatchUserAdhoc(db, "case", "remove", "t");
-  for (const c of created) {
-    const at = Date.parse(String(cfgOf(c).caseCreatedAt));
-    assert.ok(Math.abs(at - (Date.now() - 2 * 86_400_000)) < 60_000, `${c.systemKey} carries caseCreatedAt`);
-  }
-  assert.equal(cfgOf(created.find((c) => c.systemKey === "m365-remove-user")!).entraUserId, "entra-obj-1");
-  assert.equal(cfgOf(created.find((c) => c.systemKey === "ad-remove-user")!).entraUserId, undefined);
+  const cfg = cfgOf(created[0]);
+  assert.equal(cfg.target, null);
+  assert.match(String(cfg.approvalTarget), /^Active Directory: jsmyth — the onboard recorded no account, so it is deleted only if it was created after this case$/);
 });
 
-test("remove is refused past the window and on anything but an onboard", async () => {
-  assert.deepEqual(await dispatchUserAdhoc(stubDb({ ageDays: 45 }).db, "case", "remove", "t"), { ok: false, status: 409, error: '"Remove user" is only offered for 30 days after the onboard — offboard this user instead' });
-  const off = await dispatchUserAdhoc(stubDb({ action: "offboard" }).db, "case", "remove", "t");
-  assert.equal(off.ok, false);
+test("H1: the Remove confirm key and dialog name the accounts the onboard created, not the payload name", () => {
+  const jobs = DEFAULT_JOBS();
+  const payload = { samAccountName: "jsmyth", userPrincipalName: "jsmyth@acme.com" };
+  assert.equal(removeConfirmKey(jobs, payload), "jmsmyth@acme.com");
+  assert.deepEqual(removalAccounts(jobs, payload), ["Active Directory: jmsmyth (id guid-1)", "Microsoft 365: jmsmyth@acme.com (id entra-1)"]);
+  assert.equal(removeConfirmKey([], payload), "jsmyth@acme.com", "nothing reported — the payload is all there is");
 });
 
-test("correct: jobs carry the previous AND the pending identity; the case payload is untouched at dispatch", async () => {
+test("H1: the approval step in the run report names the account approving it deletes", () => {
+  const rr = buildRunReport({
+    caseId: "c", caseNumber: null, subject: null, action: "onboard", caseStatus: "completed", client: { name: "A", slug: "a" }, payload: {},
+    jobs: [{ systemKey: "ad-remove-user", sequence: 0, mode: "api", status: "pending", request: { requiresApproval: true, config: { approvalTarget: "Active Directory: jmsmyth (id guid-1)" } }, result: null, validation: null, error: null, startedAt: null, finishedAt: null }],
+    names: new Map(),
+  });
+  assert.equal(rr.steps[0].verdict, "needs_approval");
+  assert.equal(rr.steps[0].pendingReason, "approving deletes Active Directory: jmsmyth (id guid-1)");
+});
+
+// ── H2: only identities a system actually TOOK are carried ─────────────────────────────────────────
+test("H2: a SUCCEEDED correction's result becomes that system's target; a FAILED correction contributes nothing", () => {
+  const jobs: J[] = [
+    ...DEFAULT_JOBS(),
+    { id: "c1", systemKey: "ad-correct-user", status: "succeeded", sequence: 10, request: {}, result: { Sam: "jmsmith", Upn: "jmsmith@acme.com", ObjectGuid: "guid-1" } },
+    { id: "c2", systemKey: "m365-correct-user", status: "failed", sequence: 11, request: { config: { newUpn: "john.smith@acme.com" } }, result: null },
+  ];
+  assert.deepEqual(resolveTarget("active-directory", jobs), { sam: "jmsmith", upn: "jmsmith@acme.com", objectGuid: "guid-1", source: "correction" });
+  // M365's correction failed (the name was taken by someone else): it still targets what the onboard made.
+  assert.deepEqual(resolveTarget("m365", jobs), { upn: "jmsmyth@acme.com", id: "entra-1", syncEnabled: false, source: "onboard" });
+});
+
+test("H2: an older runner's correction result without an id keeps the onboard's id", () => {
+  const jobs: J[] = [...DEFAULT_JOBS(), { id: "c1", systemKey: "m365-correct-user", status: "succeeded", sequence: 10, request: {}, result: { Actions: ["updated"], Upn: "jmsmith@acme.com" } }];
+  assert.equal(resolveTarget("m365", jobs)?.id, "entra-1");
+  assert.equal(resolveTarget("m365", jobs)?.upn, "jmsmith@acme.com");
+});
+
+test("H2: remove after a correction that failed on M365 targets M365's ONBOARD account, never the failed target name", async () => {
+  const { db, created, finish } = stubDb();
+  await dispatchUserAdhoc(db, "case", "correct", "t", { email: "john.smith@acme.com" });
+  finish("ad-correct-user", "succeeded", { Sam: "john.smith", Upn: "john.smith@acme.com", ObjectGuid: "guid-1" });
+  finish("m365-correct-user", "failed");
+  finish("exchange-correct-user", "failed");
+  await dispatchUserAdhoc(db, "case", "remove", "t");
+  const m = cfgOf(created.find((c) => c.systemKey === "m365-remove-user")!);
+  assert.equal((m.target as { upn: string }).upn, "jmsmyth@acme.com");
+  assert.equal(JSON.stringify(m).includes("john.smith"), false, "the failed correction's name is carried nowhere");
+  const ad = cfgOf(created.find((c) => c.systemKey === "ad-remove-user")!);
+  assert.equal((ad.target as { sam: string }).sam, "john.smith");
+});
+
+// ── correction commit (review 1) ─────────────────────────────────────────────────────────────────
+test("correct: jobs carry the previous identity, the target and the pending correction; the payload is untouched at dispatch", async () => {
   const { db, created, updates, state } = stubDb();
   const r = await dispatchUserAdhoc(db, "case", "correct", "t", { lastName: "Smith", email: "jsmith@acme.com" });
   assert.equal(r.ok, true);
   assert.deepEqual(created.map((c) => c.systemKey), ["ad-correct-user", "m365-correct-user", "exchange-correct-user"]);
   const cfg = cfgOf(created[0]);
   assert.equal(cfg.newUpn, "jsmith@acme.com");
-  assert.equal(cfg.newSam, "jsmith");
   assert.equal(typeof cfg.correctionId, "string");
   assert.deepEqual(cfg.correction, { lastName: "Smith", email: "jsmith@acme.com" });
-  assert.deepEqual(cfg.previousIdentity, { SamAccountName: "jsmyth", UserPrincipalName: "jsmyth@acme.com", DisplayName: "John Smyth", workEmail: null });
-  assert.equal((created[0].request as { requiresApproval: boolean }).requiresApproval, false);
-  assert.equal(new Set(created.map((c) => cfgOf(c).correctionId)).size, 1, "one correction = one correctionId");
-  // Review fix #1: nothing is written to the case until every system has taken the correction.
+  assert.equal((cfg.target as { objectGuid: string }).objectGuid, "guid-1");
+  assert.equal(typeof cfg.caseCreatedAt, "string");
+  assert.equal((cfgOf(created[2]).target as { id: string }).id, "entra-1", "the mailbox is the Entra user the onboard created");
   assert.equal(updates.length, 0);
   assert.equal(state.payload.userPrincipalName, "jsmyth@acme.com");
 });
@@ -113,56 +180,40 @@ test("the case takes the corrected identity only once EVERY job of that correcti
   assert.equal(await commitUserCorrectionIfComplete(db, ad), false);
   const m = finish("m365-correct-user", "failed");
   assert.equal(await commitUserCorrectionIfComplete(db, m), false);
-  assert.equal(updates.length, 0, "a failed line keeps the case on the old identity");
   const x = finish("exchange-correct-user", "succeeded");
   assert.equal(await commitUserCorrectionIfComplete(db, x), false);
-  // The operator re-runs the failed M365 line (same job, same config) and it succeeds.
   state.jobs.find((j) => j.id === m)!.status = "succeeded";
   assert.equal(await commitUserCorrectionIfComplete(db, m), true);
   const p = updates[0].payload as Record<string, unknown>;
   assert.equal(p.userPrincipalName, "jsmith@acme.com");
   assert.equal(p.lastName, "Smith");
-  assert.equal(p.samAccountName, "jsmith"); // followed the old UPN's local part
-  assert.equal((p.fieldSource as Record<string, string>).lastName, "operator");
 });
 
-test("a failed correction can be re-dispatched: it still looks the account up by the identity it had", async () => {
-  const { db, created, finish } = stubDb();
+// ── M2: no Correct after a Remove ────────────────────────────────────────────────────────────────
+test("M2: Correct is refused once a Remove has succeeded on the case", async () => {
+  const jobs: J[] = [...DEFAULT_JOBS(), { id: "r", systemKey: "m365-remove-user", status: "succeeded", sequence: 9, request: {} }];
+  const r = await dispatchUserAdhoc(stubDb({ jobs }).db, "case", "correct", "t", { lastName: "Smith" });
+  assert.deepEqual(r, { ok: false, status: 409, error: "the user was removed on this case — there's no account left to correct" });
+});
+
+// ── M1: the optional mailbox job ─────────────────────────────────────────────────────────────────
+test("M1: a cloud client whose mailbox came from the m365 step gets an optional Exchange correction on the M365 credential", async () => {
+  const jobs: J[] = [{ id: "m", systemKey: "m365", status: "succeeded", request: { secretNames: ["m365-admin"] }, result: { UserId: "entra-1", Upn: "jsmyth@acme.com", OnPremSyncEnabled: false } }];
+  const { db, created } = stubDb({ jobs });
   await dispatchUserAdhoc(db, "case", "correct", "t", { email: "jsmith@acme.com" });
-  for (const k of ["ad-correct-user", "m365-correct-user", "exchange-correct-user"]) finish(k, "failed");
-  const r = await dispatchUserAdhoc(db, "case", "correct", "t", { email: "jsmith@acme.com" });
-  assert.equal(r.ok, true);
-  const again = cfgOf(created[3]);
-  assert.equal((again.previousIdentity as Record<string, unknown>).UserPrincipalName, "jsmyth@acme.com");
-  assert.notEqual(again.correctionId, cfgOf(created[0]).correctionId);
+  assert.deepEqual(created.map((c) => c.systemKey), ["m365-correct-user", "exchange-correct-user"]);
+  assert.equal(cfgOf(created[1]).mailboxOptional, true);
 });
 
-test("remove after a half-applied correction searches BOTH the old and the corrected identity", async () => {
-  const { db, created, finish } = stubDb();
-  await dispatchUserAdhoc(db, "case", "correct", "t", { email: "jsmith@acme.com" });
-  finish("ad-correct-user", "succeeded"); finish("m365-correct-user", "failed"); finish("exchange-correct-user", "succeeded");
-  const r = await dispatchUserAdhoc(db, "case", "remove", "t");
-  assert.equal(r.ok, true);
-  const rm = created.filter((c) => String(c.systemKey).endsWith("-remove-user"));
-  assert.equal(rm.length, 2);
-  for (const c of rm) {
-    const ids = cfgOf(c).knownIdentities as Array<{ SamAccountName: string | null; UserPrincipalName: string | null }>;
-    assert.deepEqual(ids[0], { SamAccountName: "jsmyth", UserPrincipalName: "jsmyth@acme.com" }, "what the case says now comes first");
-    assert.ok(ids.some((i) => i.UserPrincipalName === "jsmith@acme.com" && i.SamAccountName === "jsmith"), "the corrected identity is searched too");
-  }
-});
-
-test("ad-standalone: the AD correction keeps AD's own UPN suffix, never the mail domain", async () => {
-  const { db, created } = stubDb({
-    client: { backbone: "ad_standalone", identity: { adDomain: "syee.local", usernamePatterns: ["{first}{last}"] } },
-    payload: { firstName: "John", lastName: "Smyth", samAccountName: "johnsmyth", userPrincipalName: "johnsmyth@acme.com", displayName: "John Smyth" },
-  });
-  await dispatchUserAdhoc(db, "case", "correct", "t", { lastName: "Smith", email: "johnsmith@acme.com" });
-  const ad = cfgOf(created.find((c) => c.systemKey === "ad-correct-user")!);
-  assert.equal(ad.newUpn, "johnsmith@syee.local");
-  assert.equal((ad.previousIdentity as Record<string, unknown>).UserPrincipalName, "johnsmyth@syee.local");
-  const m = cfgOf(created.find((c) => c.systemKey === "m365-correct-user")!);
-  assert.equal(m.newUpn, "johnsmith@acme.com", "the cloud lane keeps the mail domain");
+test("M1: no optional Exchange job for a directory-synced user (AD readdresses the mailbox)", async () => {
+  const synced: J[] = [{ id: "m", systemKey: "m365", status: "succeeded", request: {}, result: { UserId: "entra-1", Upn: "jsmyth@acme.com", OnPremSyncEnabled: true } }];
+  const a = stubDb({ jobs: synced });
+  await dispatchUserAdhoc(a.db, "case", "correct", "t", { email: "jsmith@acme.com" });
+  assert.equal(a.created.some((c) => c.systemKey === "exchange-correct-user"), false);
+  const cloud: J[] = [{ id: "m", systemKey: "m365", status: "succeeded", request: {}, result: { UserId: "entra-1" } }];
+  const b = stubDb({ jobs: cloud, client: { backbone: "ad_synced", identity: {} } });
+  await dispatchUserAdhoc(b.db, "case", "correct", "t", { email: "jsmith@acme.com" });
+  assert.equal(b.created.some((c) => c.systemKey === "exchange-correct-user"), false);
 });
 
 test("hybrid: the Exchange correction never brokers the on-prem Exchange session", async () => {
@@ -174,23 +225,44 @@ test("hybrid: the Exchange correction never brokers the on-prem Exchange session
   assert.deepEqual((x.request as { secretNames: string[] }).secretNames, ["m365-admin"]);
 });
 
-test("a cloud client whose mailbox came from the m365 step (no exchange line) still gets the address change", async () => {
-  const jobs: J[] = [{ id: "m", systemKey: "m365", status: "succeeded", request: { secretNames: ["m365-admin"] } }];
-  const { db, created } = stubDb({ jobs });
-  await dispatchUserAdhoc(db, "case", "correct", "t", { email: "jsmith@acme.com" });
-  assert.deepEqual(created.map((c) => c.systemKey), ["m365-correct-user", "exchange-correct-user"]);
-  const x = created[1];
-  assert.deepEqual((x.request as { secretNames: string[] }).secretNames, ["m365-admin"]);
-  assert.equal(cfgOf(x).mailboxOptional, true);
+// ── ad-standalone: prior #3 + L4 ─────────────────────────────────────────────────────────────────
+const STANDALONE_CLIENT = { backbone: "ad_standalone", identity: { adDomain: "syee.local", usernamePatterns: ["{first}{last}"] } };
+const STANDALONE_PAYLOAD = { firstName: "John", lastName: "Smyth", samAccountName: "johnsmyth", userPrincipalName: "johnsmyth@acme.com", displayName: "John Smyth" };
+
+test("ad-standalone: AD keeps its own UPN suffix, and its mail/proxyAddresses take the CLOUD email (never the AD UPN)", async () => {
+  const { db, created } = stubDb({ client: STANDALONE_CLIENT, payload: STANDALONE_PAYLOAD });
+  await dispatchUserAdhoc(db, "case", "correct", "t", { lastName: "Smith", email: "johnsmith@acme.com" });
+  const ad = cfgOf(created.find((c) => c.systemKey === "ad-correct-user")!);
+  assert.equal(ad.newUpn, "johnsmith@syee.local");
+  assert.equal(ad.mailAddress, "johnsmith@acme.com");
+  assert.equal((ad.previousIdentity as Record<string, unknown>).UserPrincipalName, "johnsmyth@syee.local");
+  assert.equal(cfgOf(created.find((c) => c.systemKey === "m365-correct-user")!).newUpn, "johnsmith@acme.com");
 });
 
-test("a correction with no email change doesn't queue Exchange", async () => {
-  const { db, created } = stubDb();
-  await dispatchUserAdhoc(db, "case", "correct", "t", { firstName: "Jon" });
-  assert.equal(created.some((c) => c.systemKey === "exchange-correct-user"), false);
+test("L4: a committed standalone correction records the AD UPN it set, and adUpnFor prefers it over re-deriving from the names", async () => {
+  const { db, finish, updates } = stubDb({ client: STANDALONE_CLIENT, payload: STANDALONE_PAYLOAD });
+  await dispatchUserAdhoc(db, "case", "correct", "t", { email: "jsm@acme.com" });
+  let last = "";
+  for (const k of ["ad-correct-user", "m365-correct-user", "exchange-correct-user"]) last = finish(k, "succeeded");
+  assert.equal(await commitUserCorrectionIfComplete(db, last), true);
+  const p = updates[0].payload as Record<string, unknown>;
+  assert.equal(p.adUpn, "jsm@syee.local");
+  // Re-deriving from the names would give johnsmyth@syee.local — the correction's is what AD has now.
+  assert.equal(adUpnFor(p, STANDALONE_CLIENT)?.upn, "jsm@syee.local");
 });
 
-test("any correct/remove step in flight blocks both kinds (a remove must never chase a pending rename)", async () => {
+// ── L1: the in-flight check runs inside the transaction, under a row lock ──────────────────────────
+test("L1: the busy check runs inside the transaction after locking the case row", async () => {
+  const s = stubDb({ busyInTx: "m365-correct-user" }); // another POST got in between the read and the write
+  const r = await dispatchUserAdhoc(s.db, "case", "remove", "t");
+  assert.equal(r.ok, false);
+  assert.equal((r as { status: number }).status, 409);
+  assert.equal(s.created.length, 0);
+  assert.equal(s.raw.length, 1);
+  assert.match(s.raw[0], /SELECT id FROM "CaseRequest" WHERE id = \? FOR UPDATE/);
+});
+
+test("any correct/remove step in flight blocks both kinds", async () => {
   const jobs: J[] = [
     { id: "a", systemKey: "active-directory", status: "succeeded", request: {} },
     { id: "p", systemKey: "ad-correct-user", status: "pending", request: {} },
@@ -198,6 +270,59 @@ test("any correct/remove step in flight blocks both kinds (a remove must never c
   const r = await dispatchUserAdhoc(stubDb({ jobs }).db, "case", "remove", "t");
   assert.equal(r.ok, false);
   assert.equal((r as { status: number }).status, 409);
+});
+
+// ── L2: runner version gate + "skipped" is not done ─────────────────────────────────────────────
+test("L2: runners older than 1.127.0 (or not reporting a version) are withheld the correct/remove keys", () => {
+  assert.deepEqual(userAdhocVersionExclusions("1.126.9").sort(), [...USER_ADHOC_SYSTEM_KEYS].sort());
+  assert.deepEqual(userAdhocVersionExclusions(null).sort(), [...USER_ADHOC_SYSTEM_KEYS].sort());
+  assert.deepEqual(userAdhocVersionExclusions("1.127.0"), []);
+  assert.deepEqual(userAdhocVersionExclusions("2.0.1"), []);
+});
+
+test("L2: a 'skipped' correct/remove result is recorded as failed (not done); other keys are untouched", () => {
+  const r = userAdhocResultStatus("m365-correct-user", "skipped");
+  assert.equal(r.status, "failed");
+  assert.match(r.error ?? "", /runner 1\.127\.0 or later/);
+  assert.deepEqual(userAdhocResultStatus("m365", "skipped"), { status: "skipped" });
+  assert.deepEqual(userAdhocResultStatus("ad-remove-user", "succeeded"), { status: "succeeded" });
+});
+
+// ── L3: re-run rules ─────────────────────────────────────────────────────────────────────────────
+test("L3: re-running a correction is refused once a NEWER correction exists", async () => {
+  const s = stubDb();
+  await dispatchUserAdhoc(s.db, "case", "correct", "t", { email: "a@acme.com" });
+  for (const k of ["ad-correct-user", "m365-correct-user", "exchange-correct-user"]) s.finish(k, "failed");
+  const oldAd = s.state.jobs.find((j) => j.systemKey === "ad-correct-user")!;
+  await dispatchUserAdhoc(s.db, "case", "correct", "t", { email: "b@acme.com" });
+  const r = await userAdhocRequeueCheck(s.db, { ...oldAd, caseRequestId: "case" });
+  assert.equal(r.ok, false);
+  assert.match((r as { error: string }).error, /newer correction/);
+  const newAd = s.state.jobs.filter((j) => j.systemKey === "ad-correct-user").at(-1)!;
+  assert.deepEqual(await userAdhocRequeueCheck(s.db, { ...newAd, caseRequestId: "case" }), { ok: true });
+});
+
+test("L3: re-running a remove needs a fresh approval and a fresh 30-day window check", async () => {
+  const fresh = stubDb();
+  const job = { id: "r", systemKey: "ad-remove-user", caseRequestId: "case", request: { requiresApproval: true, approved: true } };
+  const r = await userAdhocRequeueCheck(fresh.db, job);
+  assert.equal(r.ok, true);
+  assert.deepEqual((r as { patch: unknown }).patch, { approved: false, requiresApproval: true });
+  const old = stubDb({ ageDays: 45 });
+  const late = await userAdhocRequeueCheck(old.db, job);
+  assert.equal(late.ok, false);
+});
+
+test("remove is refused past the window and on anything but an onboard", async () => {
+  assert.deepEqual(await dispatchUserAdhoc(stubDb({ ageDays: 45 }).db, "case", "remove", "t"), { ok: false, status: 409, error: '"Remove user" is only offered for 30 days after the onboard — offboard this user instead' });
+  const off = await dispatchUserAdhoc(stubDb({ action: "offboard" }).db, "case", "remove", "t");
+  assert.equal(off.ok, false);
+});
+
+test("a correction with no email change doesn't queue Exchange", async () => {
+  const { db, created } = stubDb();
+  await dispatchUserAdhoc(db, "case", "correct", "t", { firstName: "Jon" });
+  assert.equal(created.some((c) => c.systemKey === "exchange-correct-user"), false);
 });
 
 test("checkCorrection trims, requires something, and rejects a malformed email", () => {

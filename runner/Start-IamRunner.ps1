@@ -1649,10 +1649,26 @@ $DISPATCH['m365-correct-user']     = @{ Connect = $DISPATCH['m365'].Connect; Onb
 # lane opens when `exchange-onprem` is brokered is never wanted here (and unreachable from the cloud).
 # The app doesn't broker it; the Connect drops it too, for a job queued by an older app. Its session is
 # closed when the job ends, like the exchange lane's (the job loop's finally calls Disconnect).
+# A mailboxOptional job (queued off the m365 line — no exchange line on the plan) mirrors the m365
+# lane's best-effort EXO finishing: it connects inside Onboard, and a failed connect (e.g. an m365-admin
+# secret with no EXO cert) is a WARN manual follow-up saying the address was NOT changed, rather than a
+# failure that would stop the whole correction from committing.
 $DISPATCH['exchange-correct-user'] = @{
-    Connect    = { param($job, $creds) $exo = @{} + $creds; [void]$exo.Remove('exchange-onprem'); & $DISPATCH['exchange'].Connect $job $exo }
+    Connect    = { param($job, $creds)
+        if ((Get-CtgProp $job.config 'mailboxOptional') -eq $true) { return }  # connected best-effort in Onboard
+        $exo = @{} + $creds; [void]$exo.Remove('exchange-onprem'); & $DISPATCH['exchange'].Connect $job $exo
+    }
     Disconnect = { Disconnect-CtgExchange }
-    Onboard    = { param($job, $creds) Invoke-CtgExchangeCorrectAddress -User (Get-CtgLookupUser $job) -Config $job.config }
+    Onboard    = { param($job, $creds)
+        if ((Get-CtgProp $job.config 'mailboxOptional') -eq $true) {
+            $exo = @{} + $creds; [void]$exo.Remove('exchange-onprem')
+            try { & $DISPATCH['exchange'].Connect $job $exo }
+            catch {
+                return [pscustomobject]@{ System = 'exchange'; Status = 'ok'; Actions = @("WARN manual follow-up: couldn't connect to Exchange Online ($($_.Exception.Message)) — the mailbox's primary address was NOT changed to $(Get-CtgProp $job.config 'newUpn'). Change it in the Exchange admin center (keep the old address as an alias).") }
+            }
+        }
+        Invoke-CtgExchangeCorrectAddress -User (Get-CtgLookupUser $job) -Config $job.config
+    }
 }
 $DISPATCH['google-remove-user']    = @{ Connect = $DISPATCH['google-workspace'].Connect; Onboard = { param($job, $creds) Invoke-CtgGoogleRemoveUser -User $job.payload -Config $job.config } }
 $DISPATCH['google-correct-user']   = @{ Connect = $DISPATCH['google-workspace'].Connect; Onboard = { param($job, $creds) Invoke-CtgGoogleCorrectUser -User (Get-CtgLookupUser $job) -Config $job.config } }

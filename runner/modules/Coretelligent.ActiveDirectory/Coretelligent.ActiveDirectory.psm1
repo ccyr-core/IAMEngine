@@ -341,7 +341,12 @@ function Invoke-CtgADOnboarding {
         }
     }
 
-    [pscustomobject]@{ System = 'active-directory'; Status = 'ok'; Sam = $sam; Ou = $ouPath; Actions = $actions.ToArray() }
+    # FR #88: report WHICH account this onboard created or adopted — the chosen (possibly fallback) name
+    # and its objectGUID — so a later Correct/Remove acts on exactly this account, never on whoever holds
+    # the payload's primary username. Best-effort: a read failure just leaves the id out.
+    $objectGuid = $null
+    try { $objectGuid = [string](Get-CtgProp (Get-ADUser -Identity $sam -Properties ObjectGUID -ErrorAction Stop @AdConnection) 'ObjectGUID') } catch { $objectGuid = $null }
+    [pscustomobject]@{ System = 'active-directory'; Status = 'ok'; Sam = $sam; Upn = $chosenUpn; ObjectGuid = $objectGuid; Ou = $ouPath; Actions = $actions.ToArray() }
 }
 
 # Change/mover lane: apply a delta to an EXISTING AD user — add groups, remove groups (by name or
@@ -1103,37 +1108,18 @@ function Get-CtgAdCaseUser {
 }
 
 # ── FR #88: correct or remove a user THIS engine created ───────────────────────────────────────────
-# Both are ad-hoc jobs dispatched from an onboard case (never planned), and both find the account the
-# way the onboard left it: by sAMAccountName, then UPN.
-
-# Every (sam, UPN) pair the case has given this user, in the order to try them: the job's own identity
-# first, then the app-supplied config.knownIdentities (the old AND the corrected identity of any
-# correction on the case, finished or not), then the correction's own target (newSam/newUpn).
-function Get-CtgAdCaseIdentities {
-    param([pscustomobject]$User, [pscustomobject]$Config)
-    $out = [System.Collections.Generic.List[object]]::new()
-    $add = { param($s, $u, $cur) $s = [string]$s; $u = [string]$u; if ($s -or $u) { $out.Add([pscustomobject]@{ Sam = $s; Upn = $u; Current = [bool]$cur }) } }
-    & $add (Get-CtgProp $User 'SamAccountName') (Get-CtgProp $User 'UserPrincipalName') $true
-    foreach ($i in @(Get-CtgProp $Config 'knownIdentities')) { if ($i) { & $add (Get-CtgProp $i 'SamAccountName') (Get-CtgProp $i 'UserPrincipalName') $false } }
-    & $add (Get-CtgProp $Config 'newSam') (Get-CtgProp $Config 'newUpn') $false
-    $out.ToArray()
-}
-
-# The first AD account matching any of those identities, by sam then UPN — never by display name. The
-# match is tagged CtgMatchedCurrent: $true only when it came from the case's CURRENT identity.
-function Find-CtgAdUserByIdentities {
-    param([object[]]$Identities, [string[]]$Properties, [hashtable]$AdConnection = @{})
-    foreach ($id in $Identities) {
-        $u = $null
-        if ($id.Sam) { try { $u = Get-ADUser -Identity $id.Sam -Properties $Properties -ErrorAction SilentlyContinue @AdConnection } catch { $u = $null } }
-        if (-not $u -and $id.Upn) { $u = @(Get-ADUser -Filter "UserPrincipalName -eq '$($id.Upn -replace "'", "''")'" -Properties $Properties -ErrorAction SilentlyContinue @AdConnection)[0] }
-        if ($u) { $u | Add-Member -NotePropertyName CtgMatchedCurrent -NotePropertyValue ([bool]$id.Current) -Force; return $u }
-    }
-    $null
-}
+# Both are ad-hoc jobs dispatched from an onboard case (never planned). WHICH account they act on:
+#   config.target — the account the onboard (or its latest SUCCEEDED correction) reported: Sam/Upn and,
+#                   when the result had it, the objectGUID. The payload's username is NOT enough on its
+#                   own: the onboard may have fallen back to another username because the primary
+#                   belonged to someone else.
+#   With an objectGUID: the account is looked up by it and nothing else — positive proof.
+#   Without one: the target's names, then the case's own identity, and an account is used only if it was
+#   provably created for this case (whenCreated >= config.caseCreatedAt). A Correct may also look under
+#   the NEW identity (a re-run after a partial first run) — but without an id that match is refused.
 
 # Was an account created no earlier than the case (5 min of clock-skew slack)? $false whenever either
-# side is missing or unreadable — the answer has to be PROVABLY yes before a fallback match is deleted.
+# side is missing or unreadable — the answer has to be PROVABLY yes.
 function Test-CtgCreatedSinceCase {
     param($Created, $Since)
     if (-not $Created -or -not $Since) { return $false }
@@ -1141,13 +1127,45 @@ function Test-CtgCreatedSinceCase {
     try { (& $toUtc $Created) -ge (& $toUtc $Since).AddMinutes(-5) } catch { $false }
 }
 
-# Remove (hard delete) a user the onboard created — e.g. the hire fell through. Identity is matched on
-# sam/UPN ONLY: the display-name fallback other ad-hoc steps use could, on a unique-but-wrong match,
-# delete a different person, and a delete can't be taken back. It tries every identity the case has
-# given the user (a correction may have landed here but not elsewhere). Group memberships are captured
-# first as evidence. -Recursive removes child objects (e.g. ActiveSync device containers) that would
-# otherwise block the delete. Found under NONE of them = a WARN, not a quiet success: nothing was
-# deleted, and an operator has to confirm the account is really gone.
+# Resolve the AD account a correct/remove job may act on. Returns { User; Refused; Tried } — User is
+# $null when nothing (acceptable) was found; Refused explains a match that could not be proven ours.
+function Resolve-CtgAdCaseAccount {
+    param([pscustomobject]$User, [pscustomobject]$Config, [string[]]$Properties, [hashtable]$AdConnection = @{}, [switch]$IncludeNew)
+    $props = @(@($Properties) + 'ObjectGUID', 'whenCreated' | Select-Object -Unique)
+    $t = Get-CtgProp $Config 'target'
+    $guid = [string](Get-CtgProp $t 'objectGuid')
+    if ($guid) {
+        $u = $null
+        try { $u = Get-ADUser -Identity $guid -Properties $props -ErrorAction SilentlyContinue @AdConnection } catch { $u = $null }
+        return [pscustomobject]@{ User = $u; Refused = $null; Tried = "objectGUID $guid" }
+    }
+    $ids = [System.Collections.Generic.List[object]]::new()
+    $add = { param($s, $n, $origin) $s = [string]$s; $n = [string]$n; if ($s -or $n) { $ids.Add([pscustomobject]@{ Sam = $s; Upn = $n; Origin = $origin }) } }
+    & $add (Get-CtgProp $t 'sam') (Get-CtgProp $t 'upn') 'target'
+    & $add (Get-CtgProp $User 'SamAccountName') (Get-CtgProp $User 'UserPrincipalName') 'case'
+    if ($IncludeNew) { & $add (Get-CtgProp $Config 'newSam') (Get-CtgProp $Config 'newUpn') 'new' }
+    $tried = @($ids | ForEach-Object { @($_.Sam, $_.Upn) } | Where-Object { $_ } | Select-Object -Unique) -join ', '
+    foreach ($id in $ids) {
+        $u = $null
+        if ($id.Sam) { try { $u = Get-ADUser -Identity $id.Sam -Properties $props -ErrorAction SilentlyContinue @AdConnection } catch { $u = $null } }
+        if (-not $u -and $id.Upn) { $u = @(Get-ADUser -Filter "UserPrincipalName -eq '$($id.Upn -replace "'", "''")'" -Properties $props -ErrorAction SilentlyContinue @AdConnection)[0] }
+        if (-not $u) { continue }
+        $who = "$([string]$u.SamAccountName) ($([string]$u.DistinguishedName))"
+        if ($id.Origin -eq 'new') {
+            return [pscustomobject]@{ User = $null; Tried = $tried; Refused = "AD user $who was found only under the CORRECTED name, and the onboard recorded no objectGUID to prove it is this case's account" }
+        }
+        if (-not (Test-CtgCreatedSinceCase (Get-CtgProp $u 'whenCreated') (Get-CtgProp $Config 'caseCreatedAt'))) {
+            return [pscustomobject]@{ User = $null; Tried = $tried; Refused = "AD user $who was created $(Get-CtgProp $u 'whenCreated') — before this case ($(Get-CtgProp $Config 'caseCreatedAt')), or when can't be told — and the onboard recorded no objectGUID, so it can't be proven to be the account this onboard made" }
+        }
+        return [pscustomobject]@{ User = $u; Refused = $null; Tried = $tried }
+    }
+    [pscustomobject]@{ User = $null; Refused = $null; Tried = $tried }
+}
+
+# Remove (hard delete) a user the onboard created — e.g. the hire fell through. Never by display name.
+# Group memberships are captured first as evidence. -Recursive removes child objects (e.g. ActiveSync
+# device containers) that would otherwise block the delete. Not found, or found but not provably this
+# case's account = a WARN naming what it found, and nothing deleted.
 function Invoke-CtgADRemoveUser {
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -1156,19 +1174,16 @@ function Invoke-CtgADRemoveUser {
         [hashtable]$AdConnection = @{}
     )
     $actions = [System.Collections.Generic.List[string]]::new()
-    $ids = @(Get-CtgAdCaseIdentities -User $User -Config $Config)
-    if ($ids.Count -eq 0) { throw "no sAMAccountName or UPN on the case — refusing to look the user up by display name for a delete" }
-    $props = @('SamAccountName', 'DistinguishedName', 'MemberOf', 'UserPrincipalName', 'whenCreated')
-    $u = Find-CtgAdUserByIdentities -Identities $ids -Properties $props -AdConnection $AdConnection
-    if (-not $u) {
-        $tried = @($ids | ForEach-Object { @($_.Sam, $_.Upn) } | Where-Object { $_ } | Select-Object -Unique) -join ', '
-        $actions.Add("WARN AD user not found under any identity this case gave it ($tried) — nothing deleted. Already removed, or renamed outside this case: check AD before assuming it is gone")
+    $props = @('SamAccountName', 'DistinguishedName', 'MemberOf', 'UserPrincipalName')
+    $r = Resolve-CtgAdCaseAccount -User $User -Config $Config -Properties $props -AdConnection $AdConnection
+    if (-not $r.Tried) { throw "no sAMAccountName, UPN or objectGUID for the user — refusing to look the user up by display name for a delete" }
+    if ($r.Refused) {
+        $actions.Add("WARN $($r.Refused). Nothing deleted: check it in AD")
         return [pscustomobject]@{ System = 'active-directory'; Status = 'ok'; Actions = $actions.ToArray(); Evidence = @{ Groups = @() } }
     }
-    # Matched under an OLD/corrected identity, not the case's current one: that name may since belong to
-    # someone else. Delete only if the account provably post-dates this case (whenCreated >= caseCreatedAt).
-    if (-not $u.CtgMatchedCurrent -and -not (Test-CtgCreatedSinceCase (Get-CtgProp $u 'whenCreated') (Get-CtgProp $Config 'caseCreatedAt'))) {
-        $actions.Add("WARN matched AD user $([string]$u.SamAccountName) ($([string]$u.DistinguishedName)) under an earlier identity of this case, but it was created $(Get-CtgProp $u 'whenCreated') — before this case ($(Get-CtgProp $Config 'caseCreatedAt')), or when can't be told — so it can't be proven to be the account this onboard made. Nothing deleted: check it in AD")
+    $u = $r.User
+    if (-not $u) {
+        $actions.Add("WARN AD user not found ($($r.Tried)) — nothing deleted. Already removed, or renamed outside this case: check AD before assuming it is gone")
         return [pscustomobject]@{ System = 'active-directory'; Status = 'ok'; Actions = $actions.ToArray(); Evidence = @{ Groups = @() } }
     }
     $groups = @(@(Get-CtgProp $u 'MemberOf') | ForEach-Object { [string]$_ })
@@ -1177,15 +1192,18 @@ function Invoke-CtgADRemoveUser {
         Remove-ADObject -Identity ([string]$u.DistinguishedName) -Recursive -Confirm:$false -ErrorAction Stop @AdConnection
         $actions.Add("deleted AD user $([string]$u.SamAccountName) ($([string]$u.DistinguishedName))")
     }
-    [pscustomobject]@{ System = 'active-directory'; Status = 'ok'; Sam = [string]$u.SamAccountName; Actions = $actions.ToArray(); Evidence = @{ Groups = $groups } }
+    [pscustomobject]@{ System = 'active-directory'; Status = 'ok'; Sam = [string]$u.SamAccountName; ObjectGuid = [string](Get-CtgProp $u 'ObjectGUID'); Actions = $actions.ToArray(); Evidence = @{ Groups = $groups; Account = "$([string]$u.SamAccountName) ($([string]$u.DistinguishedName))" } }
 }
 
 # Correct a user the onboard created (a misspelled name, or a different username/email). Config:
 #   firstName / lastName / displayName — any subset; the CN follows the display name
-#   newUpn — the corrected UPN/email: sets UPN and mail, makes it the primary SMTP proxy address and
-#            keeps the old primary as an alias (so mail to the old address still arrives), and follows
-#            the sAMAccountName along only when it was the old UPN's local part (the client's pattern).
+#   newUpn — the corrected UPN: sets it, and follows the sAMAccountName along only when it was the old
+#            UPN's local part (the client's pattern)
+#   mailAddress — the address mail/proxyAddresses take (AD-standalone: the corrected CLOUD email, since
+#            the AD-suffix UPN is never a mail address); defaults to newUpn. The new address becomes the
+#            primary SMTP proxy and the old primary stays as an alias (mail to it still arrives).
 # Idempotent: every write compares first. The cloud copy of a synced user follows through directory sync.
+# Not found / not provably this case's account = a failure (nothing changed, the correction won't commit).
 function Invoke-CtgADCorrectUser {
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -1195,13 +1213,14 @@ function Invoke-CtgADCorrectUser {
     )
     $actions = [System.Collections.Generic.List[string]]::new()
     $props = @('SamAccountName', 'DistinguishedName', 'GivenName', 'Surname', 'DisplayName', 'UserPrincipalName', 'mail', 'proxyAddresses', 'Name')
-    $u = Get-CtgAdCaseUser -User $User -Properties $props -AdConnection $AdConnection
-    # A re-run after a partial first run: the account may already carry the corrected sam/UPN.
-    if (-not $u) { $u = Find-CtgAdUserByIdentities -Identities @(Get-CtgAdCaseIdentities -User ([pscustomobject]@{}) -Config $Config) -Properties $props -AdConnection $AdConnection }
-    if (-not $u) { throw "AD user not found — nothing corrected (check the case's username/UPN)" }
+    $r = Resolve-CtgAdCaseAccount -User $User -Config $Config -Properties $props -AdConnection $AdConnection -IncludeNew
+    if ($r.Refused) { throw "refused: $($r.Refused) — nothing corrected" }
+    $u = $r.User
+    if (-not $u) { throw "AD user not found ($($r.Tried)) — nothing corrected (check the case's username/UPN)" }
     $sam = [string]$u.SamAccountName
     $first = [string](Get-CtgProp $Config 'firstName'); $last = [string](Get-CtgProp $Config 'lastName')
     $display = [string](Get-CtgProp $Config 'displayName'); $newUpn = [string](Get-CtgProp $Config 'newUpn')
+    $mailTo = [string](Get-CtgProp $Config 'mailAddress'); if (-not $mailTo) { $mailTo = $newUpn }
 
     $set = @{}
     if ($first -and $first -cne [string]$u.GivenName) { $set['GivenName'] = $first }
@@ -1216,35 +1235,44 @@ function Invoke-CtgADCorrectUser {
         $actions.Add("renamed the AD object to '$display'")
     }
 
-    if ($newUpn -and $newUpn -ine [string]$u.UserPrincipalName) {
+    $finalSam = $sam; $finalUpn = [string]$u.UserPrincipalName
+    $upnChange = $newUpn -and $newUpn -ine [string]$u.UserPrincipalName
+    $mailChange = $mailTo -and $mailTo -ine [string]$u.mail
+    if ($upnChange -or $mailChange) {
         $oldUpn = [string]$u.UserPrincipalName
-        $oldPrimary = [string](@(@(Get-CtgProp $u 'proxyAddresses') | Where-Object { ([string]$_) -cmatch '^SMTP:' }) | Select-Object -First 1)
-        $proxies = [System.Collections.Generic.List[string]]::new()
-        foreach ($p in @(Get-CtgProp $u 'proxyAddresses')) {
-            $s = [string]$p
-            if ($s -ieq "smtp:$newUpn") { continue }                                 # re-added as primary below
-            if ($s -cmatch '^SMTP:') { $proxies.Add('smtp:' + $s.Substring(5)) } else { $proxies.Add($s) }  # old primary -> alias
+        $setArgs = @{}
+        if ($mailChange) {
+            $oldPrimary = [string](@(@(Get-CtgProp $u 'proxyAddresses') | Where-Object { ([string]$_) -cmatch '^SMTP:' }) | Select-Object -First 1)
+            $proxies = [System.Collections.Generic.List[string]]::new()
+            foreach ($p in @(Get-CtgProp $u 'proxyAddresses')) {
+                $s = [string]$p
+                if ($s -ieq "smtp:$mailTo") { continue }                                 # re-added as primary below
+                if ($s -cmatch '^SMTP:') { $proxies.Add('smtp:' + $s.Substring(5)) } else { $proxies.Add($s) }  # old primary -> alias
+            }
+            if (-not $oldPrimary -and ([string]$u.mail)) { $proxies.Add("smtp:$([string]$u.mail)") }
+            $proxies.Insert(0, "SMTP:$mailTo")
+            $setArgs['Replace'] = @{ proxyAddresses = [string[]]$proxies; mail = $mailTo }
         }
-        if (-not $oldPrimary -and ([string]$u.mail)) { $proxies.Add("smtp:$([string]$u.mail)") }
-        $proxies.Insert(0, "SMTP:$newUpn")
-        $replace = @{ proxyAddresses = [string[]]$proxies; mail = $newUpn }
         $newSam = $null
-        $oldLocal = ($oldUpn -split '@')[0]
-        if ($oldLocal -and $sam -ieq $oldLocal) {
-            $candidate = (($newUpn -split '@')[0])
-            if ($candidate.Length -gt 20) { $candidate = $candidate.Substring(0, 20) }
-            if ($candidate -ine $sam) { $newSam = $candidate }
+        if ($upnChange) {
+            $setArgs['UserPrincipalName'] = $newUpn
+            $oldLocal = ($oldUpn -split '@')[0]
+            if ($oldLocal -and $sam -ieq $oldLocal) {
+                $candidate = (($newUpn -split '@')[0])
+                if ($candidate.Length -gt 20) { $candidate = $candidate.Substring(0, 20) }
+                if ($candidate -ine $sam) { $newSam = $candidate; $setArgs['SamAccountName'] = $newSam }
+            }
         }
-        if ($PSCmdlet.ShouldProcess($sam, "Change UPN $oldUpn -> $newUpn")) {
-            $setArgs = @{ UserPrincipalName = $newUpn; Replace = $replace }
-            if ($newSam) { $setArgs["SamAccountName"] = $newSam }
+        if ($PSCmdlet.ShouldProcess($sam, "Change $(@($(if ($upnChange) { "UPN $oldUpn -> $newUpn" }), $(if ($mailChange) { "mail -> $mailTo" })) -join ', ')")) {
             Set-ADUser -Identity $sam @setArgs -ErrorAction Stop @AdConnection
-            $actions.Add("UPN and email changed $oldUpn -> $newUpn (the old address stays as an alias)")
-            if ($newSam) { $actions.Add("sAMAccountName changed $sam -> $newSam (it followed the old UPN's local part)") }
+            if ($upnChange) { $actions.Add("UPN changed $oldUpn -> $newUpn"); $finalUpn = $newUpn }
+            if ($mailChange) { $actions.Add("email changed to $mailTo (the old address stays as an alias)") }
+            if ($newSam) { $actions.Add("sAMAccountName changed $sam -> $newSam (it followed the old UPN's local part)"); $finalSam = $newSam }
         }
     }
     if ($actions.Count -eq 0) { $actions.Add("already correct — nothing to change") }
-    [pscustomobject]@{ System = 'active-directory'; Status = 'ok'; Sam = $sam; Actions = $actions.ToArray() }
+    # The account's identity AFTER the correction, with its objectGUID — what a later Remove/Correct targets.
+    [pscustomobject]@{ System = 'active-directory'; Status = 'ok'; Sam = $finalSam; Upn = $finalUpn; ObjectGuid = [string](Get-CtgProp $u 'ObjectGUID'); Actions = $actions.ToArray() }
 }
 
 function Invoke-CtgADConsistencyCheck {

@@ -1641,9 +1641,28 @@ function Invoke-CtgExchangeCorrectAddress {
         return [pscustomobject]@{ System = 'exchange'; Status = 'ok'; Actions = $actions.ToArray() }
     }
     $old = [string](@('UserPrincipalName', 'workEmail', 'email') | ForEach-Object { Get-CtgProp $User $_ } | Where-Object { ([string]$_) -match '@' } | Select-Object -First 1)
-    # Either address resolves the mailbox (any proxy address does) — the old one before, the new one on a re-run.
-    $mbx = $null
-    foreach ($id in @($old, $newUpn) | Where-Object { $_ }) { try { $mbx = Get-Mailbox -Identity $id -ErrorAction SilentlyContinue } catch { $mbx = $null }; if ($mbx) { break } }
+    # WHICH mailbox: the Entra user the onboard created (config.target = the m365 line's id + UPN — maybe a
+    # fallback username, not the payload's). Any address resolves a mailbox (proxy addresses do): the
+    # target's, the case's, then the corrected one (a re-run). With the Entra id, a mailbox is used only
+    # if its ExternalDirectoryObjectId is that id; without it, a match only under the NEW address is refused.
+    $t = Get-CtgProp $Config 'target'
+    $entraId = [string](Get-CtgProp $t 'id')
+    $mbx = $null; $matchedNew = $false
+    foreach ($pair in @(@((Get-CtgProp $t 'upn'), $false), @($old, $false), @($newUpn, $true))) {
+        $addr = [string]$pair[0]
+        if (-not $addr) { continue }
+        try { $mbx = Get-Mailbox -Identity $addr -ErrorAction SilentlyContinue } catch { $mbx = $null }
+        if ($mbx) { $matchedNew = $pair[1]; break }
+    }
+    if ($mbx) {
+        $mbxId = [string](Get-CtgProp $mbx 'ExternalDirectoryObjectId')
+        if ($entraId -and $mbxId -and $mbxId -ine $entraId) {
+            throw "refused: mailbox $([string](Get-CtgProp $mbx 'PrimarySmtpAddress')) belongs to Entra object $mbxId, not the account this onboard created ($entraId) — address not changed"
+        }
+        if (-not $entraId -and $matchedNew) {
+            throw "refused: mailbox $([string](Get-CtgProp $mbx 'PrimarySmtpAddress')) was found only under the corrected address, and the onboard recorded no Entra id to prove it is this case's — address not changed"
+        }
+    }
     if (-not $mbx) {
         # Queued off the M365 line (the plan has no exchange line; the licence made the mailbox): a user
         # with no mailbox (unlicensed) has no address to move — a warning, not a failed correction.

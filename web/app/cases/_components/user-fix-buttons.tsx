@@ -71,7 +71,9 @@ export function CorrectUserButton({ caseId, current }: { caseId: string; current
   );
 }
 
-export function RemoveUserButton({ caseId, email }: { caseId: string; email: string }) {
+// `email` is the confirm key — the account the onboard created (removeConfirmKey); `accounts` lists
+// every account the steps will delete, one per system.
+export function RemoveUserButton({ caseId, email, accounts }: { caseId: string; email: string; accounts: string[] }) {
   const router = useRouter();
   const [open, setOpen] = useState(false);
   const [confirm, setConfirm] = useState("");
@@ -96,11 +98,14 @@ export function RemoveUserButton({ caseId, email }: { caseId: string; email: str
         <Dialog onClose={() => setOpen(false)}>
           <h2 style={{ margin: "0 0 0.25rem" }}>Remove the user</h2>
           <p className="note" style={{ color: "#b3261e", marginTop: 0 }}>
-            This permanently deletes <b>{email}</b> from every system this onboard set up (Active Directory, Microsoft 365, Google). It adds one step per system to this case; each needs approval before it runs, and the user&rsquo;s groups are saved first.
+            This permanently deletes the account this onboard created on each system. It adds one step per system to this case; each needs approval before it runs, and the user&rsquo;s groups are saved first.
           </p>
+          <ul className="note" style={{ margin: "0 0 0.5rem" }}>
+            {accounts.map((a) => <li key={a}>{a}</li>)}
+          </ul>
           <p className="note">Google keeps a deleted user restorable for 20 days; AD and Microsoft 365 deletes are permanent.</p>
           <label className="note" style={{ display: "flex", flexDirection: "column", gap: 3 }}>
-            Type the email to confirm
+            Type <b>{email}</b> to confirm
             <input value={confirm} onChange={(e) => setConfirm(e.target.value)} placeholder={email} disabled={busy} autoComplete="off" />
           </label>
           {err && <p className="note" style={{ color: "#b3261e" }}>{err}</p>}
