@@ -46,6 +46,7 @@ import { runnerBuildId } from "../runner/bundle";
 import { agentBuildIsCurrent, autoUpdateDecision, AGENT_AUTO_UPDATE_KEY } from "./agent-updates";
 import { decideAutoRetry, type AutoRetryMarker } from "./auto-retry";
 import { applyAdStandaloneUpn } from "./ad-standalone-upn";
+import { provisionedUpnFrom } from "./provisioned-upn";
 import { resolveActor, type ActorInput } from "../auth/actor";
 import { planTokenRefresh, planTokenConfirm } from "./agent-token-refresh";
 
@@ -1176,6 +1177,22 @@ export function makeRunnerService(db: PrismaClient) {
         }
       }
 
+      // SharePoint site-group mirror (FR #118): the new hire may have been created at a FALLBACK username
+      // (the primary belonged to someone else). Hand the sharepoint step the account the m365/entra step
+      // actually created, so the mirror can never land on the other person. See provisioned-upn.ts.
+      const spCaseIds = [...new Set(claimed.filter((j) => j.systemKey === "sharepoint" && j.case.action === "onboard").map((j) => j.caseRequestId))];
+      const upnByCase = new Map<string, string>();
+      if (spCaseIds.length > 0) {
+        const cloud = await db.job.findMany({
+          where: { caseRequestId: { in: spCaseIds }, systemKey: { in: ["m365", "entra"] }, status: "succeeded" },
+          select: { caseRequestId: true, systemKey: true, status: true, result: true },
+        });
+        for (const id of spCaseIds) {
+          const upn = provisionedUpnFrom(cloud.filter((c) => c.caseRequestId === id));
+          if (upn) upnByCase.set(id, upn);
+        }
+      }
+
       // Offboard manager hand-off: exchange grants the departing user's MANAGER Full Access to the
       // converted shared mailbox (delegateManagerFullAccess). It normally runs first and reads the live
       // directory link — but if it runs AFTER active-directory (a re-run, or a first attempt that
@@ -1361,6 +1378,8 @@ export function makeRunnerService(db: PrismaClient) {
             ? { ...casePayload, cloudObject: cloudByCase.get(j.caseRequestId) ?? cloudObjectFor(null) }
             : capturedManager
             ? { ...casePayload, managerEmail: capturedManager }
+            : j.systemKey === "sharepoint" && upnByCase.has(j.caseRequestId)
+            ? { ...casePayload, provisionedUpn: upnByCase.get(j.caseRequestId) }
             : j.case.payload;
         // AD-STANDALONE domain separation (FR #83/#107): on the on-prem lane, hand the AD-domain UPN
         // instead of the mail-domain one. Wraps the chain above (not another arm of it) so

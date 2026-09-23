@@ -1622,41 +1622,25 @@ $DISPATCH['entra'] = $DISPATCH['m365']
 # them, onboard with "mirror <user>" copies the reference user's. PnP app-only on the SAME m365-admin
 # cert as the OneDrive hand-off; Graph (the m365 Connect) is used only to find the tenant's SharePoint
 # root, from which the admin-centre URL is derived (config.rootUrl overrides it for an odd tenant).
+#
+# The decisions (who, whether there is anything to do, the site walk) live in the module's
+# Invoke-CtgSharePointSiteGroupsStep, where they are tested. This lane only supplies the leaver (resolved
+# exactly as the m365 lane does) and the PnP context — as a scriptblock, so an onboard with no mirror
+# user never needs PnP, the cert or the site list at all.
 function Invoke-CtgSharePointSiteGroupsLane {
     param($Job, $Creds, [ValidateSet('onboard', 'offboard')][string]$Lane)
-    if (-not $pnpAvail) { throw "PnP.PowerShell isn't available on this runner, so the SharePoint site-group step can't run here — it runs on a runner with PnP.PowerShell installed (the central runner installs it at startup when it can reach the gallery)." }
-    $certArgs = Get-CtgExoCertArgs $Creds['m365-admin']
-    if ($certArgs.Count -eq 0) { throw "the m365-admin secret has no certificate (CertificateBase64 or CertificateThumbprint) — SharePoint app-only access needs one, the same cert the Exchange step uses." }
-    $appId = Get-CtgM365AppId $Creds
-    $tenant = Get-CtgTenantDomain $Job $Creds
-    $root = [string](Get-CtgProp $Job.config 'rootUrl')
-    if (-not $root) { $root = [string](Get-CtgProp (Invoke-MgGraphRequest -Method GET -Uri 'v1.0/sites/root?$select=webUrl' -ErrorAction Stop) 'webUrl') }
-    if ($root -notmatch '^https://([^./]+)\.sharepoint\.com') { throw "couldn't work out this tenant's SharePoint address (got '$root') — set config.rootUrl on the sharepoint system, e.g. https://contoso.sharepoint.com" }
-    $adminUrl = "https://$($Matches[1])-admin.sharepoint.com"
-    Set-CtgPhase $Job.id "listing SharePoint sites (cached per tenant)"
-    $sites = @(Get-CtgSharePointSiteUrls -AdminUrl $adminUrl -AppId $appId -Tenant $tenant -CertArgs $certArgs)
-    $email = Resolve-CtgM365Upn -User $Job.payload
-    if (-not $email) { throw "the case carries no email/UPN for the user — set it on the case and re-run." }
-    $actions = [System.Collections.Generic.List[string]]::new()
-    if ($Lane -eq 'offboard') {
-        Set-CtgPhase $Job.id "removing $email from site groups on $($sites.Count) site(s)"
-        foreach ($a in (Invoke-CtgSharePointSiteGroupsOffboard -Email $email -Sites $sites -AppId $appId -Tenant $tenant -CertArgs $certArgs)) { $actions.Add($a) }
+    $context = {
+        if (-not $pnpAvail) { throw "PnP.PowerShell isn't available on this runner, so the SharePoint site-group step can't run here — it runs on a runner with PnP.PowerShell installed (the central runner installs it at startup when it can reach the gallery)." }
+        $certArgs = Get-CtgExoCertArgs $Creds['m365-admin']
+        if ($certArgs.Count -eq 0) { throw "the m365-admin secret has no certificate (CertificateBase64 or CertificateThumbprint) — SharePoint app-only access needs one, the same cert the Exchange step uses." }
+        $root = [string](Get-CtgProp $Job.config 'rootUrl')
+        if (-not $root) { $root = [string](Get-CtgProp (Invoke-MgGraphRequest -Method GET -Uri 'v1.0/sites/root?$select=webUrl' -ErrorAction Stop) 'webUrl') }
+        if ($root -notmatch '^https://([^./]+)\.sharepoint\.com') { throw "couldn't work out this tenant's SharePoint address (got '$root') — set config.rootUrl on the sharepoint system, e.g. https://contoso.sharepoint.com" }
+        @{ AppId = (Get-CtgM365AppId $Creds); Tenant = (Get-CtgTenantDomain $Job $Creds); CertArgs = $certArgs; AdminUrl = "https://$($Matches[1])-admin.sharepoint.com" }
     }
-    else {
-        $mirror = [string](Get-CtgProp $Job.config 'mirrorFromUser')
-        if (-not $mirror) { $actions.Add("no mirror user on this onboard — no SharePoint site groups to copy") }
-        else {
-            # The intake names the reference user by display name as often as by email — resolve it.
-            $ref = Resolve-CtgEntraUser -Identity $mirror
-            if (-not $ref) { $actions.Add("WARN mirror user not found in Entra: $mirror — SharePoint site groups not mirrored") }
-            else {
-                $exclude = @(Get-CtgProp (Get-CtgProp $Job.config 'mirrorPolicy') 'exclude')
-                Set-CtgPhase $Job.id "mirroring $($ref.UserPrincipalName)'s site groups across $($sites.Count) site(s)"
-                foreach ($a in (Invoke-CtgSharePointSiteGroupsMirror -NewEmail $email -ReferenceEmail ([string]$ref.UserPrincipalName) -Sites $sites -AppId $appId -Tenant $tenant -CertArgs $certArgs -Exclude $exclude)) { $actions.Add($a) }
-            }
-        }
-    }
-    [pscustomobject]@{ System = 'sharepoint'; Status = 'ok'; Email = $email; Actions = $actions.ToArray() }
+    Set-CtgPhase $Job.id "SharePoint site groups ($Lane)"
+    $leaver = if ($Lane -eq 'offboard') { Resolve-CtgM365Upn -User $Job.payload } else { '' }
+    Invoke-CtgSharePointSiteGroupsStep -Lane $Lane -Payload $Job.payload -Config $Job.config -LeaverUpn $leaver -Context $context
 }
 
 $DISPATCH['sharepoint'] = @{

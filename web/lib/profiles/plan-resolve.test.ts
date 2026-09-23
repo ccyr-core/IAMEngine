@@ -611,3 +611,16 @@ test("mirror is injected into the sharepoint job as well", () => {
   assert.deepEqual(resolved.find((j) => j.systemKey === "sharepoint")!.config, { mirrorFromUser: "Jane Boss" });
   assert.equal(resolved.find((j) => j.systemKey === "zoom")!.config, null);
 });
+
+// PR #111 review: the mirror policy's "never mirror" list (FR #119) never reached the sharepoint job.
+test("the sharepoint job inherits the cloud lane's mirror-policy exclude list", () => {
+  const planned = [job("m365", { mirrorPolicy: { securityOnly: true, exclude: ["ChatGPT*"] } }), job("sharepoint", null)];
+  const resolved = resolvePlannedConfigs({ personas: null, globals: null, locations: null }, { ...payload, mirrorPermissionsFromUser: "Jane Boss" }, "onboard", planned);
+  assert.deepEqual(resolved.find((j) => j.systemKey === "sharepoint")!.config, { mirrorFromUser: "Jane Boss", mirrorPolicy: { exclude: ["ChatGPT*"] } });
+});
+
+test("a sharepoint job with its own mirror policy keeps it", () => {
+  const planned = [job("m365", { mirrorPolicy: { exclude: ["ChatGPT*"] } }), job("sharepoint", { mirrorPolicy: { exclude: ["Board*"] } })];
+  const resolved = resolvePlannedConfigs({ personas: null, globals: null, locations: null }, { ...payload, mirrorPermissionsFromUser: "Jane Boss" }, "onboard", planned);
+  assert.deepEqual(resolved.find((j) => j.systemKey === "sharepoint")!.config, { mirrorFromUser: "Jane Boss", mirrorPolicy: { exclude: ["Board*"] } });
+});

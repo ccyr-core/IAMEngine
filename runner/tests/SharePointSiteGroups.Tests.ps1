@@ -2,13 +2,17 @@
 # site groups on onboard. PnP.PowerShell isn't on a test host, so its cmdlets are thin global stubs,
 # mocked in the module scope.
 BeforeAll {
-    function global:Connect-PnPOnline { param($Url, $ClientId, $Tenant, $CertificatePath, $CertificatePassword, $Thumbprint) }
-    function global:Get-PnPTenantSite { param() }
-    function global:Get-PnPUser { param($Identity) }
-    function global:Get-PnPGroup { param() }
-    function global:Get-PnPGroupMember { param($Group) }
-    function global:Remove-PnPGroupMember { param($Group, $LoginName) }
-    function global:Add-PnPGroupMember { param($Group, $LoginName) }
+    # Advanced (CmdletBinding), as real cmdlets are, so they take -ErrorAction.
+    function global:Connect-PnPOnline { [CmdletBinding()] param($Url, $ClientId, $Tenant, $CertificatePath, $CertificatePassword, $Thumbprint) }
+    function global:Get-PnPTenantSite { [CmdletBinding()] param() }
+    function global:Get-PnPUser { [CmdletBinding()] param($Identity) }
+    function global:Get-PnPGroup { [CmdletBinding()] param() }
+    function global:Get-PnPGroupMember { [CmdletBinding()] param($Group) }
+    function global:Remove-PnPGroupMember { [CmdletBinding()] param($Group, $LoginName) }
+    function global:Add-PnPGroupMember { [CmdletBinding()] param($Group, $LoginName) }
+    # The runner's global progress poster, and Graph — both called by the module when present.
+    function global:Send-CtgProgress { param([string]$Message) }
+    function global:Get-MgUser { [CmdletBinding()] param($Filter, $Top, $All, $ConsistencyLevel, $Property, $UserId) }
     Import-Module "$PSScriptRoot/../modules/Coretelligent.SharePoint/Coretelligent.SharePoint.psm1" -Force -DisableNameChecking
     $script:Cert = @{ CertificateThumbprint = 'AB' }
 }
@@ -62,11 +66,152 @@ Describe 'site groups' {
         Should -Invoke Add-PnPGroupMember -ModuleName Coretelligent.SharePoint -Times 1 -Exactly -ParameterFilter { $Group -eq 'Finance Members' -and $LoginName -eq 'i:0#.f|membership|new@contoso.com' }
         ($r -join "`n") | Should -Match "not mirrored: site group 'ChatGPT Pilot'"
     }
-    It 'one failing site warns and the rest still run' {
+    It 'one failing site is reported, the rest still run, and the step does not claim success' {
         $script:OnSite = $true
         Mock Connect-PnPOnline -ModuleName Coretelligent.SharePoint { if ($Url -match 'Broken') { throw 'Access denied' } }
-        $r = Invoke-CtgSharePointSiteGroupsOffboard -Email 'leaver@contoso.com' -Sites @('https://contoso.sharepoint.com/sites/Broken', 'https://contoso.sharepoint.com/sites/Finance') -AppId 'app' -Tenant 'contoso.com' -CertArgs $script:Cert
-        ($r -join "`n") | Should -Match 'WARN SharePoint site https://contoso.sharepoint.com/sites/Broken not cleaned'
+        { Invoke-CtgSharePointSiteGroupsOffboard -Email 'leaver@contoso.com' -Sites @('https://contoso.sharepoint.com/sites/Broken', 'https://contoso.sharepoint.com/sites/Finance') -AppId 'app' -Tenant 'contoso.com' -CertArgs $script:Cert } |
+            Should -Throw '*1 of 2 site(s)*sites/Broken*Access denied*'
+        Should -Invoke Remove-PnPGroupMember -ModuleName Coretelligent.SharePoint -Times 2 -Exactly
+    }
+}
+
+# Review fixes on PR #111. Each test here failed against the first cut of FR #118.
+Describe 'review fixes' {
+    BeforeEach {
+        $script:OnSite = $true
+        Mock Connect-PnPOnline -ModuleName Coretelligent.SharePoint { }
+        Mock Get-PnPGroup -ModuleName Coretelligent.SharePoint { @([pscustomobject]@{ Title = 'Finance Members' }, [pscustomobject]@{ Title = 'ChatGPT Pilot' }) }
+        Mock Get-PnPUser -ModuleName Coretelligent.SharePoint { if ($script:OnSite -and $Identity -match 'leaver@|ref@') { [pscustomobject]@{ LoginName = $Identity } } }
+        Mock Get-PnPGroupMember -ModuleName Coretelligent.SharePoint { @([pscustomobject]@{ LoginName = 'i:0#.f|membership|leaver@contoso.com' }, [pscustomobject]@{ LoginName = 'i:0#.f|membership|ref@contoso.com' }) }
+        Mock Remove-PnPGroupMember -ModuleName Coretelligent.SharePoint { }
+        Mock Add-PnPGroupMember -ModuleName Coretelligent.SharePoint { }
+        Mock Send-CtgProgress -ModuleName Coretelligent.SharePoint { }
+        Mock Start-Sleep -ModuleName Coretelligent.SharePoint { }
+        Mock Get-PnPTenantSite -ModuleName Coretelligent.SharePoint { @([pscustomobject]@{ Url = 'https://contoso.sharepoint.com/sites/Finance'; Template = 'GROUP#0' }) }
+        Mock Get-MgUser -ModuleName Coretelligent.SharePoint {
+            if ($Filter -match 'ref@contoso\.com') { @([pscustomobject]@{ UserPrincipalName = 'ref@contoso.com'; DisplayName = 'Rita Ref' }) }
+            elseif ($Filter -match "displayName eq 'Rita Ref'") { @([pscustomobject]@{ UserPrincipalName = 'ref@contoso.com'; DisplayName = 'Rita Ref' }) }
+            elseif ($Filter -match "displayName eq 'Sam Twin'") { @([pscustomobject]@{ UserPrincipalName = 'sam1@contoso.com' }, [pscustomobject]@{ UserPrincipalName = 'sam2@contoso.com' }) }
+        }
+        InModuleScope Coretelligent.SharePoint { $script:CtgSiteCache = @{} }
+        $script:Ctx = { @{ AppId = 'app'; Tenant = 'contoso.com'; CertArgs = @{ CertificateThumbprint = 'AB' }; AdminUrl = 'https://contoso-admin.sharepoint.com' } }
+    }
+
+    # Finding 2: a big tenant walked with no narration tripped the runner's 600 s stall watchdog.
+    It 'posts progress while it walks the sites' {
+        $script:OnSite = $false
+        $sites = @(1..25 | ForEach-Object { "https://contoso.sharepoint.com/sites/S$_" })
+        $null = Invoke-CtgSharePointSiteGroupsOffboard -Email 'leaver@contoso.com' -Sites $sites -AppId 'app' -Tenant 'contoso.com' -CertArgs $script:Cert
+        Should -Invoke Send-CtgProgress -ModuleName Coretelligent.SharePoint -Times 3
+        $null = Invoke-CtgSharePointSiteGroupsMirror -NewEmail 'new@contoso.com' -ReferenceEmail 'ref@contoso.com' -Sites $sites -AppId 'app' -Tenant 'contoso.com' -CertArgs $script:Cert
+        Should -Invoke Send-CtgProgress -ModuleName Coretelligent.SharePoint -Times 6
+    }
+
+    # Finding 3: a lookup error read as "never on this site" — the offboard reported success.
+    It 'a lookup error on a site fails the offboard instead of reading as "not on this site"' {
+        Mock Get-PnPUser -ModuleName Coretelligent.SharePoint { throw 'Access is denied. (Exception from HRESULT: 0x80070005)' }
+        { Invoke-CtgSharePointSiteGroupsOffboard -Email 'leaver@contoso.com' -Sites @('https://contoso.sharepoint.com/sites/Finance') -AppId 'app' -Tenant 'contoso.com' -CertArgs $script:Cert } |
+            Should -Throw '*may still have access*sites/Finance*Access is denied*'
+    }
+    It 'a user who is genuinely not on the site is still a quiet skip' {
+        Mock Get-PnPUser -ModuleName Coretelligent.SharePoint { throw 'User cannot be found.' }
+        $r = Invoke-CtgSharePointSiteGroupsOffboard -Email 'leaver@contoso.com' -Sites @('https://contoso.sharepoint.com/sites/Finance') -AppId 'app' -Tenant 'contoso.com' -CertArgs $script:Cert
+        ($r -join "`n") | Should -Match 'removed leaver@contoso.com from 0 group\(s\) on 0 of 1 site'
+    }
+    It 'throttling (429/503) is retried, not skipped' {
+        $global:SpUserCalls = 0
+        Mock Get-PnPUser -ModuleName Coretelligent.SharePoint {
+            $global:SpUserCalls++
+            if ($global:SpUserCalls -eq 1) { throw 'The remote server returned an error: (429) Too Many Requests.' }
+            else { [pscustomobject]@{ LoginName = $Identity } }
+        }
+        $r = Invoke-CtgSharePointSiteGroupsOffboard -Email 'leaver@contoso.com' -Sites @('https://contoso.sharepoint.com/sites/Finance') -AppId 'app' -Tenant 'contoso.com' -CertArgs $script:Cert
+        Should -Invoke Start-Sleep -ModuleName Coretelligent.SharePoint -Times 1 -Exactly
+        Should -Invoke Remove-PnPGroupMember -ModuleName Coretelligent.SharePoint -Times 2 -Exactly
+        ($r -join "`n") | Should -Match 'from 2 group\(s\) on 1 of 1 site'
+    }
+    It 'a group-member read error is an error too, not an empty group' {
+        Mock Get-PnPGroupMember -ModuleName Coretelligent.SharePoint { throw 'The remote server returned an error: (500) Internal Server Error.' }
+        { Invoke-CtgSharePointSiteGroupsOffboard -Email 'leaver@contoso.com' -Sites @('https://contoso.sharepoint.com/sites/Finance') -AppId 'app' -Tenant 'contoso.com' -CertArgs $script:Cert } |
+            Should -Throw '*sites/Finance*500*'
+    }
+
+    # Finding 5: in a dry run the WhatIf preference also stopped the temp .pfx (a private key) being
+    # deleted, and a fresh copy was written for every site.
+    It 'a dry run writes the certificate once and deletes it' {
+        $global:SpCertPaths = [System.Collections.Generic.List[string]]::new()
+        Mock Connect-PnPOnline -ModuleName Coretelligent.SharePoint { $global:SpCertPaths.Add([string]$CertificatePath) }
+        $pfx = @{ CertificateBase64 = [Convert]::ToBase64String([byte[]](1, 2, 3)) }
+        $sites = @('https://contoso.sharepoint.com/sites/A', 'https://contoso.sharepoint.com/sites/B', 'https://contoso.sharepoint.com/sites/C')
+        try {
+            $global:WhatIfPreference = $true
+            $null = Invoke-CtgSharePointSiteGroupsOffboard -Email 'leaver@contoso.com' -Sites $sites -AppId 'app' -Tenant 'contoso.com' -CertArgs $pfx
+        }
+        finally {
+            $global:WhatIfPreference = $false
+            $leftover = @($global:SpCertPaths | Where-Object { $_ -and (Test-Path -LiteralPath $_) })
+            foreach ($f in $leftover) { [System.IO.File]::Delete($f) }
+        }
+        $global:SpCertPaths.Count | Should -Be 3
+        @($global:SpCertPaths | Select-Object -Unique).Count | Should -Be 1
+        $leftover.Count | Should -Be 0
+        Should -Invoke Remove-PnPGroupMember -ModuleName Coretelligent.SharePoint -Times 0 -Exactly
+    }
+
+    # Finding 7: no mirror user = nothing to do; don't touch PnP, the cert, or the site list at all.
+    It 'onboard with no mirror user is a no-op that never builds the SharePoint context' {
+        $global:SpCtxCalls = 0
+        $r = Invoke-CtgSharePointSiteGroupsStep -Lane onboard -Payload ([pscustomobject]@{ UserPrincipalName = 'new@contoso.com' }) -Config ([pscustomobject]@{}) -Context { $global:SpCtxCalls++; throw 'PnP is not installed' }
+        $r.Status | Should -Be 'ok'
+        ($r.Actions -join "`n") | Should -Match 'no mirror user'
+        $global:SpCtxCalls | Should -Be 0
+        Should -Invoke Connect-PnPOnline -ModuleName Coretelligent.SharePoint -Times 0 -Exactly
+        Should -Invoke Get-PnPTenantSite -ModuleName Coretelligent.SharePoint -Times 0 -Exactly
+    }
+
+    # Finding 1: the m365 step creates the hire at a FALLBACK username when the primary belongs to
+    # someone else — the mirror must land on the account it actually created, never on the primary.
+    It 'onboard mirrors onto the account the m365 step created (provisionedUpn), not the primary candidate' {
+        $p = [pscustomobject]@{ UserPrincipalName = 'jsmith@contoso.com'; UserPrincipalNameFallbacks = @('john.smith2@contoso.com'); provisionedUpn = 'john.smith2@contoso.com' }
+        $r = Invoke-CtgSharePointSiteGroupsStep -Lane onboard -Payload $p -Config ([pscustomobject]@{ mirrorFromUser = 'ref@contoso.com' }) -Context $script:Ctx
+        $r.Email | Should -Be 'john.smith2@contoso.com'
+        Should -Invoke Add-PnPGroupMember -ModuleName Coretelligent.SharePoint -Times 2 -Exactly -ParameterFilter { $LoginName -eq 'i:0#.f|membership|john.smith2@contoso.com' }
+        Should -Invoke Add-PnPGroupMember -ModuleName Coretelligent.SharePoint -Times 0 -Exactly -ParameterFilter { $LoginName -match 'jsmith@' }
+    }
+    It 'onboard refuses to guess between username candidates when the created account is unknown' {
+        $p = [pscustomobject]@{ UserPrincipalName = 'jsmith@contoso.com'; UserPrincipalNameFallbacks = @('john.smith2@contoso.com') }
+        { Invoke-CtgSharePointSiteGroupsStep -Lane onboard -Payload $p -Config ([pscustomobject]@{ mirrorFromUser = 'ref@contoso.com' }) -Context $script:Ctx } |
+            Should -Throw '*which account*'
+        Should -Invoke Add-PnPGroupMember -ModuleName Coretelligent.SharePoint -Times 0 -Exactly
+    }
+    It 'onboard with a single username candidate uses it' {
+        $r = Invoke-CtgSharePointSiteGroupsStep -Lane onboard -Payload ([pscustomobject]@{ UserPrincipalName = 'new@contoso.com' }) -Config ([pscustomobject]@{ mirrorFromUser = 'ref@contoso.com' }) -Context $script:Ctx
+        $r.Email | Should -Be 'new@contoso.com'
+        Should -Invoke Add-PnPGroupMember -ModuleName Coretelligent.SharePoint -Times 2 -Exactly
+    }
+
+    # Finding 4: the mirror user was resolved by display name with -Top 1 — two people, arbitrary pick.
+    It 'a mirror user named by a display name two people share fails with a clear message' {
+        { Invoke-CtgSharePointSiteGroupsStep -Lane onboard -Payload ([pscustomobject]@{ UserPrincipalName = 'new@contoso.com' }) -Config ([pscustomobject]@{ mirrorFromUser = 'Sam Twin' }) -Context $script:Ctx } |
+            Should -Throw '*2 or more people*Sam Twin*email*'
+        Should -Invoke Add-PnPGroupMember -ModuleName Coretelligent.SharePoint -Times 0 -Exactly
+    }
+    It 'a mirror user named by a unique display name resolves to their UPN' {
+        $r = Invoke-CtgSharePointSiteGroupsStep -Lane onboard -Payload ([pscustomobject]@{ UserPrincipalName = 'new@contoso.com' }) -Config ([pscustomobject]@{ mirrorFromUser = 'Rita Ref' }) -Context $script:Ctx
+        ($r.Actions -join "`n") | Should -Match 'mirrored 2 group\(s\) from ref@contoso.com'
+    }
+
+    # Finding 6: the mirror policy's exclude list (config.mirrorPolicy.exclude) reaches the step and is honoured.
+    It 'the step honours config.mirrorPolicy.exclude' {
+        $cfg = [pscustomobject]@{ mirrorFromUser = 'ref@contoso.com'; mirrorPolicy = [pscustomobject]@{ exclude = @('chatgpt*') } }
+        $r = Invoke-CtgSharePointSiteGroupsStep -Lane onboard -Payload ([pscustomobject]@{ UserPrincipalName = 'new@contoso.com' }) -Config $cfg -Context $script:Ctx
+        Should -Invoke Add-PnPGroupMember -ModuleName Coretelligent.SharePoint -Times 1 -Exactly -ParameterFilter { $Group -eq 'Finance Members' }
+        ($r.Actions -join "`n") | Should -Match "not mirrored: site group 'ChatGPT Pilot'"
+    }
+
+    It 'offboard removes the leaver it is given, building the context only then' {
+        $r = Invoke-CtgSharePointSiteGroupsStep -Lane offboard -Payload ([pscustomobject]@{}) -LeaverUpn 'leaver@contoso.com' -Context $script:Ctx
+        $r.Status | Should -Be 'ok'
         Should -Invoke Remove-PnPGroupMember -ModuleName Coretelligent.SharePoint -Times 2 -Exactly
     }
 }

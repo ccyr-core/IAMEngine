@@ -7,8 +7,13 @@ export const entry: ChangelogEntry = {
   title: "SharePoint: site groups are cleaned up on offboard and mirrored on onboard (runner 1.127.0)",
   items: [
     "The SharePoint system now runs as a real step: on offboard it removes the leaver from every SharePoint site group they're in (a site's Owners, Members, Visitors and custom groups), on every site in the tenant",
-    "On an onboard that says \"mirror <user>\", it adds the new user to the same site groups as the reference user; groups excluded by the client's mirror policy are skipped",
-    "Sites the person never used are skipped quickly, and the tenant's site list is reused for 6 hours rather than re-read on every case; one site failing is reported and the rest still run",
+    "On an onboard that says \"mirror <user>\", it adds the new user to the same site groups as the reference user. Groups on the client's mirror-policy \"never mirror\" list are skipped. A SharePoint step without its own list uses the Microsoft 365 one",
+    "The new user is the account the Microsoft 365 step actually created. If that step had to use a fallback username because the first one belonged to someone else, the groups go to the fallback account, never the other person's. When the step can't tell which account was created, it stops and says so instead of guessing",
+    "A reference user given by name must match exactly one person. If two people share the name, the step stops and asks for an email address instead of picking one",
+    "An onboard with no mirror user finishes straight away without touching SharePoint",
+    "Sites the person never used are skipped quickly, and the tenant's site list is reused for 6 hours rather than re-read on every case",
+    "If SharePoint is throttling, the step waits and retries. If a site still can't be checked, the other sites are still done, then the step fails and lists the sites it couldn't finish. An offboard never reports success while the leaver might still have access somewhere. The run report shows progress as the step works through the sites",
+    "A dry run writes the certificate to disk only once and deletes it afterwards. Before this, each site left its own copy behind",
     "It uses the client's existing Microsoft 365 app and certificate (the same Sites.FullControl.All access the OneDrive hand-off already needs)",
   ],
 };
