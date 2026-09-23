@@ -2968,17 +2968,17 @@ $CONNTEST_PROBE = @{
     'exchange'         = { param($job, $creds)
         $o = Get-OrganizationConfig -ErrorAction Stop
         # A successful app-only connect + org read proves Exchange.ManageAsApp and SOME Exchange role —
-        # but not which one. Exchange Online builds the session from that role and omits every cmdlet it
-        # doesn't grant, so a tenant whose app holds a narrower role connects fine here and then fails
-        # mid-offboard with "'Get-MailboxStatistics' is not recognized" (FR #125, Brighton Park). Check
-        # the cmdlets the Exchange lanes actually call, so the gap shows up here instead of on a case.
+        # not that every cmdlet the lanes call is in the session. Two things leave one out: an app role
+        # narrower than Exchange Administrator, or a session whose command module didn't load fully in
+        # this runner process (FR #125: Brighton Park had the role and still hit "'Get-MailboxStatistics'
+        # is not recognized" mid-offboard). Checking the cmdlets here surfaces either before a live case.
         $missingCmdlets = @(Get-CtgExoMissingCmdlet)
         $script:ConnTestRights = @(
             @{ op = 'connect to Exchange Online app-only (Exchange.ManageAsApp + an Exchange role)'; ok = $true; detail = "connected app-only to $($o.Name)" },
-            @{ op = 'run the cmdlets the Exchange onboard/offboard steps use'; ok = ($missingCmdlets.Count -eq 0); detail = $(if ($missingCmdlets.Count) { "not granted by the app's Exchange role: $($missingCmdlets -join ', ')" } else { 'all present' }) }
+            @{ op = 'run the cmdlets the Exchange onboard/offboard steps use'; ok = ($missingCmdlets.Count -eq 0); detail = $(if ($missingCmdlets.Count) { "missing from the session: $($missingCmdlets -join ', ')" } else { 'all present' }) }
         )
         if ($missingCmdlets.Count) {
-            throw "org: $($o.Name) · connected, but the app's Exchange role doesn't grant $($missingCmdlets.Count) cmdlet(s) the Exchange steps use: $($missingCmdlets -join ', '). Assign the app's service principal the Exchange Administrator role in Entra -> Roles and administrators, then re-test."
+            throw "org: $($o.Name) · connected, but $($missingCmdlets.Count) cmdlet(s) the Exchange steps use are missing from the session: $($missingCmdlets -join ', '). If the app does NOT have the Exchange Administrator role, assign it in Entra -> Roles and administrators; if it already does, restart the runner (its Exchange session didn't load fully) and re-test."
         }
         "org: $($o.Name)"
     }
@@ -3815,13 +3815,19 @@ while ($true) {
                             throw "the Coretelligent module providing '$missing' isn't loaded on this host — it needs a host-specific dependency (the ActiveDirectory/RSAT module for AD, ExchangeOnlineManagement for Exchange, the ADSync module for directory-sync). This step must run on the client-network agent that has it, not the central/cloud runner."
                         }
                         # FR #125: an Exchange Online cmdlet missing from a CONNECTED session is not a missing
-                        # module — EXO builds the app-only session from the app's RBAC role and leaves out any
-                        # cmdlet the role doesn't grant. Installing a module can't fix that (it's installed —
-                        # the connect just used it), so say what can, instead of "not recognized".
+                        # module to install — the connect just used ExchangeOnlineManagement. Two causes:
+                        #   1. the app's Exchange role doesn't grant it (EXO builds an app-only session from the
+                        #      role and leaves out every cmdlet the role doesn't cover);
+                        #   2. the session's command module didn't finish loading in THIS runner process — the
+                        #      late-August/early-September state where the EXO module went missing or a self-heal
+                        #      loaded a second copy (see the 2026-09-03 hotfix). Brighton Park's Aug 31 failure
+                        #      already had the Exchange Administrator role, so this is the likelier cause there.
+                        # Installing and importing a module mid-run is the hazard that hotfix closed, so don't:
+                        # say what fixes each cause instead of the bare "not recognized".
                         if ($missing -and (Get-Command Test-CtgExoCmdlet -ErrorAction SilentlyContinue) -and (Test-CtgExoCmdlet $missing) -and
                             (Get-Command Get-ConnectionInformation -ErrorAction SilentlyContinue) -and
                             @(Get-ConnectionInformation -ErrorAction SilentlyContinue | Where-Object { $_.State -eq 'Connected' }).Count -gt 0) {
-                            throw "'$missing' is not available in this Exchange Online session. Exchange Online only loads the cmdlets the app registration's Exchange role grants, so the app for this tenant is missing a role that includes it — nothing needs installing. In Entra -> Roles and administrators, assign the app's service principal the Exchange Administrator role (or an Exchange role that covers mailbox management), then re-run this step. Test connections on the client will list every cmdlet the Exchange steps need that is still missing."
+                            throw "'$missing' is not available in this Exchange Online session, though the connect succeeded — nothing needs installing. Either (1) the app registration's Exchange role doesn't include it: if the app does NOT already have Exchange Administrator, assign it in Entra -> Roles and administrators; or (2) if it already does, this runner's Exchange session didn't load fully — restart the runner, then re-run this step. Test connections on the client lists every cmdlet the Exchange steps need that the session is missing."
                         }
                         if ($try -eq 0 -and $missing) {
                             Set-CtgPhase $job.id "missing command '$missing' — locating + installing its module"

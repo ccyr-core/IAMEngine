@@ -1,12 +1,12 @@
 # FR #0000125: Brighton Park's offboard failed on "'Get-MailboxStatistics' is not recognized" right
 # after a successful app-only Connect-ExchangeOnline, and the runner then tried to INSTALL a module.
 #
-# Exchange Online builds an app-only session from the app's RBAC role and leaves out every cmdlet the
-# role doesn't grant. So a missing EXO cmdlet in a connected session is a role gap, not a missing
-# module -- the module is installed; the connect just used it. Two consequences, both tested here:
+# A cmdlet can be missing from a CONNECTED session: the app's RBAC role may not grant it (EXO builds the
+# session from it), or the session didn't load fully in that runner process (Brighton Park had the role).
+# Either way it is not a missing module -- the connect just used it. Two consequences, both tested here:
 #   - the connection test must check the cmdlets the lanes call, not treat "connected" as proof of
 #     the Exchange Administrator role (it claimed exactly that);
-#   - the missing-command handler must name the role, not attempt an install that cannot help.
+#   - the missing-command handler must name both causes, not attempt an install that cannot help.
 BeforeAll {
     $Root = Split-Path $PSScriptRoot -Parent
     Import-Module "$Root/modules/Coretelligent.Exchange/Coretelligent.Exchange.psd1" -Force
@@ -58,6 +58,11 @@ Describe 'the runner' {
         $install = $script:Runner.IndexOf("locating + installing its module")
         $gap | Should -BeGreaterThan 0
         $gap | Should -BeLessThan $install
+    }
+    It 'names BOTH causes -- the role, and a session that did not load (restart the runner)' {
+        $m = [regex]::Match($script:Runner, 'is not available in this Exchange Online session[^"]*').Value
+        $m | Should -Match 'Exchange Administrator'
+        $m | Should -Match 'restart the runner'
     }
     It 'no longer claims a connect proves the Exchange Administrator role' {
         $script:Runner | Should -Not -Match 'PROVES the app holds Exchange\.ManageAsApp \+ the\s+# Exchange Administrator role'
