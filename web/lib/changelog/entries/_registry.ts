@@ -72,6 +72,7 @@ export { entry as connectorBrowserSessionAuth } from "./connector-browser-sessio
 export { entry as connectorProbeAndHarHosts } from "./connector-probe-and-har-hosts";
 export { entry as consistencyCheckCannotVerify } from "./consistency-check-cannot-verify";
 export { entry as copyButtonsWorkOffTheHost } from "./copy-buttons-work-off-the-host";
+export { entry as correctOrRemoveUser } from "./correct-or-remove-user";
 export { entry as createSecretIdentitySubfolder } from "./create-secret-identity-subfolder";
 export { entry as coreidSlugRedirect } from "./coreid-slug-redirect";
 export { entry as coretelligentPostResetRestore } from "./coretelligent-post-reset-restore";

@@ -1636,6 +1636,19 @@ $DISPATCH['google-password-reset'] = @{
 }
 foreach ($k in 'ad-password-reset', 'm365-password-reset', 'google-password-reset') { $DISPATCH[$k].Offboard = $DISPATCH[$k].Onboard }
 
+# FR #88 — ad-hoc "Correct user" / "Remove user" on an onboard case: fix a misspelled name or a wrong
+# username/email, or hard-delete an account whose hire fell through. Same shape as the resets above:
+# never planned, one executor per system for both lanes, Connect aliased from the owning system. The
+# app gates every remove job on approval (and snapshots evidence) before a runner can claim it.
+$DISPATCH['ad-remove-user']        = @{ Onboard = { param($job, $creds) Invoke-CtgADRemoveUser -User (Add-ClientContext $job) -Config $job.config -AdConnection (New-CtgAdConnection $creds) } }
+$DISPATCH['ad-correct-user']       = @{ Onboard = { param($job, $creds) Invoke-CtgADCorrectUser -User (Get-CtgLookupUser $job) -Config $job.config -AdConnection (New-CtgAdConnection $creds) } }
+$DISPATCH['m365-remove-user']      = @{ Connect = $DISPATCH['m365'].Connect; Onboard = { param($job, $creds) Invoke-CtgM365RemoveUser -User $job.payload -Config $job.config } }
+$DISPATCH['m365-correct-user']     = @{ Connect = $DISPATCH['m365'].Connect; Onboard = { param($job, $creds) Invoke-CtgM365CorrectUser -User (Get-CtgLookupUser $job) -Config $job.config } }
+$DISPATCH['exchange-correct-user'] = @{ Connect = $DISPATCH['exchange'].Connect; Onboard = { param($job, $creds) Invoke-CtgExchangeCorrectAddress -User (Get-CtgLookupUser $job) -Config $job.config } }
+$DISPATCH['google-remove-user']    = @{ Connect = $DISPATCH['google-workspace'].Connect; Onboard = { param($job, $creds) Invoke-CtgGoogleRemoveUser -User $job.payload -Config $job.config } }
+$DISPATCH['google-correct-user']   = @{ Connect = $DISPATCH['google-workspace'].Connect; Onboard = { param($job, $creds) Invoke-CtgGoogleCorrectUser -User (Get-CtgLookupUser $job) -Config $job.config } }
+foreach ($k in 'ad-remove-user', 'ad-correct-user', 'm365-remove-user', 'm365-correct-user', 'exchange-correct-user', 'google-remove-user', 'google-correct-user') { $DISPATCH[$k].Offboard = $DISPATCH[$k].Onboard }
+
 # Ad-hoc "force Spanning sync" (browser automation): dispatched on demand from a case's Spanning step
 # to make Spanning discover a just-created M365 user NOW (the Spanning API has no sync endpoint). Rides
 # the Spanning line's brokered secret; no Connect lane (the browser flow does its own portal login).
@@ -1880,8 +1893,10 @@ $script:ConnectedTenant = @{}
 # ConnectedTenant['m365'] still == A's key, SKIPS Connect, and provisions/offboards A's user inside
 # B's tenant. Whenever a shared session is (re)bound, forget the SIBLING keys so they reconnect.
 $script:ConnectionGroups = @{
-    graph  = @('m365', 'entra', 'm365-password-reset', 'tap', 'notify')
-    google = @('google-workspace', 'google-password-reset')
+    graph  = @('m365', 'entra', 'm365-password-reset', 'tap', 'notify', 'm365-remove-user', 'm365-correct-user')
+    google = @('google-workspace', 'google-password-reset', 'google-remove-user', 'google-correct-user')
+    # FR #88: exchange-correct-user reuses the Exchange Online session (process-wide), like the resets above reuse theirs.
+    exchange = @('exchange', 'exchange-correct-user')
 }
 
 # The other systemKeys that share an ambient connection with this one ('' when it owns its session).
@@ -1964,6 +1979,19 @@ function Add-ClientContext {
     if ($u -and -not $u.PSObject.Properties['PrimaryDomain']) {
         $u | Add-Member -NotePropertyName PrimaryDomain -NotePropertyValue $Job.client.primaryDomain -Force
     }
+    $u
+}
+
+# FR #88: a "Correct user" job finds the account by the identity it had BEFORE the correction — the app
+# updates the case's payload to the corrected names/email when it dispatches, and stamps the old ones on
+# config.previousIdentity. Overlay those onto a copy of the payload (the case payload itself is untouched).
+function Get-CtgLookupUser {
+    param($Job)
+    $u = [pscustomobject]@{}
+    if ($Job.payload) { foreach ($p in $Job.payload.PSObject.Properties) { $u | Add-Member -NotePropertyName $p.Name -NotePropertyValue $p.Value -Force } }
+    $prev = Get-CtgProp $Job.config 'previousIdentity'
+    if ($prev) { foreach ($p in $prev.PSObject.Properties) { if ($null -ne $p.Value -and "$($p.Value)" -ne '') { $u | Add-Member -NotePropertyName $p.Name -NotePropertyValue $p.Value -Force } } }
+    if ($Job.client -and -not $u.PSObject.Properties['PrimaryDomain']) { $u | Add-Member -NotePropertyName PrimaryDomain -NotePropertyValue $Job.client.primaryDomain -Force }
     $u
 }
 

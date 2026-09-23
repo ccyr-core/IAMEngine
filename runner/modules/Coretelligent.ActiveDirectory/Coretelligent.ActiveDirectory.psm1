@@ -1102,6 +1102,108 @@ function Get-CtgAdCaseUser {
     return $u
 }
 
+# ── FR #88: correct or remove a user THIS engine created ───────────────────────────────────────────
+# Both are ad-hoc jobs dispatched from an onboard case (never planned), and both find the account the
+# way the onboard left it: by sAMAccountName, then UPN.
+
+# Remove (hard delete) a user the onboard created — e.g. the hire fell through. Identity is matched on
+# sam/UPN ONLY: the display-name fallback other ad-hoc steps use could, on a unique-but-wrong match,
+# delete a different person, and a delete can't be taken back. Group memberships are captured first as
+# evidence. -Recursive removes child objects (e.g. ActiveSync device containers) that would otherwise
+# block the delete. Not found = already removed (the idempotent re-run).
+function Invoke-CtgADRemoveUser {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)][pscustomobject]$User,
+        [Parameter(Mandatory)][pscustomobject]$Config,
+        [hashtable]$AdConnection = @{}
+    )
+    $actions = [System.Collections.Generic.List[string]]::new()
+    $sam = [string](Get-CtgProp $User 'SamAccountName')
+    $upn = [string](Get-CtgProp $User 'UserPrincipalName')
+    if (-not $sam -and -not $upn) { throw "no sAMAccountName or UPN on the case — refusing to look the user up by display name for a delete" }
+    $props = @('SamAccountName', 'DistinguishedName', 'MemberOf', 'UserPrincipalName')
+    $u = $null
+    if ($sam) { $u = Get-ADUser -Identity $sam -Properties $props -ErrorAction SilentlyContinue @AdConnection }
+    if (-not $u -and $upn) { $u = @(Get-ADUser -Filter "UserPrincipalName -eq '$($upn -replace "'", "''")'" -Properties $props -ErrorAction SilentlyContinue @AdConnection)[0] }
+    if (-not $u) {
+        $actions.Add("AD user not found ($(@($sam, $upn) | Where-Object { $_ } | Select-Object -First 1)) — nothing deleted (already removed, or renamed outside this case — check before assuming it is gone)")
+        return [pscustomobject]@{ System = 'active-directory'; Status = 'ok'; Actions = $actions.ToArray(); Evidence = @{ Groups = @() } }
+    }
+    $groups = @(@(Get-CtgProp $u 'MemberOf') | ForEach-Object { [string]$_ })
+    $actions.Add("captured $($groups.Count) group membership(s) as evidence")
+    if ($PSCmdlet.ShouldProcess([string]$u.DistinguishedName, "Delete AD user")) {
+        Remove-ADObject -Identity ([string]$u.DistinguishedName) -Recursive -Confirm:$false -ErrorAction Stop @AdConnection
+        $actions.Add("deleted AD user $([string]$u.SamAccountName) ($([string]$u.DistinguishedName))")
+    }
+    [pscustomobject]@{ System = 'active-directory'; Status = 'ok'; Sam = [string]$u.SamAccountName; Actions = $actions.ToArray(); Evidence = @{ Groups = $groups } }
+}
+
+# Correct a user the onboard created (a misspelled name, or a different username/email). Config:
+#   firstName / lastName / displayName — any subset; the CN follows the display name
+#   newUpn — the corrected UPN/email: sets UPN and mail, makes it the primary SMTP proxy address and
+#            keeps the old primary as an alias (so mail to the old address still arrives), and follows
+#            the sAMAccountName along only when it was the old UPN's local part (the client's pattern).
+# Idempotent: every write compares first. The cloud copy of a synced user follows through directory sync.
+function Invoke-CtgADCorrectUser {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)][pscustomobject]$User,
+        [Parameter(Mandatory)][pscustomobject]$Config,
+        [hashtable]$AdConnection = @{}
+    )
+    $actions = [System.Collections.Generic.List[string]]::new()
+    $props = @('SamAccountName', 'DistinguishedName', 'GivenName', 'Surname', 'DisplayName', 'UserPrincipalName', 'mail', 'proxyAddresses', 'Name')
+    $u = Get-CtgAdCaseUser -User $User -Properties $props -AdConnection $AdConnection
+    if (-not $u) { throw "AD user not found — nothing corrected (check the case's username/UPN)" }
+    $sam = [string]$u.SamAccountName
+    $first = [string](Get-CtgProp $Config 'firstName'); $last = [string](Get-CtgProp $Config 'lastName')
+    $display = [string](Get-CtgProp $Config 'displayName'); $newUpn = [string](Get-CtgProp $Config 'newUpn')
+
+    $set = @{}
+    if ($first -and $first -cne [string]$u.GivenName) { $set['GivenName'] = $first }
+    if ($last -and $last -cne [string]$u.Surname) { $set['Surname'] = $last }
+    if ($display -and $display -cne [string]$u.DisplayName) { $set['DisplayName'] = $display }
+    if ($set.Count -and $PSCmdlet.ShouldProcess($sam, "Set $($set.Keys -join ', ')")) {
+        Set-ADUser -Identity $sam @set -ErrorAction Stop @AdConnection
+        $actions.Add("updated $($set.Keys -join ', ')")
+    }
+    if ($display -and $display -cne [string]$u.Name -and $PSCmdlet.ShouldProcess([string]$u.DistinguishedName, "Rename to $display")) {
+        Rename-ADObject -Identity ([string]$u.DistinguishedName) -NewName $display -ErrorAction Stop @AdConnection
+        $actions.Add("renamed the AD object to '$display'")
+    }
+
+    if ($newUpn -and $newUpn -ine [string]$u.UserPrincipalName) {
+        $oldUpn = [string]$u.UserPrincipalName
+        $oldPrimary = [string](@(@(Get-CtgProp $u 'proxyAddresses') | Where-Object { ([string]$_) -cmatch '^SMTP:' }) | Select-Object -First 1)
+        $proxies = [System.Collections.Generic.List[string]]::new()
+        foreach ($p in @(Get-CtgProp $u 'proxyAddresses')) {
+            $s = [string]$p
+            if ($s -ieq "smtp:$newUpn") { continue }                                 # re-added as primary below
+            if ($s -cmatch '^SMTP:') { $proxies.Add('smtp:' + $s.Substring(5)) } else { $proxies.Add($s) }  # old primary -> alias
+        }
+        if (-not $oldPrimary -and ([string]$u.mail)) { $proxies.Add("smtp:$([string]$u.mail)") }
+        $proxies.Insert(0, "SMTP:$newUpn")
+        $replace = @{ proxyAddresses = [string[]]$proxies; mail = $newUpn }
+        $newSam = $null
+        $oldLocal = ($oldUpn -split '@')[0]
+        if ($oldLocal -and $sam -ieq $oldLocal) {
+            $candidate = (($newUpn -split '@')[0])
+            if ($candidate.Length -gt 20) { $candidate = $candidate.Substring(0, 20) }
+            if ($candidate -ine $sam) { $newSam = $candidate }
+        }
+        if ($PSCmdlet.ShouldProcess($sam, "Change UPN $oldUpn -> $newUpn")) {
+            $setArgs = @{ UserPrincipalName = $newUpn; Replace = $replace }
+            if ($newSam) { $setArgs["SamAccountName"] = $newSam }
+            Set-ADUser -Identity $sam @setArgs -ErrorAction Stop @AdConnection
+            $actions.Add("UPN and email changed $oldUpn -> $newUpn (the old address stays as an alias)")
+            if ($newSam) { $actions.Add("sAMAccountName changed $sam -> $newSam (it followed the old UPN's local part)") }
+        }
+    }
+    if ($actions.Count -eq 0) { $actions.Add("already correct — nothing to change") }
+    [pscustomobject]@{ System = 'active-directory'; Status = 'ok'; Sam = $sam; Actions = $actions.ToArray() }
+}
+
 function Invoke-CtgADConsistencyCheck {
     param(
         [Parameter(Mandatory)][pscustomobject]$User,
@@ -1372,4 +1474,4 @@ function Test-CtgAdOuCreateUserRight {
     }
 }
 
-Export-ModuleMember -Function Invoke-CtgADOnboarding, Invoke-CtgADOffboarding, Invoke-CtgADChange, Invoke-CtgADEmailWriteback, Confirm-CtgADEmailWriteback, Invoke-CtgADConsistencyCheck, Invoke-CtgADHardMatch, Invoke-CtgADPasswordReset, Set-CtgADAttributes, Get-CtgMirrorGroups, Test-CtgCondition, Resolve-CtgOuPath, Confirm-CtgAD, Test-CtgAdCreateUserAce, Get-CtgAdAccountSids, Test-CtgAdOuCreateUserRight
+Export-ModuleMember -Function Invoke-CtgADOnboarding, Invoke-CtgADRemoveUser, Invoke-CtgADCorrectUser, Invoke-CtgADOffboarding, Invoke-CtgADChange, Invoke-CtgADEmailWriteback, Confirm-CtgADEmailWriteback, Invoke-CtgADConsistencyCheck, Invoke-CtgADHardMatch, Invoke-CtgADPasswordReset, Set-CtgADAttributes, Get-CtgMirrorGroups, Test-CtgCondition, Resolve-CtgOuPath, Confirm-CtgAD, Test-CtgAdCreateUserAce, Get-CtgAdAccountSids, Test-CtgAdOuCreateUserRight

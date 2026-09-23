@@ -511,6 +511,58 @@ function Confirm-CtgGoogle {
 # generates the value (revealed once to the operator, then wiped) and injects it as
 # config.newPassword at claim; this executor only sets it — the plaintext must NEVER appear in the
 # result, actions, or an error.
+# ── FR #88: correct or remove a user THIS engine created (ad-hoc jobs from an onboard case) ─────────
+function Get-CtgGoogleCaseEmail {
+    param([pscustomobject]$User)
+    [string](@('UserPrincipalName', 'workEmail', 'email') | ForEach-Object { Get-CtgProp $User $_ } | Where-Object { ([string]$_) -match '@' } | Select-Object -First 1)
+}
+
+# Delete a Google user the onboard created. Google keeps a deleted user restorable for 20 days and the
+# Admin SDK has no call to purge it sooner — the result says so rather than implying it's gone for good.
+function Invoke-CtgGoogleRemoveUser {
+    [CmdletBinding(SupportsShouldProcess)]
+    param([Parameter(Mandatory)][pscustomobject]$User, [Parameter(Mandatory)][pscustomobject]$Config)
+    $actions = [System.Collections.Generic.List[string]]::new()
+    $email = Get-CtgGoogleCaseEmail $User
+    if (-not $email) { throw "no email/UPN on the case — refusing to guess which Google user to delete" }
+    $u = Get-CtgGoogleUser -Email $email
+    if (-not $u) { $actions.Add("Google user $email not found — nothing deleted (already removed, or renamed outside this case — check before assuming it is gone)") }
+    elseif ($PSCmdlet.ShouldProcess($email, "Delete Google user")) {
+        Invoke-CtgGoogleApi -Method DELETE -Path "/users/$email" | Out-Null
+        $actions.Add("deleted Google user $email (Google keeps it restorable for 20 days; there is no API to purge it sooner)")
+    }
+    [pscustomobject]@{ System = 'google-workspace'; Status = 'ok'; Actions = $actions.ToArray() }
+}
+
+# Correct names / primary email on a Google user. Renaming primaryEmail makes Google keep the old address
+# as an alias automatically, so mail to it still arrives.
+function Invoke-CtgGoogleCorrectUser {
+    [CmdletBinding(SupportsShouldProcess)]
+    param([Parameter(Mandatory)][pscustomobject]$User, [Parameter(Mandatory)][pscustomobject]$Config)
+    $actions = [System.Collections.Generic.List[string]]::new()
+    $email = Get-CtgGoogleCaseEmail $User
+    $newUpn = [string](Get-CtgProp $Config 'newUpn')
+    $u = $null
+    foreach ($id in @($email, $newUpn) | Where-Object { $_ }) { $u = Get-CtgGoogleUser -Email $id; if ($u) { break } }
+    if (-not $u) { throw "Google user not found for $email — nothing corrected" }
+    $current = [string](Get-CtgProp $u 'primaryEmail')
+    $name = Get-CtgProp $u 'name'
+    $body = @{}
+    $n = @{}
+    $first = [string](Get-CtgProp $Config 'firstName'); $last = [string](Get-CtgProp $Config 'lastName')
+    if ($first -and $first -cne [string](Get-CtgProp $name 'givenName')) { $n['givenName'] = $first }
+    if ($last -and $last -cne [string](Get-CtgProp $name 'familyName')) { $n['familyName'] = $last }
+    if ($n.Count) { $body['name'] = $n }
+    if ($newUpn -and $newUpn -ine $current) { $body['primaryEmail'] = $newUpn }
+    if ($body.Count -eq 0) { $actions.Add("already correct — nothing to change") }
+    elseif ($PSCmdlet.ShouldProcess($current, "Update $($body.Keys -join ', ')")) {
+        Invoke-CtgGoogleApi -Method PUT -Path "/users/$current" -Body $body | Out-Null
+        if ($n.Count) { $actions.Add("updated name ($($n.Keys -join ', '))") }
+        if ($body['primaryEmail']) { $actions.Add("primary email changed $current -> $newUpn (Google keeps the old address as an alias)") }
+    }
+    [pscustomobject]@{ System = 'google-workspace'; Status = 'ok'; Actions = $actions.ToArray() }
+}
+
 function Invoke-CtgGooglePasswordReset {
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -749,4 +801,4 @@ function Invoke-CtgGoogleDwdGrant {
     throw "domain-wide delegation grant could not be confirmed — $err$ev"
 }
 
-Export-ModuleMember -Function Connect-CtgGoogle, Get-CtgGoogleSessionScopes, Get-CtgGoogleCustomer, Invoke-CtgGoogleApi, Get-CtgGoogleUser, Get-CtgGoogleUserGroups, Invoke-CtgGoogleOnboarding, Invoke-CtgGoogleOffboarding, Confirm-CtgGoogle, Invoke-CtgGooglePasswordReset, Invoke-CtgGoogleChange, Invoke-CtgGoogleOAuthSignin, Invoke-CtgGoogleDwdGrant
+Export-ModuleMember -Function Connect-CtgGoogle, Invoke-CtgGoogleRemoveUser, Invoke-CtgGoogleCorrectUser, Get-CtgGoogleSessionScopes, Get-CtgGoogleCustomer, Invoke-CtgGoogleApi, Get-CtgGoogleUser, Get-CtgGoogleUserGroups, Invoke-CtgGoogleOnboarding, Invoke-CtgGoogleOffboarding, Confirm-CtgGoogle, Invoke-CtgGooglePasswordReset, Invoke-CtgGoogleChange, Invoke-CtgGoogleOAuthSignin, Invoke-CtgGoogleDwdGrant

@@ -2840,6 +2840,75 @@ function Invoke-CtgEntraTap {
 # Operator-dispatched "Generate random password" from a case's M365/Entra line. The APP generates the
 # value (revealed once to the operator, then wiped) and injects it as config.newPassword at claim;
 # this executor only sets it — the plaintext must NEVER appear in the result, actions, or an error.
+# ── FR #88: correct or remove a user THIS engine created (ad-hoc jobs from an onboard case) ─────────
+# A user synced from AD is AD's to change: the AD step does it and directory sync carries it here, so
+# both functions leave a synced user alone and say so.
+
+# The exact UPN the onboard created — from the case, never a display-name search (see the AD remove).
+function Get-CtgCaseUpnExact {
+    param([pscustomobject]$User)
+    [string](@('UserPrincipalName', 'workEmail', 'email') | ForEach-Object { Get-CtgProp $User $_ } | Where-Object { ([string]$_) -match '@' } | Select-Object -First 1)
+}
+
+# Hard-delete a cloud-mastered user: delete, then permanently purge from Deleted users (Graph keeps a
+# deleted user restorable for 30 days otherwise). Licences are released by the delete. The purge can
+# briefly 404 while the delete propagates, so it retries for up to ~30 s before warning.
+function Invoke-CtgM365RemoveUser {
+    [CmdletBinding(SupportsShouldProcess)]
+    param([Parameter(Mandatory)][pscustomobject]$User, [Parameter(Mandatory)][pscustomobject]$Config)
+    $actions = [System.Collections.Generic.List[string]]::new()
+    $upn = Get-CtgCaseUpnExact $User
+    if (-not $upn) { throw "no UPN/email on the case — refusing to look the user up by display name for a delete" }
+    $u = Get-MgUser -UserId $upn -Property 'id,userPrincipalName,onPremisesSyncEnabled' -ErrorAction SilentlyContinue
+    if (-not $u) {
+        $actions.Add("Entra user $upn not found — nothing deleted (already removed, or renamed outside this case — check before assuming it is gone)")
+        return [pscustomobject]@{ System = 'm365'; Status = 'ok'; Actions = $actions.ToArray() }
+    }
+    if ((Get-CtgProp $u 'OnPremisesSyncEnabled') -eq $true) {
+        $actions.Add("$upn is synced from AD — the AD step deletes it and directory sync removes the cloud copy (Microsoft then keeps it in Deleted users for 30 days; purge it there if it must go at once)")
+        return [pscustomobject]@{ System = 'm365'; Status = 'ok'; Actions = $actions.ToArray() }
+    }
+    if ($PSCmdlet.ShouldProcess($upn, "Delete and permanently purge")) {
+        Remove-MgUser -UserId $u.Id -ErrorAction Stop
+        $actions.Add("deleted Entra user $upn (licences released)")
+        $purged = $false
+        for ($i = 0; $i -lt 6 -and -not $purged; $i++) {
+            try { Remove-MgDirectoryDeletedItem -DirectoryObjectId $u.Id -ErrorAction Stop; $purged = $true }
+            catch { if ($i -lt 5) { Start-Sleep -Seconds 5 } }
+        }
+        if ($purged) { $actions.Add("permanently purged $upn from Deleted users") }
+        else { $actions.Add("WARN $upn was deleted but not yet purged from Deleted users — purge it in Entra -> Deleted users, or re-run this step") }
+    }
+    [pscustomobject]@{ System = 'm365'; Status = 'ok'; Actions = $actions.ToArray() }
+}
+
+# Correct names / UPN on a cloud-mastered user. Config: firstName, lastName, displayName, newUpn.
+# The mailbox's primary address is Exchange's to change (Invoke-CtgExchangeCorrectAddress).
+function Invoke-CtgM365CorrectUser {
+    [CmdletBinding(SupportsShouldProcess)]
+    param([Parameter(Mandatory)][pscustomobject]$User, [Parameter(Mandatory)][pscustomobject]$Config)
+    $actions = [System.Collections.Generic.List[string]]::new()
+    $upn = Get-CtgCaseUpnExact $User
+    if (-not $upn) { throw "no UPN/email on the case — can't find the user to correct" }
+    $u = Get-MgUser -UserId $upn -Property 'id,userPrincipalName,givenName,surname,displayName,onPremisesSyncEnabled' -ErrorAction SilentlyContinue
+    if (-not $u) { throw "Entra user $upn not found — nothing corrected" }
+    if ((Get-CtgProp $u 'OnPremisesSyncEnabled') -eq $true) {
+        $actions.Add("$upn is synced from AD — the AD step makes the change and directory sync carries it to Entra")
+        return [pscustomobject]@{ System = 'm365'; Status = 'ok'; Actions = $actions.ToArray() }
+    }
+    $body = @{}
+    foreach ($pair in @(@('firstName', 'GivenName', 'givenName'), @('lastName', 'Surname', 'surname'), @('displayName', 'DisplayName', 'displayName'), @('newUpn', 'UserPrincipalName', 'userPrincipalName'))) {
+        $want = [string](Get-CtgProp $Config $pair[0])
+        if ($want -and $want -cne [string](Get-CtgProp $u $pair[1])) { $body[$pair[2]] = $want }
+    }
+    if ($body.Count -eq 0) { $actions.Add("already correct — nothing to change") }
+    elseif ($PSCmdlet.ShouldProcess($upn, "Update $($body.Keys -join ', ')")) {
+        Update-MgUser -UserId $u.Id -BodyParameter $body -ErrorAction Stop
+        $actions.Add("updated $($body.Keys -join ', ')$(if ($body['userPrincipalName']) { " ($upn -> $($body['userPrincipalName']))" })")
+    }
+    [pscustomobject]@{ System = 'm365'; Status = 'ok'; Actions = $actions.ToArray() }
+}
+
 function Invoke-CtgM365PasswordReset {
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -3059,4 +3128,4 @@ function Get-CtgAppCredentialExpiry {
     @{ expiresAt = $pick.UtcDateTime.ToString('o'); note = '' }
 }
 
-Export-ModuleMember -Function Connect-CtgM365, New-CtgCompliantPassword, Resolve-CtgSkuId, Set-CtgSeatAwareLicense, Invoke-CtgM365CloudMirror, Resolve-CtgM365Upn, Resolve-CtgEntraUser, Get-CtgM365UserDevices, Invoke-CtgM365Onboarding, Invoke-CtgM365Offboarding, Invoke-CtgM365Change, Confirm-CtgM365, Invoke-CtgEntraTap, Invoke-CtgM365PasswordReset, Get-CtgAppCredentialExpiry, Get-CtgGraphError, Get-CtgProxyAddressConflict, Get-CtgUserDrive, Invoke-CtgEntraDeviceCode
+Export-ModuleMember -Function Connect-CtgM365, Invoke-CtgM365RemoveUser, Invoke-CtgM365CorrectUser, New-CtgCompliantPassword, Resolve-CtgSkuId, Set-CtgSeatAwareLicense, Invoke-CtgM365CloudMirror, Resolve-CtgM365Upn, Resolve-CtgEntraUser, Get-CtgM365UserDevices, Invoke-CtgM365Onboarding, Invoke-CtgM365Offboarding, Invoke-CtgM365Change, Confirm-CtgM365, Invoke-CtgEntraTap, Invoke-CtgM365PasswordReset, Get-CtgAppCredentialExpiry, Get-CtgGraphError, Get-CtgProxyAddressConflict, Get-CtgUserDrive, Invoke-CtgEntraDeviceCode

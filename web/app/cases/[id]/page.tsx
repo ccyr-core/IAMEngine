@@ -27,6 +27,7 @@ import { caseEffectiveDate } from "@/lib/cases/schedule";
 import { IntakePanel } from "../_components/intake-panel";
 import { hasStartedJobs } from "@/lib/cases/job-status";
 import { isMilestoneCase } from "@/lib/eggs/occasions";
+import { REMOVE_USER_WINDOW_DAYS } from "@/lib/jobs/user-adhoc";
 import { pickResetSourceJob } from "@/lib/jobs/password-reset";
 
 export const dynamic = "force-dynamic";
@@ -100,6 +101,18 @@ export default async function CaseDetailPage({ params }: { params: { id: string 
   const scheduledForIso = caseMeta?.scheduledFor?.toISOString() ?? null;
   // The case's effective date string — the ScheduleButton computes its suggested time from this in
   // the BROWSER (so "08:00" / "+5 min" land in the operator's timezone, not the server's).
+  // FR #88: correct / remove the user this onboard created — offered once a directory step has run
+  // (there's an account to act on), to roles that run cases. Remove only within the recent window.
+  const userFix = c.action === "onboard" && !c.dryRun && canRevealPassword
+    && c.jobs.some((j) => ["active-directory", "m365", "entra", "google-workspace"].includes(j.systemKey) && j.status === "succeeded")
+    ? {
+        current: {
+          firstName: String(c.payload.firstName ?? ""), lastName: String(c.payload.lastName ?? ""),
+          displayName: String(c.payload.displayName ?? ""), email: String(c.payload.userPrincipalName ?? c.payload.workEmail ?? ""),
+        },
+        canRemove: Date.now() - c.createdAt.getTime() <= REMOVE_USER_WINDOW_DAYS * 86_400_000,
+      }
+    : null;
   const effectiveDate = caseEffectiveDate(c.action, c.payload, c.subject);
 
   // Multi-domain clients: the domains this case may onboard under + the persisted per-case pick.
@@ -174,6 +187,7 @@ export default async function CaseDetailPage({ params }: { params: { id: string 
           resetSourceSystemName={resetSourceJob?.systemName ?? null}
           canResetPassword={canRevealPassword}
           domain={domainInfo}
+          userFix={userFix}
         />
       </div>
       {paused && (

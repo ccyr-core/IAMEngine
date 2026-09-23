@@ -482,6 +482,36 @@ function Set-CtgMailboxRegional {
 # Dynamic distribution groups are computed, not assignable, so they're not returned/handled. Runs in
 # the exchange lane (which already has the EXO session) AFTER the mailbox lands, so the new user is a
 # valid recipient. Idempotent; returns an actions array.
+# FR #88: move a cloud mailbox's PRIMARY address to the corrected email. -WindowsEmailAddress makes it
+# the primary SMTP address and Exchange keeps the old primary as an alias, so mail to the old address
+# still lands. A directory-synced mailbox is AD's (its proxyAddresses come from the AD step) — left alone.
+function Invoke-CtgExchangeCorrectAddress {
+    [CmdletBinding(SupportsShouldProcess)]
+    param([Parameter(Mandatory)][pscustomobject]$User, [Parameter(Mandatory)][pscustomobject]$Config)
+    $actions = [System.Collections.Generic.List[string]]::new()
+    $newUpn = [string](Get-CtgProp $Config 'newUpn')
+    if (-not $newUpn) {
+        $actions.Add("no email change on this correction — the mailbox address stays as it is")
+        return [pscustomobject]@{ System = 'exchange'; Status = 'ok'; Actions = $actions.ToArray() }
+    }
+    $old = [string](@('UserPrincipalName', 'workEmail', 'email') | ForEach-Object { Get-CtgProp $User $_ } | Where-Object { ([string]$_) -match '@' } | Select-Object -First 1)
+    # Either address resolves the mailbox (any proxy address does) — the old one before, the new one on a re-run.
+    $mbx = $null
+    foreach ($id in @($old, $newUpn) | Where-Object { $_ }) { $mbx = Get-Mailbox -Identity $id -ErrorAction SilentlyContinue; if ($mbx) { break } }
+    if (-not $mbx) { throw "mailbox not found for $old or $newUpn — address not changed" }
+    if ((Get-CtgProp $mbx 'IsDirSynced') -eq $true) {
+        $actions.Add("the mailbox is synced from AD — the AD step sets the new primary address and directory sync carries it")
+    }
+    elseif ([string](Get-CtgProp $mbx 'PrimarySmtpAddress') -ieq $newUpn) {
+        $actions.Add("primary address already $newUpn — no change")
+    }
+    elseif ($PSCmdlet.ShouldProcess([string]$mbx.Identity, "Set primary SMTP $newUpn")) {
+        Set-Mailbox -Identity $mbx.Identity -WindowsEmailAddress $newUpn -ErrorAction Stop
+        $actions.Add("primary email address changed to $newUpn (the old address stays as an alias)")
+    }
+    [pscustomobject]@{ System = 'exchange'; Status = 'ok'; Actions = $actions.ToArray() }
+}
+
 function Invoke-CtgExchangeDistListMirror {
     [CmdletBinding(SupportsShouldProcess)]
     param([Parameter(Mandatory)][string]$MirrorUser, [Parameter(Mandatory)][string]$NewUser)
@@ -1628,4 +1658,4 @@ function Invoke-CtgExchangeChange {
     [pscustomobject]@{ System = 'exchange'; Status = 'ok'; Actions = @($actions) }
 }
 
-Export-ModuleMember -Function Connect-CtgExchange, Disconnect-CtgExchange, Connect-CtgExchangeOnPrem, Get-CtgMailboxSizeGB, ConvertFrom-CtgMailboxSize, Format-CtgMailboxSize, Test-CtgConvertToShared, Test-CtgCloudMailboxShared, Test-CtgHideFromGal, Invoke-CtgExchangeOnboarding, Invoke-CtgExchangeHybridOnboard, Invoke-CtgExchangeCloudOnboard, Invoke-CtgExchangeNamedGroups, Invoke-CtgExchangeDistListMirror, Invoke-CtgExchangeSharedMailboxMirror, Invoke-CtgExchangeSharedMailboxMirrorBounded, Invoke-CtgExchangeDefaultMailboxAccess, Invoke-CtgExchangeMailboxAudit, Invoke-CtgExchangeCalendarReviewers, Invoke-CtgExchangeChange, Set-CtgMailboxRegional, Wait-CtgMailbox, Invoke-CtgExchangeOffboarding, Confirm-CtgExchange
+Export-ModuleMember -Function Connect-CtgExchange, Invoke-CtgExchangeCorrectAddress, Disconnect-CtgExchange, Connect-CtgExchangeOnPrem, Get-CtgMailboxSizeGB, ConvertFrom-CtgMailboxSize, Format-CtgMailboxSize, Test-CtgConvertToShared, Test-CtgCloudMailboxShared, Test-CtgHideFromGal, Invoke-CtgExchangeOnboarding, Invoke-CtgExchangeHybridOnboard, Invoke-CtgExchangeCloudOnboard, Invoke-CtgExchangeNamedGroups, Invoke-CtgExchangeDistListMirror, Invoke-CtgExchangeSharedMailboxMirror, Invoke-CtgExchangeSharedMailboxMirrorBounded, Invoke-CtgExchangeDefaultMailboxAccess, Invoke-CtgExchangeMailboxAudit, Invoke-CtgExchangeCalendarReviewers, Invoke-CtgExchangeChange, Set-CtgMailboxRegional, Wait-CtgMailbox, Invoke-CtgExchangeOffboarding, Confirm-CtgExchange

@@ -17,6 +17,7 @@ import { ScheduleButton } from "./schedule-button";
 import { PauseButton } from "./pause-button";
 import { CaseDomainSelect } from "./case-domain-select";
 import { ReplanButton } from "./replan-button";
+import { CorrectUserButton, RemoveUserButton, type UserIdentity } from "./user-fix-buttons";
 
 type DomainInfo = { options: string[]; defaultDomain: string | null; override: string | null };
 
@@ -34,6 +35,9 @@ type Props = {
   resetSourceSystemName: string | null;
   canResetPassword: boolean; // same case.dispatch-derived boolean as hasInitialPassword's reveal gate
   domain: DomainInfo | null; // onboard multi-domain clients only
+  // FR #88: correct / remove the user this onboard created (null = not offered: not an onboard, no step
+  // has run, or the viewer can't run cases). canRemove is false once the onboard is past its window.
+  userFix?: { current: UserIdentity; canRemove: boolean } | null;
 };
 
 export function CaseActionsMenu(props: Props) {
@@ -76,6 +80,8 @@ export function CaseActionsMenu(props: Props) {
           {action === "onboard" && domain && (
             <div className="case-actions-row"><CaseDomainSelect caseId={caseId} options={domain.options} defaultDomain={domain.defaultDomain} override={domain.override} started={started} /></div>
           )}
+          {props.userFix && <div className="case-actions-row"><CorrectUserButton caseId={caseId} current={props.userFix.current} /></div>}
+          {props.userFix?.canRemove && props.userFix.current.email && <div className="case-actions-row"><RemoveUserButton caseId={caseId} email={props.userFix.current.email} /></div>}
           <div className="actions-menu-sep" />
           <div className="case-actions-row">                                  <ReplanButton caseId={caseId} canReplan={true} started={started} /></div>
         </div>
