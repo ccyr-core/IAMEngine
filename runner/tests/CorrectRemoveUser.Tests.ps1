@@ -129,13 +129,14 @@ Describe 'Google correct / remove' {
 # nothing says WARN instead of reporting a clean success.
 Describe 'review fix: Remove searches every identity the case gave the user' {
     BeforeAll {
-        $script:Known = [pscustomobject]@{ knownIdentities = @(
+        # The case was created 2026-09-01; the account it made is from the 2nd.
+        $script:Known = [pscustomobject]@{ caseCreatedAt = '2026-09-01T12:00:00.000Z'; knownIdentities = @(
                 [pscustomobject]@{ SamAccountName = 'jsmyth'; UserPrincipalName = 'jsmyth@acme.com' },
                 [pscustomobject]@{ SamAccountName = 'jsmith'; UserPrincipalName = 'jsmith@acme.com' }) }
     }
     It 'AD: deletes the account under its CORRECTED name when the old one is gone' {
         Mock Get-ADUser -ModuleName Coretelligent.ActiveDirectory { $null }
-        Mock Get-ADUser -ModuleName Coretelligent.ActiveDirectory -ParameterFilter { $Identity -eq 'jsmith' } { [pscustomobject]@{ SamAccountName = 'jsmith'; DistinguishedName = 'CN=John Smith,DC=acme,DC=com'; MemberOf = @() } }
+        Mock Get-ADUser -ModuleName Coretelligent.ActiveDirectory -ParameterFilter { $Identity -eq 'jsmith' } { [pscustomobject]@{ SamAccountName = 'jsmith'; DistinguishedName = 'CN=John Smith,DC=acme,DC=com'; MemberOf = @(); whenCreated = [datetime]::new(2026, 9, 2, 9, 0, 0, [DateTimeKind]::Utc) } }
         Mock Remove-ADObject -ModuleName Coretelligent.ActiveDirectory { }
         $null = Invoke-CtgADRemoveUser -User $script:Case -Config $script:Known
         Should -Invoke Remove-ADObject -ModuleName Coretelligent.ActiveDirectory -Times 1 -Exactly -ParameterFilter { $Identity -eq 'CN=John Smith,DC=acme,DC=com' }
@@ -149,7 +150,7 @@ Describe 'review fix: Remove searches every identity the case gave the user' {
     }
     It 'M365: deletes the account under its corrected UPN when the old one is gone' {
         Mock Get-MgUser -ModuleName Coretelligent.M365 { $null }
-        Mock Get-MgUser -ModuleName Coretelligent.M365 -ParameterFilter { $UserId -eq 'jsmith@acme.com' } { [pscustomobject]@{ Id = 'u2'; UserPrincipalName = 'jsmith@acme.com'; OnPremisesSyncEnabled = $null } }
+        Mock Get-MgUser -ModuleName Coretelligent.M365 -ParameterFilter { $UserId -eq 'jsmith@acme.com' } { [pscustomobject]@{ Id = 'u2'; UserPrincipalName = 'jsmith@acme.com'; OnPremisesSyncEnabled = $null; CreatedDateTime = [datetime]::new(2026, 9, 2, 9, 0, 0, [DateTimeKind]::Utc) } }
         Mock Remove-MgUser -ModuleName Coretelligent.M365 { }
         Mock Remove-MgDirectoryDeletedItem -ModuleName Coretelligent.M365 { }
         $r = Invoke-CtgM365RemoveUser -User $script:Case -Config $script:Known
@@ -165,10 +166,76 @@ Describe 'review fix: Remove searches every identity the case gave the user' {
     }
     It 'Google: deletes the account under its corrected address, by its primary email' {
         Mock Get-CtgGoogleUser -ModuleName Coretelligent.GoogleWorkspace { $null }
-        Mock Get-CtgGoogleUser -ModuleName Coretelligent.GoogleWorkspace -ParameterFilter { $Email -eq 'jsmith@acme.com' } { [pscustomobject]@{ primaryEmail = 'jsmith@acme.com' } }
+        Mock Get-CtgGoogleUser -ModuleName Coretelligent.GoogleWorkspace -ParameterFilter { $Email -eq 'jsmith@acme.com' } { [pscustomobject]@{ primaryEmail = 'jsmith@acme.com'; creationTime = '2026-09-02T09:00:00.000Z' } }
         Mock Invoke-CtgGoogleApi -ModuleName Coretelligent.GoogleWorkspace { }
         $null = Invoke-CtgGoogleRemoveUser -User $script:Case -Config $script:Known
         Should -Invoke Invoke-CtgGoogleApi -ModuleName Coretelligent.GoogleWorkspace -Times 1 -Exactly -ParameterFilter { $Method -eq 'DELETE' -and $Path -eq '/users/jsmith@acme.com' }
+    }
+}
+
+# A fallback identity (an earlier/corrected name of this case) may since belong to SOMEONE ELSE. A match
+# found only under one is deleted only when it's provably this onboard's account; otherwise WARN, no delete.
+Describe 'review fix: a fallback-identity match must be provably this case''s account' {
+    BeforeAll {
+        $script:Known = [pscustomobject]@{ caseCreatedAt = '2026-09-01T12:00:00.000Z'; knownIdentities = @(
+                [pscustomobject]@{ SamAccountName = 'jsmyth'; UserPrincipalName = 'jsmyth@acme.com' },
+                [pscustomobject]@{ SamAccountName = 'jsmith'; UserPrincipalName = 'jsmith@acme.com' }) }
+        $script:Older = [datetime]::new(2024, 3, 1, 0, 0, 0, [DateTimeKind]::Utc)
+    }
+    It 'AD: refuses a fallback match created before the case, naming it' {
+        Mock Get-ADUser -ModuleName Coretelligent.ActiveDirectory { $null }
+        Mock Get-ADUser -ModuleName Coretelligent.ActiveDirectory -ParameterFilter { $Identity -eq 'jsmith' } { [pscustomobject]@{ SamAccountName = 'jsmith'; DistinguishedName = 'CN=Jane Smith,DC=acme,DC=com'; MemberOf = @(); whenCreated = $script:Older } }
+        Mock Remove-ADObject -ModuleName Coretelligent.ActiveDirectory { }
+        $r = Invoke-CtgADRemoveUser -User $script:Case -Config $script:Known
+        Should -Invoke Remove-ADObject -ModuleName Coretelligent.ActiveDirectory -Times 0 -Exactly
+        ($r.Actions -join ' ') | Should -Match '^WARN matched AD user jsmith \(CN=Jane Smith'
+    }
+    It 'AD: refuses a fallback match when the case creation time is unknown' {
+        Mock Get-ADUser -ModuleName Coretelligent.ActiveDirectory { $null }
+        Mock Get-ADUser -ModuleName Coretelligent.ActiveDirectory -ParameterFilter { $Identity -eq 'jsmith' } { [pscustomobject]@{ SamAccountName = 'jsmith'; DistinguishedName = 'CN=Jane Smith,DC=acme,DC=com'; MemberOf = @(); whenCreated = [datetime]::UtcNow } }
+        Mock Remove-ADObject -ModuleName Coretelligent.ActiveDirectory { }
+        $null = Invoke-CtgADRemoveUser -User $script:Case -Config ([pscustomobject]@{ knownIdentities = $script:Known.knownIdentities })
+        Should -Invoke Remove-ADObject -ModuleName Coretelligent.ActiveDirectory -Times 0 -Exactly
+    }
+    It 'AD: a match under the CURRENT identity is deleted as before, whatever its age' {
+        Mock Get-ADUser -ModuleName Coretelligent.ActiveDirectory { [pscustomobject]@{ SamAccountName = 'jsmyth'; DistinguishedName = 'CN=John Smyth,DC=acme,DC=com'; MemberOf = @(); whenCreated = $script:Older } }
+        Mock Remove-ADObject -ModuleName Coretelligent.ActiveDirectory { }
+        $null = Invoke-CtgADRemoveUser -User $script:Case -Config $script:Known
+        Should -Invoke Remove-ADObject -ModuleName Coretelligent.ActiveDirectory -Times 1 -Exactly
+    }
+    It 'M365: refuses a fallback match created before the case' {
+        Mock Get-MgUser -ModuleName Coretelligent.M365 { $null }
+        Mock Get-MgUser -ModuleName Coretelligent.M365 -ParameterFilter { $UserId -eq 'jsmith@acme.com' } { [pscustomobject]@{ Id = 'other'; UserPrincipalName = 'jsmith@acme.com'; OnPremisesSyncEnabled = $null; CreatedDateTime = $script:Older } }
+        Mock Remove-MgUser -ModuleName Coretelligent.M365 { }
+        $r = Invoke-CtgM365RemoveUser -User $script:Case -Config $script:Known
+        Should -Invoke Remove-MgUser -ModuleName Coretelligent.M365 -Times 0 -Exactly
+        ($r.Actions -join ' ') | Should -Match '^WARN matched Entra user jsmith@acme\.com'
+    }
+    It 'M365: the Entra id the onboard reported decides — a different object is refused even if new' {
+        Mock Get-MgUser -ModuleName Coretelligent.M365 { $null }
+        Mock Get-MgUser -ModuleName Coretelligent.M365 -ParameterFilter { $UserId -eq 'jsmith@acme.com' } { [pscustomobject]@{ Id = 'other'; UserPrincipalName = 'jsmith@acme.com'; OnPremisesSyncEnabled = $null; CreatedDateTime = [datetime]::UtcNow } }
+        Mock Remove-MgUser -ModuleName Coretelligent.M365 { }
+        $cfg = [pscustomobject]@{ caseCreatedAt = $script:Known.caseCreatedAt; entraUserId = 'ours'; knownIdentities = $script:Known.knownIdentities }
+        $r = Invoke-CtgM365RemoveUser -User $script:Case -Config $cfg
+        Should -Invoke Remove-MgUser -ModuleName Coretelligent.M365 -Times 0 -Exactly
+        ($r.Actions -join ' ') | Should -Match "isn't the one this onboard created \(ours\)"
+    }
+    It 'M365: ...and the matching Entra id is deleted even when its creation time is unknown' {
+        Mock Get-MgUser -ModuleName Coretelligent.M365 { $null }
+        Mock Get-MgUser -ModuleName Coretelligent.M365 -ParameterFilter { $UserId -eq 'jsmith@acme.com' } { [pscustomobject]@{ Id = 'ours'; UserPrincipalName = 'jsmith@acme.com'; OnPremisesSyncEnabled = $null } }
+        Mock Remove-MgUser -ModuleName Coretelligent.M365 { }
+        Mock Remove-MgDirectoryDeletedItem -ModuleName Coretelligent.M365 { }
+        $cfg = [pscustomobject]@{ caseCreatedAt = $script:Known.caseCreatedAt; entraUserId = 'ours'; knownIdentities = $script:Known.knownIdentities }
+        $null = Invoke-CtgM365RemoveUser -User $script:Case -Config $cfg
+        Should -Invoke Remove-MgUser -ModuleName Coretelligent.M365 -Times 1 -Exactly -ParameterFilter { $UserId -eq 'ours' }
+    }
+    It 'Google: refuses a fallback match created before the case' {
+        Mock Get-CtgGoogleUser -ModuleName Coretelligent.GoogleWorkspace { $null }
+        Mock Get-CtgGoogleUser -ModuleName Coretelligent.GoogleWorkspace -ParameterFilter { $Email -eq 'jsmith@acme.com' } { [pscustomobject]@{ primaryEmail = 'jsmith@acme.com'; creationTime = '2024-03-01T00:00:00.000Z' } }
+        Mock Invoke-CtgGoogleApi -ModuleName Coretelligent.GoogleWorkspace { }
+        $r = Invoke-CtgGoogleRemoveUser -User $script:Case -Config $script:Known
+        Should -Invoke Invoke-CtgGoogleApi -ModuleName Coretelligent.GoogleWorkspace -Times 0 -Exactly
+        ($r.Actions -join ' ') | Should -Match '^WARN matched Google user jsmith@acme\.com'
     }
 }
 

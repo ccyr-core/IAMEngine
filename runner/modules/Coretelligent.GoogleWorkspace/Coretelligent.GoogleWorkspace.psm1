@@ -517,6 +517,15 @@ function Get-CtgGoogleCaseEmail {
     [string](@('UserPrincipalName', 'workEmail', 'email') | ForEach-Object { Get-CtgProp $User $_ } | Where-Object { ([string]$_) -match '@' } | Select-Object -First 1)
 }
 
+# Was an account created no earlier than the case (5 min of clock-skew slack)? $false whenever either
+# side is missing or unreadable — the answer has to be PROVABLY yes before a fallback match is deleted.
+function Test-CtgCreatedSinceCase {
+    param($Created, $Since)
+    if (-not $Created -or -not $Since) { return $false }
+    $toUtc = { param($v) if ($v -is [datetime]) { $v.ToUniversalTime() } elseif ($v -is [DateTimeOffset]) { $v.UtcDateTime } else { [DateTimeOffset]::Parse([string]$v, [Globalization.CultureInfo]::InvariantCulture).UtcDateTime } }
+    try { (& $toUtc $Created) -ge (& $toUtc $Since).AddMinutes(-5) } catch { $false }
+}
+
 # Delete a Google user the onboard created. Google keeps a deleted user restorable for 20 days and the
 # Admin SDK has no call to purge it sooner — the result says so rather than implying it's gone for good.
 function Invoke-CtgGoogleRemoveUser {
@@ -528,9 +537,16 @@ function Invoke-CtgGoogleRemoveUser {
     $emails = @(@(Get-CtgGoogleCaseEmail $User) + @(@(Get-CtgProp $Config 'knownIdentities') | ForEach-Object { if ($_) { Get-CtgProp $_ 'UserPrincipalName' } }) |
         ForEach-Object { [string]$_ } | Where-Object { $_ -match '@' } | Select-Object -Unique)
     if ($emails.Count -eq 0) { throw "no email/UPN on the case — refusing to guess which Google user to delete" }
-    $u = $null
-    foreach ($e in $emails) { $u = Get-CtgGoogleUser -Email $e; if ($u) { break } }
+    $u = $null; $matchedBy = $null
+    foreach ($e in $emails) { $u = Get-CtgGoogleUser -Email $e; if ($u) { $matchedBy = $e; break } }
     $email = if ($u -and (Get-CtgProp $u 'primaryEmail')) { [string](Get-CtgProp $u 'primaryEmail') } else { $emails[0] }
+    # Matched under an OLD/corrected address, not the case's current one: that address may since belong
+    # to someone else. Delete only if the account provably post-dates this case (creationTime >= caseCreatedAt).
+    $caseEmail = Get-CtgGoogleCaseEmail $User
+    if ($u -and -not ($caseEmail -and $matchedBy -ieq $caseEmail) -and -not (Test-CtgCreatedSinceCase (Get-CtgProp $u 'creationTime') (Get-CtgProp $Config 'caseCreatedAt'))) {
+        $actions.Add("WARN matched Google user $email under an earlier address of this case, but it was created $(Get-CtgProp $u 'creationTime') — before this case ($(Get-CtgProp $Config 'caseCreatedAt')), or when can't be told — so it can't be proven to be the account this onboard made. Nothing deleted: check it in the Google admin console")
+        return [pscustomobject]@{ System = 'google-workspace'; Status = 'ok'; Actions = $actions.ToArray() }
+    }
     if (-not $u) { $actions.Add("WARN Google user not found under any address this case gave it ($($emails -join ', ')) — nothing deleted. Already removed, or renamed outside this case: check before assuming it is gone") }
     elseif ($PSCmdlet.ShouldProcess($email, "Delete Google user")) {
         Invoke-CtgGoogleApi -Method DELETE -Path "/users/$email" | Out-Null

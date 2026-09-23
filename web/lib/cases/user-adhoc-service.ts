@@ -19,6 +19,7 @@ import {
   identityOf, correctedPayload, knownIdentities, type UserCorrection,
 } from "../jobs/user-adhoc";
 import { adUpnFor } from "../profiles/ad-domain";
+import { jobResultEnvelope } from "../jobs/job-result";
 import { resolveActor, type ActorInput } from "../auth/actor";
 
 export type UserAdhocResult =
@@ -45,7 +46,7 @@ export async function dispatchUserAdhoc(
     select: {
       action: true, createdAt: true, dryRun: true, clientId: true, payload: true,
       client: { select: { backbone: true, identity: true } },
-      jobs: { select: { id: true, systemKey: true, status: true, request: true } },
+      jobs: { select: { id: true, systemKey: true, status: true, request: true, result: true } },
     },
   });
   if (!c) return { ok: false, status: 404, error: "case not found" };
@@ -89,7 +90,19 @@ export async function dispatchUserAdhoc(
   const adNow = c.client ? adUpnFor(payload, c.client) : null;
 
   const configFor = (targetKey: string): Record<string, unknown> => {
-    if (kind === "remove") return { knownIdentities: known };
+    // A remove may find the account under an EARLIER identity of this case — a name that could since
+    // belong to someone else. The runner deletes such a fallback match only when it is provably this
+    // onboard's account: the Entra object id the m365 step reported, else created no earlier than the case.
+    if (kind === "remove") {
+      const cfg: Record<string, unknown> = { knownIdentities: known, caseCreatedAt: c.createdAt.toISOString() };
+      if (targetKey === "m365-remove-user") {
+        const src = sources.get(targetKey);
+        const res = (src ? jobResultEnvelope(src.result) : null) as Record<string, unknown> | null;
+        const id = res?.UserId ?? res?.userId;
+        if (typeof id === "string" && id) cfg.entraUserId = id;
+      }
+      return cfg;
+    }
     const newSam = correction?.email ? identityOf(correctedPayload(payload, correction)).SamAccountName : null;
     const cfg: Record<string, unknown> = {
       correctionId, correction, firstName: correction?.firstName, lastName: correction?.lastName, displayName: correction?.displayName,

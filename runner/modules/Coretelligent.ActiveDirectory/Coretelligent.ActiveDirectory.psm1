@@ -1112,23 +1112,33 @@ function Get-CtgAdCaseUser {
 function Get-CtgAdCaseIdentities {
     param([pscustomobject]$User, [pscustomobject]$Config)
     $out = [System.Collections.Generic.List[object]]::new()
-    $add = { param($s, $u) $s = [string]$s; $u = [string]$u; if ($s -or $u) { $out.Add([pscustomobject]@{ Sam = $s; Upn = $u }) } }
-    & $add (Get-CtgProp $User 'SamAccountName') (Get-CtgProp $User 'UserPrincipalName')
-    foreach ($i in @(Get-CtgProp $Config 'knownIdentities')) { if ($i) { & $add (Get-CtgProp $i 'SamAccountName') (Get-CtgProp $i 'UserPrincipalName') } }
-    & $add (Get-CtgProp $Config 'newSam') (Get-CtgProp $Config 'newUpn')
+    $add = { param($s, $u, $cur) $s = [string]$s; $u = [string]$u; if ($s -or $u) { $out.Add([pscustomobject]@{ Sam = $s; Upn = $u; Current = [bool]$cur }) } }
+    & $add (Get-CtgProp $User 'SamAccountName') (Get-CtgProp $User 'UserPrincipalName') $true
+    foreach ($i in @(Get-CtgProp $Config 'knownIdentities')) { if ($i) { & $add (Get-CtgProp $i 'SamAccountName') (Get-CtgProp $i 'UserPrincipalName') $false } }
+    & $add (Get-CtgProp $Config 'newSam') (Get-CtgProp $Config 'newUpn') $false
     $out.ToArray()
 }
 
-# The first AD account matching any of those identities, by sam then UPN — never by display name.
+# The first AD account matching any of those identities, by sam then UPN — never by display name. The
+# match is tagged CtgMatchedCurrent: $true only when it came from the case's CURRENT identity.
 function Find-CtgAdUserByIdentities {
     param([object[]]$Identities, [string[]]$Properties, [hashtable]$AdConnection = @{})
     foreach ($id in $Identities) {
         $u = $null
         if ($id.Sam) { try { $u = Get-ADUser -Identity $id.Sam -Properties $Properties -ErrorAction SilentlyContinue @AdConnection } catch { $u = $null } }
         if (-not $u -and $id.Upn) { $u = @(Get-ADUser -Filter "UserPrincipalName -eq '$($id.Upn -replace "'", "''")'" -Properties $Properties -ErrorAction SilentlyContinue @AdConnection)[0] }
-        if ($u) { return $u }
+        if ($u) { $u | Add-Member -NotePropertyName CtgMatchedCurrent -NotePropertyValue ([bool]$id.Current) -Force; return $u }
     }
     $null
+}
+
+# Was an account created no earlier than the case (5 min of clock-skew slack)? $false whenever either
+# side is missing or unreadable — the answer has to be PROVABLY yes before a fallback match is deleted.
+function Test-CtgCreatedSinceCase {
+    param($Created, $Since)
+    if (-not $Created -or -not $Since) { return $false }
+    $toUtc = { param($v) if ($v -is [datetime]) { $v.ToUniversalTime() } elseif ($v -is [DateTimeOffset]) { $v.UtcDateTime } else { [DateTimeOffset]::Parse([string]$v, [Globalization.CultureInfo]::InvariantCulture).UtcDateTime } }
+    try { (& $toUtc $Created) -ge (& $toUtc $Since).AddMinutes(-5) } catch { $false }
 }
 
 # Remove (hard delete) a user the onboard created — e.g. the hire fell through. Identity is matched on
@@ -1148,11 +1158,17 @@ function Invoke-CtgADRemoveUser {
     $actions = [System.Collections.Generic.List[string]]::new()
     $ids = @(Get-CtgAdCaseIdentities -User $User -Config $Config)
     if ($ids.Count -eq 0) { throw "no sAMAccountName or UPN on the case — refusing to look the user up by display name for a delete" }
-    $props = @('SamAccountName', 'DistinguishedName', 'MemberOf', 'UserPrincipalName')
+    $props = @('SamAccountName', 'DistinguishedName', 'MemberOf', 'UserPrincipalName', 'whenCreated')
     $u = Find-CtgAdUserByIdentities -Identities $ids -Properties $props -AdConnection $AdConnection
     if (-not $u) {
         $tried = @($ids | ForEach-Object { @($_.Sam, $_.Upn) } | Where-Object { $_ } | Select-Object -Unique) -join ', '
         $actions.Add("WARN AD user not found under any identity this case gave it ($tried) — nothing deleted. Already removed, or renamed outside this case: check AD before assuming it is gone")
+        return [pscustomobject]@{ System = 'active-directory'; Status = 'ok'; Actions = $actions.ToArray(); Evidence = @{ Groups = @() } }
+    }
+    # Matched under an OLD/corrected identity, not the case's current one: that name may since belong to
+    # someone else. Delete only if the account provably post-dates this case (whenCreated >= caseCreatedAt).
+    if (-not $u.CtgMatchedCurrent -and -not (Test-CtgCreatedSinceCase (Get-CtgProp $u 'whenCreated') (Get-CtgProp $Config 'caseCreatedAt'))) {
+        $actions.Add("WARN matched AD user $([string]$u.SamAccountName) ($([string]$u.DistinguishedName)) under an earlier identity of this case, but it was created $(Get-CtgProp $u 'whenCreated') — before this case ($(Get-CtgProp $Config 'caseCreatedAt')), or when can't be told — so it can't be proven to be the account this onboard made. Nothing deleted: check it in AD")
         return [pscustomobject]@{ System = 'active-directory'; Status = 'ok'; Actions = $actions.ToArray(); Evidence = @{ Groups = @() } }
     }
     $groups = @(@(Get-CtgProp $u 'MemberOf') | ForEach-Object { [string]$_ })

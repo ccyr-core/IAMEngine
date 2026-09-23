@@ -2865,9 +2865,18 @@ function Find-CtgM365UserByUpns {
     foreach ($upn in $Upns) {
         $u = $null
         try { $u = Get-MgUser -UserId $upn -Property $Property -ErrorAction SilentlyContinue } catch { $u = $null }
-        if ($u) { return $u }
+        if ($u) { $u | Add-Member -NotePropertyName CtgMatchedUpn -NotePropertyValue $upn -Force; return $u }
     }
     $null
+}
+
+# Was an account created no earlier than the case (5 min of clock-skew slack)? $false whenever either
+# side is missing or unreadable — the answer has to be PROVABLY yes before a fallback match is deleted.
+function Test-CtgCreatedSinceCase {
+    param($Created, $Since)
+    if (-not $Created -or -not $Since) { return $false }
+    $toUtc = { param($v) if ($v -is [datetime]) { $v.ToUniversalTime() } elseif ($v -is [DateTimeOffset]) { $v.UtcDateTime } else { [DateTimeOffset]::Parse([string]$v, [Globalization.CultureInfo]::InvariantCulture).UtcDateTime } }
+    try { (& $toUtc $Created) -ge (& $toUtc $Since).AddMinutes(-5) } catch { $false }
 }
 
 # Hard-delete a cloud-mastered user: delete, then permanently purge from Deleted users (Graph keeps a
@@ -2880,12 +2889,25 @@ function Invoke-CtgM365RemoveUser {
     $actions = [System.Collections.Generic.List[string]]::new()
     $upns = @(Get-CtgCaseUpnCandidates -User $User -Config $Config)
     if ($upns.Count -eq 0) { throw "no UPN/email on the case — refusing to look the user up by display name for a delete" }
-    $u = Find-CtgM365UserByUpns -Upns $upns -Property 'id,userPrincipalName,onPremisesSyncEnabled'
+    $u = Find-CtgM365UserByUpns -Upns $upns -Property 'id,userPrincipalName,onPremisesSyncEnabled,createdDateTime'
     if (-not $u) {
         $actions.Add("WARN Entra user not found under any identity this case gave it ($($upns -join ', ')) — nothing deleted. Already removed, or renamed outside this case: check Entra before assuming it is gone")
         return [pscustomobject]@{ System = 'm365'; Status = 'ok'; Actions = $actions.ToArray() }
     }
     $upn = [string](Get-CtgProp $u 'UserPrincipalName'); if (-not $upn) { $upn = $upns[0] }
+    # Matched under an OLD/corrected UPN, not the case's current one: that name may since belong to someone
+    # else. Delete only if it's provably the account this onboard made — the Entra object id the m365 step
+    # reported (config.entraUserId), else createdDateTime >= caseCreatedAt.
+    $caseUpn = Get-CtgCaseUpnExact $User
+    if (-not ($caseUpn -and [string]$u.CtgMatchedUpn -ieq $caseUpn)) {
+        $knownId = [string](Get-CtgProp $Config 'entraUserId')
+        $proven = if ($knownId) { [string]$u.Id -ieq $knownId } else { Test-CtgCreatedSinceCase (Get-CtgProp $u 'CreatedDateTime') (Get-CtgProp $Config 'caseCreatedAt') }
+        if (-not $proven) {
+            $why = if ($knownId) { "its object id $([string]$u.Id) isn't the one this onboard created ($knownId)" } else { "it was created $(Get-CtgProp $u 'CreatedDateTime') — before this case ($(Get-CtgProp $Config 'caseCreatedAt')), or when can't be told" }
+            $actions.Add("WARN matched Entra user $upn under an earlier identity of this case, but $why — so it can't be proven to be the account this onboard made. Nothing deleted: check it in Entra")
+            return [pscustomobject]@{ System = 'm365'; Status = 'ok'; Actions = $actions.ToArray() }
+        }
+    }
     if ((Get-CtgProp $u 'OnPremisesSyncEnabled') -eq $true) {
         $actions.Add("$upn is synced from AD — the AD step deletes it and directory sync removes the cloud copy (Microsoft then keeps it in Deleted users for 30 days; purge it there if it must go at once)")
         return [pscustomobject]@{ System = 'm365'; Status = 'ok'; Actions = $actions.ToArray() }

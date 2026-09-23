@@ -69,6 +69,19 @@ test("remove: one approval-gated, evidence-capturing job per system that RAN (m3
   }
 });
 
+test("remove jobs carry the case's creation time, and M365's the Entra id the onboard reported (fallback-match proof)", async () => {
+  const jobs = DEFAULT_JOBS();
+  (jobs[1] as J & { result?: unknown }).result = { System: "m365", UserId: "entra-obj-1" };
+  const { db, created } = stubDb({ jobs, ageDays: 2 });
+  await dispatchUserAdhoc(db, "case", "remove", "t");
+  for (const c of created) {
+    const at = Date.parse(String(cfgOf(c).caseCreatedAt));
+    assert.ok(Math.abs(at - (Date.now() - 2 * 86_400_000)) < 60_000, `${c.systemKey} carries caseCreatedAt`);
+  }
+  assert.equal(cfgOf(created.find((c) => c.systemKey === "m365-remove-user")!).entraUserId, "entra-obj-1");
+  assert.equal(cfgOf(created.find((c) => c.systemKey === "ad-remove-user")!).entraUserId, undefined);
+});
+
 test("remove is refused past the window and on anything but an onboard", async () => {
   assert.deepEqual(await dispatchUserAdhoc(stubDb({ ageDays: 45 }).db, "case", "remove", "t"), { ok: false, status: 409, error: '"Remove user" is only offered for 30 days after the onboard — offboard this user instead' });
   const off = await dispatchUserAdhoc(stubDb({ action: "offboard" }).db, "case", "remove", "t");
