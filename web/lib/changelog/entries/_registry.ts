@@ -116,6 +116,7 @@ export { entry as goliveReadinessPreflight } from "./golive-readiness-preflight"
 export { entry as googleBackbonePasswordReset } from "./google-backbone-password-reset";
 export { entry as googleCustomerIdValidation } from "./google-customer-id-validation";
 export { entry as googleDelineaFieldNamesMatchTemplate } from "./google-delinea-field-names-match-template";
+export { entry as googleDriveTransferRealApi } from "./google-drive-transfer-real-api";
 export { entry as googleKeyConverterTool } from "./google-key-converter-tool";
 export { entry as googleKeyFileUpload } from "./google-key-file-upload";
 export { entry as googleOauthDeheadUa } from "./google-oauth-dehead-ua";

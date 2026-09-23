@@ -17,6 +17,14 @@ $script:GoogleApiUrl = 'https://admin.googleapis.com/admin/directory/v1'
 $script:GoogleSecurityScope = 'https://www.googleapis.com/auth/admin.directory.user.security'
 $script:GoogleToken  = $null
 $script:GoogleScopes = @()
+# Drive ownership transfer uses the Data Transfer API, which needs its OWN scope. It is minted as a
+# separate, transfer-only token on demand (Get-CtgGoogleScopedToken), never added to the session's
+# scopes: delegation is all-or-nothing per exchange, so asking for it at connect would break every
+# domain that hasn't delegated it.
+$script:GoogleDataTransferUrl   = 'https://admin.googleapis.com/admin/datatransfer/v1'
+$script:GoogleDataTransferScope = 'https://www.googleapis.com/auth/admin.datatransfer'
+$script:GoogleMint = $null           # the connect's service-account signing inputs, for scoped tokens
+$script:GoogleScopedTokens = @{}     # scope -> @{ Token; Expires }
 
 function Get-CtgProp {
     param($Object, [Parameter(Mandatory)][string]$Name)
@@ -31,6 +39,39 @@ function Get-CtgProp {
 function ConvertTo-CtgBase64Url {
     param([Parameter(Mandatory)][byte[]]$Bytes)
     [Convert]::ToBase64String($Bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_')
+}
+
+# Mint an access token for exactly $scopeList (signed JWT -> OAuth exchange) with a service account.
+function New-CtgGoogleServiceToken {
+    param([string]$ClientEmail, [string]$Impersonate, [string]$PrivateKey, [string[]]$scopeList)
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $header = @{ alg = 'RS256'; typ = 'JWT' }
+    $claims = @{
+        iss   = $ClientEmail
+        sub   = $Impersonate                 # impersonated admin (domain-wide delegation)
+        scope = ($scopeList -join ' ')
+        aud   = 'https://oauth2.googleapis.com/token'
+        iat   = $now
+        exp   = $now + 3600
+    }
+    $enc = { param($o) ConvertTo-CtgBase64Url ([Text.Encoding]::UTF8.GetBytes(($o | ConvertTo-Json -Compress))) }
+    $signingInput = "$(& $enc $header).$(& $enc $claims)"
+
+    $rsa = [System.Security.Cryptography.RSA]::Create()
+    try {
+        $rsa.ImportFromPem($PrivateKey)      # service-account private_key is PKCS#8 PEM
+        $sigBytes = $rsa.SignData([Text.Encoding]::UTF8.GetBytes($signingInput),
+            [Security.Cryptography.HashAlgorithmName]::SHA256, [Security.Cryptography.RSASignaturePadding]::Pkcs1)
+    }
+    finally { $rsa.Dispose() }
+    $jwt = "$signingInput.$(ConvertTo-CtgBase64Url $sigBytes)"
+
+    $resp = Invoke-RestMethod -Method POST -Uri 'https://oauth2.googleapis.com/token' `
+        -ContentType 'application/x-www-form-urlencoded' `
+        -Body @{ grant_type = 'urn:ietf:params:oauth:grant-type:jwt-bearer'; assertion = $jwt }
+    $t = Get-CtgProp $resp 'access_token'
+    if (-not $t) { throw "Google token exchange returned no access_token — check the service account, domain-wide delegation scopes, and that '$Impersonate' is a super-admin." }
+    $t
 }
 
 function Connect-CtgGoogle {
@@ -66,42 +107,13 @@ function Connect-CtgGoogle {
     if ($PSCmdlet.ParameterSetName -eq 'Token') {
         $script:GoogleToken = $AccessToken
         $script:GoogleScopes = @()   # unknown — the caller minted the token
+        $script:GoogleMint = $null; $script:GoogleScopedTokens = @{}
         Write-Verbose "Google Workspace session established (token provided)."
         return
     }
 
     # Mint an access token for exactly $scopeList (signed JWT -> OAuth exchange).
-    $mint = {
-        param([string[]]$scopeList)
-        $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-        $header = @{ alg = 'RS256'; typ = 'JWT' }
-        $claims = @{
-            iss   = $ClientEmail
-            sub   = $Impersonate                 # impersonated admin (domain-wide delegation)
-            scope = ($scopeList -join ' ')
-            aud   = 'https://oauth2.googleapis.com/token'
-            iat   = $now
-            exp   = $now + 3600
-        }
-        $enc = { param($o) ConvertTo-CtgBase64Url ([Text.Encoding]::UTF8.GetBytes(($o | ConvertTo-Json -Compress))) }
-        $signingInput = "$(& $enc $header).$(& $enc $claims)"
-
-        $rsa = [System.Security.Cryptography.RSA]::Create()
-        try {
-            $rsa.ImportFromPem($PrivateKey)      # service-account private_key is PKCS#8 PEM
-            $sigBytes = $rsa.SignData([Text.Encoding]::UTF8.GetBytes($signingInput),
-                [Security.Cryptography.HashAlgorithmName]::SHA256, [Security.Cryptography.RSASignaturePadding]::Pkcs1)
-        }
-        finally { $rsa.Dispose() }
-        $jwt = "$signingInput.$(ConvertTo-CtgBase64Url $sigBytes)"
-
-        $resp = Invoke-RestMethod -Method POST -Uri 'https://oauth2.googleapis.com/token' `
-            -ContentType 'application/x-www-form-urlencoded' `
-            -Body @{ grant_type = 'urn:ietf:params:oauth:grant-type:jwt-bearer'; assertion = $jwt }
-        $t = Get-CtgProp $resp 'access_token'
-        if (-not $t) { throw "Google token exchange returned no access_token — check the service account, domain-wide delegation scopes, and that '$Impersonate' is a super-admin." }
-        $t
-    }
+    $mint = { param([string[]]$scopeList) New-CtgGoogleServiceToken -ClientEmail $ClientEmail -Impersonate $Impersonate -PrivateKey $PrivateKey -scopeList $scopeList }
 
     # Domain-wide delegation is all-or-nothing per request: the exchange FAILS OUTRIGHT if any single
     # requested scope isn't authorized for the service account's client ID. The offboard's "sign out
@@ -139,10 +151,56 @@ function Connect-CtgGoogle {
         }
     }
     $script:GoogleToken = $token
+    # Kept for the transfer-only token (Get-CtgGoogleScopedToken), for this session only.
+    $script:GoogleMint = @{ ClientEmail = $ClientEmail; Impersonate = $Impersonate; PrivateKey = $PrivateKey }
+    $script:GoogleScopedTokens = @{}
     # A minted token proves every scope it was minted with — record them so the connection test can
     # report them as verified, and so the offboard knows whether signOut is available at all.
     $script:GoogleScopes = @($granted)
     Write-Verbose "Google Workspace session established for $Impersonate (customer $CustomerId)."
+}
+
+function Get-CtgGoogleScopedToken {
+    # A token for exactly one extra scope, minted with the connect's service-account signer and cached
+    # for 50 minutes. Throws when the session was opened with a raw token (nothing to sign with) or the
+    # domain hasn't delegated the scope — the caller turns that into a clear follow-up.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Scope)
+    $c = $script:GoogleScopedTokens[$Scope]
+    if ($c -and $c.Expires -gt [DateTime]::UtcNow) { return $c.Token }
+    if (-not $script:GoogleMint) { throw "this Google session was opened with a ready-made token, so it can't mint the $Scope scope" }
+    try { $m = $script:GoogleMint; $t = New-CtgGoogleServiceToken -ClientEmail $m.ClientEmail -Impersonate $m.Impersonate -PrivateKey $m.PrivateKey -scopeList @($Scope) }
+    catch { throw "Google refused a token for $Scope — add it to the service account's domain-wide delegation (Admin console > Security > API controls). $($_.Exception.Message)" }
+    $script:GoogleScopedTokens[$Scope] = @{ Token = $t; Expires = [DateTime]::UtcNow.AddMinutes(50) }
+    $t
+}
+
+function Invoke-CtgGoogleDriveTransfer {
+    # Transfer a user's Drive files to another user via the Data Transfer API
+    # (POST admin/datatransfer/v1/transfers). It takes Google USER IDS, not emails, and the Drive
+    # application's id, which is looked up (GET /applications) rather than hardcoded. Returns the
+    # transfer resource. Throws with a readable reason on any failure — never reports success unseen.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$FromEmail, [Parameter(Mandatory)][string]$ToEmail)
+    $from = Get-CtgGoogleUser -Email $FromEmail
+    if (-not $from) { throw "the leaver $FromEmail was not found in Google" }
+    $to = Get-CtgGoogleUser -Email $ToEmail
+    if (-not $to) { throw "the transfer target $ToEmail was not found in Google" }
+    $tok = Get-CtgGoogleScopedToken -Scope $script:GoogleDataTransferScope
+    $apps = Invoke-CtgGoogleApi -Method GET -Path '/applications' -BaseUrl $script:GoogleDataTransferUrl -Token $tok -ThrowOn404
+    $drive = @(@(Get-CtgProp $apps 'applications') | Where-Object { $_ -and ([string](Get-CtgProp $_ 'name')) -match 'Drive' }) | Select-Object -First 1
+    if (-not $drive) { throw "the Data Transfer API lists no Drive application for this domain" }
+    $body = @{
+        oldOwnerUserId           = [string](Get-CtgProp $from 'id')
+        newOwnerUserId           = [string](Get-CtgProp $to 'id')
+        applicationDataTransfers = @(@{
+            applicationId            = [string](Get-CtgProp $drive 'id')
+            applicationTransferParams = @(@{ key = 'PRIVACY_LEVEL'; value = @('PRIVATE', 'SHARED') })
+        })
+    }
+    $r = Invoke-CtgGoogleApi -Method POST -Path '/transfers' -Body $body -BaseUrl $script:GoogleDataTransferUrl -Token $tok -ThrowOn404
+    if (-not $r) { throw "the Data Transfer API returned no transfer" }
+    $r
 }
 
 function Get-CtgGoogleSessionScopes {
@@ -169,12 +227,13 @@ function Invoke-CtgGoogleApi {
     # indistinguishable from a successful empty 204 and would read as "it worked". -ThrowOn404 opts
     # such calls out of the swallow.
     [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Method, [Parameter(Mandatory)][string]$Path, $Body, [switch]$ThrowOn404)
+    # -BaseUrl / -Token: another Google admin API on its own token (the Data Transfer API).
+    param([Parameter(Mandatory)][string]$Method, [Parameter(Mandatory)][string]$Path, $Body, [switch]$ThrowOn404, [string]$BaseUrl, [string]$Token)
     if (-not $script:GoogleToken) { throw "Call Connect-CtgGoogle first." }
     $p = @{
         Method      = $Method
-        Uri         = "$script:GoogleApiUrl$Path"
-        Headers     = @{ Authorization = "Bearer $script:GoogleToken" }
+        Uri         = "$(if ($BaseUrl) { $BaseUrl } else { $script:GoogleApiUrl })$Path"
+        Headers     = @{ Authorization = "Bearer $(if ($Token) { $Token } else { $script:GoogleToken })" }
         ContentType = 'application/json'
     }
     if ($Body) { $p.Body = ($Body | ConvertTo-Json -Depth 8) }
@@ -371,9 +430,20 @@ function Invoke-CtgGoogleOffboarding {
 
     # 4. On request: transfer Drive ownership to the delegate (only valid once moved out of Active Users).
     $transfer = Get-CtgProp $Config 'transferTarget'
+    # This used to POST /dataTransfer on the DIRECTORY API — not an endpoint at all. The 404 was
+    # swallowed by Invoke-CtgGoogleApi and the step still said "transferred", so no Drive was ever
+    # transferred. The real call is the Data Transfer API (Invoke-CtgGoogleDriveTransfer). Google runs a
+    # transfer in the background; this step REQUESTS it and says so. A transfer that can't be requested
+    # is a warning with the reason, and the rest of the offboard still runs.
     if ($transfer -and $PSCmdlet.ShouldProcess($email, "Transfer Drive to $transfer")) {
-        Invoke-CtgGoogleApi -Method POST -Path '/dataTransfer' -Body @{ oldOwnerUserId = $email; newOwnerUserId = $transfer } | Out-Null
-        $actions.Add("transferred Drive ownership to: $transfer")
+        try {
+            $t = Invoke-CtgGoogleDriveTransfer -FromEmail $email -ToEmail $transfer
+            $st = [string](Get-CtgProp $t 'overallTransferStatusCode')
+            $actions.Add("requested Drive ownership transfer to: $transfer (Google runs it in the background$(if ($st) { "; status: $st" }))")
+        }
+        catch {
+            $actions.Add("WARN Drive ownership was NOT transferred to $transfer — $($_.Exception.Message). Transfer it by hand in the Google Admin console (Account > Data transfer)")
+        }
     }
 
     # 4b. Hide from the directory / GAL (FR #21) — Google calls it "contact sharing".
