@@ -30,6 +30,7 @@ import { hasStartedJobs } from "@/lib/cases/job-status";
 import { isMilestoneCase } from "@/lib/eggs/occasions";
 import { pickResetSourceJob } from "@/lib/jobs/password-reset";
 import { loadCaseSteps } from "@/lib/cases/case-steps-service";
+import { clientDefaultPassword } from "@/lib/cases/default-password";
 
 export const dynamic = "force-dynamic";
 
@@ -84,7 +85,7 @@ export default async function CaseDetailPage({ params }: { params: { id: string 
   // Re-plan is always available: before dispatch it's a full re-plan; once started it runs
   // incrementally (kept steps survive, new/changed systems get fresh jobs).
   const started = hasStartedJobs(c.jobs);
-  const caseMeta = await db.caseRequest.findUnique({ where: { id: params.id }, select: { pausedAt: true, pausedReason: true, initialPassword: true, scheduledFor: true } });
+  const caseMeta = await db.caseRequest.findUnique({ where: { id: params.id }, select: { pausedAt: true, pausedReason: true, initialPassword: true, scheduledFor: true, clientId: true } });
   const paused = Boolean(caseMeta?.pausedAt);
   // Mirror the reveal route's guard (case.dispatch, no impersonation) so read-only roles don't see
   // a button the server will 403 — the route stays the real boundary.
@@ -94,6 +95,10 @@ export default async function CaseDetailPage({ params }: { params: { id: string 
   // FR #173 / #134: per-case step selection. Editable with the re-plan capability (the route's gate).
   const caseSteps = await loadCaseSteps(db, c.id);
   const canEditSteps = !authEnabled() || (!!acting.user && !acting.impersonating && can(acting.user.role, "case.plan"));
+  // FR #86: a client with a DEFAULT initial password (fixed, or a Delinea reference) — offer it on its
+  // onboards so the operator can send it on. Only whether one exists is read here; the value is fetched
+  // by the button through the audited, case.dispatch-gated route.
+  const hasDefaultPassword = c.action === "onboard" && canRevealPassword && !!caseMeta && Boolean(await clientDefaultPassword(db, caseMeta.clientId));
   // FR#31: offer "reset password" from the Actions menu even before any step has run (imported
   // cases pause on import, and the reset route already supports paused cases) — pick whichever
   // planned job the ad-hoc reset job should ride on. Excluded for dry runs: nothing in a dry-run
@@ -175,6 +180,7 @@ export default async function CaseDetailPage({ params }: { params: { id: string 
           effectiveDate={effectiveDate}
           showHardMatch={showHardMatch}
           hasInitialPassword={hasInitialPassword}
+          hasDefaultPassword={hasDefaultPassword}
           resetSourceJobId={resetSourceJobId}
           resetSourceSystemName={resetSourceJob?.systemName ?? null}
           canResetPassword={canRevealPassword}
