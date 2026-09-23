@@ -6,9 +6,9 @@
 import { buildPlanContext } from "./context";
 import { resolveSystemConfig } from "./resolve";
 import { evaluateLicenseRules } from "../m365/license-rules";
+import { withOffboardActions } from "../cases/offboard-actions";
 import { hideFromGalOptedOut, adLaneHidesViaAttribute, readHideFromGal } from "./hide-from-gal";
 import type { PlannedJob } from "../orchestrator";
-import { withOffboardActions } from "../cases/offboard-actions";
 
 type PlanClient = {
   backbone?: string | null;
