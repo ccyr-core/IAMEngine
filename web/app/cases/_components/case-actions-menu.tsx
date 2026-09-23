@@ -37,9 +37,10 @@ type Props = {
   domain: DomainInfo | null; // onboard multi-domain clients only
   // FR #88: correct / remove the user this onboard created (null = not offered: not an onboard, no step
   // has run, or the viewer can't run cases). canRemove is false once the onboard is past its window.
-  // canCorrect is false once a Remove has succeeded. removeConfirm / removeAccounts name the accounts
-  // the onboard actually created (which may be fallback usernames), not the payload's name.
-  userFix?: { current: UserIdentity; canCorrect: boolean; canRemove: boolean; removeConfirm: string; removeAccounts: string[] } | null;
+  // canCorrect is false once a Remove has deleted something. removeConfirm / removeAccounts name the
+  // accounts the onboard actually created (which may be fallback usernames), not the payload's name;
+  // removePreexisting names any that existed before the case (Remove is refused for those).
+  userFix?: { current: UserIdentity; canCorrect: boolean; canRemove: boolean; removeConfirm: string; removeAccounts: string[]; removePreexisting: string[] } | null;
 };
 
 export function CaseActionsMenu(props: Props) {
@@ -83,7 +84,7 @@ export function CaseActionsMenu(props: Props) {
             <div className="case-actions-row"><CaseDomainSelect caseId={caseId} options={domain.options} defaultDomain={domain.defaultDomain} override={domain.override} started={started} /></div>
           )}
           {props.userFix?.canCorrect && <div className="case-actions-row"><CorrectUserButton caseId={caseId} current={props.userFix.current} /></div>}
-          {props.userFix?.canRemove && props.userFix.removeConfirm && <div className="case-actions-row"><RemoveUserButton caseId={caseId} email={props.userFix.removeConfirm} accounts={props.userFix.removeAccounts} /></div>}
+          {props.userFix?.canRemove && props.userFix.removeConfirm && <div className="case-actions-row"><RemoveUserButton caseId={caseId} email={props.userFix.removeConfirm} accounts={props.userFix.removeAccounts} preexisting={props.userFix.removePreexisting} /></div>}
           <div className="actions-menu-sep" />
           <div className="case-actions-row">                                  <ReplanButton caseId={caseId} canReplan={true} started={started} /></div>
         </div>

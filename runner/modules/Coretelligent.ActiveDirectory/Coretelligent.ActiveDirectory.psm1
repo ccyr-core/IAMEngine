@@ -221,7 +221,7 @@ function Invoke-CtgADOnboarding {
     $sam = $null; $chosenUpn = $null; $existing = $null
     foreach ($pair in $candPairs) {
         $cand = $pair[0]; $candUpn = $pair[1]
-        $found = Get-ADUser -Filter "SamAccountName -eq '$cand'" -Properties GivenName, Surname, DisplayName -ErrorAction SilentlyContinue @AdConnection
+        $found = Get-ADUser -Filter "SamAccountName -eq '$cand'" -Properties GivenName, Surname, DisplayName, whenCreated -ErrorAction SilentlyContinue @AdConnection
         if (-not $found) { $sam = $cand; $chosenUpn = $candUpn; break }
         $fGiven = ([string](Get-CtgProp $found 'GivenName')).Trim()
         $fSur   = ([string](Get-CtgProp $found 'Surname')).Trim()
@@ -341,12 +341,12 @@ function Invoke-CtgADOnboarding {
         }
     }
 
-    # FR #88: report WHICH account this onboard created or adopted — the chosen (possibly fallback) name
-    # and its objectGUID — so a later Correct/Remove acts on exactly this account, never on whoever holds
+    # FR #88: report WHICH account this onboard created or adopted — the chosen (possibly fallback) name,
+    # its objectGUID, and whether it EXISTED already (Adopted + its creation date: Remove must not delete it) — so a later Correct/Remove acts on exactly this account, never on whoever holds
     # the payload's primary username. Best-effort: a read failure just leaves the id out.
     $objectGuid = $null
     try { $objectGuid = [string](Get-CtgProp (Get-ADUser -Identity $sam -Properties ObjectGUID -ErrorAction Stop @AdConnection) 'ObjectGUID') } catch { $objectGuid = $null }
-    [pscustomobject]@{ System = 'active-directory'; Status = 'ok'; Sam = $sam; Upn = $chosenUpn; ObjectGuid = $objectGuid; Ou = $ouPath; Actions = $actions.ToArray() }
+    [pscustomobject]@{ System = 'active-directory'; Status = 'ok'; Sam = $sam; Upn = $chosenUpn; ObjectGuid = $objectGuid; Adopted = [bool]$existing; AccountCreated = $(if ($existing) { Get-CtgProp $existing 'whenCreated' } else { $null }); Ou = $ouPath; Actions = $actions.ToArray() }
 }
 
 # Change/mover lane: apply a delta to an EXISTING AD user — add groups, remove groups (by name or
@@ -1130,13 +1130,23 @@ function Test-CtgCreatedSinceCase {
 # Resolve the AD account a correct/remove job may act on. Returns { User; Refused; Tried } — User is
 # $null when nothing (acceptable) was found; Refused explains a match that could not be proven ours.
 function Resolve-CtgAdCaseAccount {
-    param([pscustomobject]$User, [pscustomobject]$Config, [string[]]$Properties, [hashtable]$AdConnection = @{}, [switch]$IncludeNew)
+    param([pscustomobject]$User, [pscustomobject]$Config, [string[]]$Properties, [hashtable]$AdConnection = @{}, [switch]$IncludeNew, [switch]$Destructive)
     $props = @(@($Properties) + 'ObjectGUID', 'whenCreated' | Select-Object -Unique)
     $t = Get-CtgProp $Config 'target'
     $guid = [string](Get-CtgProp $t 'objectGuid')
+    $adopted = Get-CtgProp $t 'adopted'
+    # A delete never touches an account that EXISTED before this case (a rehire, an operator Adopt).
+    if ($Destructive -and $adopted -eq $true) {
+        return [pscustomobject]@{ User = $null; Tried = "$(@((Get-CtgProp $t 'sam'), $guid) | Where-Object { $_ } | Select-Object -First 1)"; Refused = "AD account $(@((Get-CtgProp $t 'sam'), $guid) | Where-Object { $_ } | Select-Object -First 1) existed before this case (the onboard adopted it) — it needs an offboard, not a Remove" }
+    }
     if ($guid) {
         $u = $null
         try { $u = Get-ADUser -Identity $guid -Properties $props -ErrorAction SilentlyContinue @AdConnection } catch { $u = $null }
+        # An onboard result from before the Adopted flag: the id proves WHICH account, not that this case
+        # created it — a delete also needs it to post-date the case.
+        if ($u -and $Destructive -and $adopted -ne $false -and -not (Test-CtgCreatedSinceCase (Get-CtgProp $u 'whenCreated') (Get-CtgProp $Config 'caseCreatedAt'))) {
+            return [pscustomobject]@{ User = $null; Tried = "objectGUID $guid"; Refused = "AD user $([string]$u.SamAccountName) ($([string]$u.DistinguishedName)) was created $(Get-CtgProp $u 'whenCreated') — before this case ($(Get-CtgProp $Config 'caseCreatedAt')), or when can't be told — and the onboard didn't record whether it created or adopted it, so it may be a pre-existing account (that needs an offboard)" }
+        }
         return [pscustomobject]@{ User = $u; Refused = $null; Tried = "objectGUID $guid" }
     }
     $ids = [System.Collections.Generic.List[object]]::new()
@@ -1175,24 +1185,26 @@ function Invoke-CtgADRemoveUser {
     )
     $actions = [System.Collections.Generic.List[string]]::new()
     $props = @('SamAccountName', 'DistinguishedName', 'MemberOf', 'UserPrincipalName')
-    $r = Resolve-CtgAdCaseAccount -User $User -Config $Config -Properties $props -AdConnection $AdConnection
+    $r = Resolve-CtgAdCaseAccount -User $User -Config $Config -Properties $props -AdConnection $AdConnection -Destructive
     if (-not $r.Tried) { throw "no sAMAccountName, UPN or objectGUID for the user — refusing to look the user up by display name for a delete" }
     if ($r.Refused) {
         $actions.Add("WARN $($r.Refused). Nothing deleted: check it in AD")
-        return [pscustomobject]@{ System = 'active-directory'; Status = 'ok'; Actions = $actions.ToArray(); Evidence = @{ Groups = @() } }
+        return [pscustomobject]@{ System = 'active-directory'; Status = 'ok'; Deleted = $false; Actions = $actions.ToArray(); Evidence = @{ Groups = @() } }
     }
     $u = $r.User
     if (-not $u) {
         $actions.Add("WARN AD user not found ($($r.Tried)) — nothing deleted. Already removed, or renamed outside this case: check AD before assuming it is gone")
-        return [pscustomobject]@{ System = 'active-directory'; Status = 'ok'; Actions = $actions.ToArray(); Evidence = @{ Groups = @() } }
+        return [pscustomobject]@{ System = 'active-directory'; Status = 'ok'; Deleted = $false; Actions = $actions.ToArray(); Evidence = @{ Groups = @() } }
     }
+    $deleted = $false
     $groups = @(@(Get-CtgProp $u 'MemberOf') | ForEach-Object { [string]$_ })
     $actions.Add("captured $($groups.Count) group membership(s) as evidence")
     if ($PSCmdlet.ShouldProcess([string]$u.DistinguishedName, "Delete AD user")) {
         Remove-ADObject -Identity ([string]$u.DistinguishedName) -Recursive -Confirm:$false -ErrorAction Stop @AdConnection
+        $deleted = $true
         $actions.Add("deleted AD user $([string]$u.SamAccountName) ($([string]$u.DistinguishedName))")
     }
-    [pscustomobject]@{ System = 'active-directory'; Status = 'ok'; Sam = [string]$u.SamAccountName; ObjectGuid = [string](Get-CtgProp $u 'ObjectGUID'); Actions = $actions.ToArray(); Evidence = @{ Groups = $groups; Account = "$([string]$u.SamAccountName) ($([string]$u.DistinguishedName))" } }
+    [pscustomobject]@{ System = 'active-directory'; Status = 'ok'; Deleted = $deleted; Sam = [string]$u.SamAccountName; ObjectGuid = [string](Get-CtgProp $u 'ObjectGUID'); Actions = $actions.ToArray(); Evidence = @{ Groups = $groups; Account = "$([string]$u.SamAccountName) ($([string]$u.DistinguishedName))" } }
 }
 
 # Correct a user the onboard created (a misspelled name, or a different username/email). Config:

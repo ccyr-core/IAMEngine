@@ -27,7 +27,7 @@ import { caseEffectiveDate } from "@/lib/cases/schedule";
 import { IntakePanel } from "../_components/intake-panel";
 import { hasStartedJobs } from "@/lib/cases/job-status";
 import { isMilestoneCase } from "@/lib/eggs/occasions";
-import { REMOVE_USER_WINDOW_DAYS, REMOVE_USER_SYSTEM_KEYS, removeConfirmKey, removalAccounts } from "@/lib/jobs/user-adhoc";
+import { REMOVE_USER_WINDOW_DAYS, removeConfirmKey, removalAccounts, preexistingAccounts, removeDeletedSomething } from "@/lib/jobs/user-adhoc";
 import { pickResetSourceJob } from "@/lib/jobs/password-reset";
 
 export const dynamic = "force-dynamic";
@@ -104,7 +104,7 @@ export default async function CaseDetailPage({ params }: { params: { id: string 
   // FR #88: correct / remove the user this onboard created — offered once a directory step has run
   // (there's an account to act on), to roles that run cases. Remove only within the recent window.
   // Remove names the accounts the onboard actually CREATED (possibly fallback usernames), and Correct
-  // is hidden once a Remove has succeeded (the server refuses it too).
+  // is hidden once a Remove has deleted something (the server refuses it too).
   const fixJobs = c.action === "onboard" && !c.dryRun && canRevealPassword
     && c.jobs.some((j) => ["active-directory", "m365", "entra", "google-workspace"].includes(j.systemKey) && j.status === "succeeded")
     ? await db.job.findMany({ where: { caseRequestId: c.id }, select: { systemKey: true, status: true, sequence: true, result: true } })
@@ -115,10 +115,11 @@ export default async function CaseDetailPage({ params }: { params: { id: string 
           firstName: String(c.payload.firstName ?? ""), lastName: String(c.payload.lastName ?? ""),
           displayName: String(c.payload.displayName ?? ""), email: String(c.payload.userPrincipalName ?? c.payload.workEmail ?? ""),
         },
-        canCorrect: !fixJobs.some((j) => REMOVE_USER_SYSTEM_KEYS.includes(j.systemKey) && j.status === "succeeded"),
+        canCorrect: !removeDeletedSomething(fixJobs),
         canRemove: Date.now() - c.createdAt.getTime() <= REMOVE_USER_WINDOW_DAYS * 86_400_000,
         removeConfirm: removeConfirmKey(fixJobs, c.payload),
         removeAccounts: removalAccounts(fixJobs, c.payload),
+        removePreexisting: preexistingAccounts(fixJobs, c.payload, c.createdAt),
       }
     : null;
   const effectiveDate = caseEffectiveDate(c.action, c.payload, c.subject);

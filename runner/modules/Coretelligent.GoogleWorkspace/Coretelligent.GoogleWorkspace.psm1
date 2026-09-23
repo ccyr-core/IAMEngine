@@ -309,7 +309,8 @@ function Invoke-CtgGoogleOnboarding {
         $actions.Add("created Google user: $email in $ou")
     }
     # FR #88: the Google user id of the account this onboard created or adopted, so a later Correct/Remove
-    # acts on exactly this account (not on whoever holds the payload's primary address).
+    # acts on exactly this account (not on whoever holds the payload's primary address). Adopted (+ its
+    # creationTime) marks an account that existed already — Remove must not delete it.
     $googleId = [string](Get-CtgProp $(if ($existing) { $existing } else { $created }) 'id')
 
     # Ensure OU (a pre-existing user may sit elsewhere) — idempotent.
@@ -328,7 +329,7 @@ function Invoke-CtgGoogleOnboarding {
         }
     }
 
-    [pscustomobject]@{ System = 'google-workspace'; Status = 'ok'; Email = $email; Id = $(if ($googleId) { $googleId } else { $null }); Ou = $ou; Actions = $actions.ToArray() }
+    [pscustomobject]@{ System = 'google-workspace'; Status = 'ok'; Email = $email; Id = $(if ($googleId) { $googleId } else { $null }); Adopted = [bool]$existing; AccountCreated = $(if ($existing) { Get-CtgProp $existing 'creationTime' } else { $null }); Ou = $ou; Actions = $actions.ToArray() }
 }
 
 function Invoke-CtgGoogleOffboarding {
@@ -537,11 +538,23 @@ function Test-CtgCreatedSinceCase {
 
 # Resolve the Google user a correct/remove job may act on: { User; Refused; Tried }.
 function Resolve-CtgGoogleCaseAccount {
-    param([pscustomobject]$User, [pscustomobject]$Config, [switch]$IncludeNew)
+    param([pscustomobject]$User, [pscustomobject]$Config, [switch]$IncludeNew, [switch]$Destructive)
     $t = Get-CtgProp $Config 'target'
     $id = [string](Get-CtgProp $t 'id')
+    $adopted = Get-CtgProp $t 'adopted'
+    # A delete never touches an account that EXISTED before this case (a rehire, an operator Adopt).
+    if ($Destructive -and $adopted -eq $true) {
+        $name = @((Get-CtgProp $t 'email'), $id) | Where-Object { $_ } | Select-Object -First 1
+        return [pscustomobject]@{ User = $null; Tried = [string]$name; Refused = "Google user $name existed before this case (the onboard adopted it) — it needs an offboard, not a Remove" }
+    }
     if ($id) {
-        return [pscustomobject]@{ User = (Get-CtgGoogleUser -Email $id); Refused = $null; Tried = "user id $id" }
+        $u = Get-CtgGoogleUser -Email $id
+        # An onboard result from before the Adopted flag: the id proves WHICH account, not that this case
+        # created it — a delete also needs it to post-date the case.
+        if ($u -and $Destructive -and $adopted -ne $false -and -not (Test-CtgCreatedSinceCase (Get-CtgProp $u 'creationTime') (Get-CtgProp $Config 'caseCreatedAt'))) {
+            return [pscustomobject]@{ User = $null; Tried = "user id $id"; Refused = "Google user $([string](Get-CtgProp $u 'primaryEmail')) was created $(Get-CtgProp $u 'creationTime') — before this case ($(Get-CtgProp $Config 'caseCreatedAt')), or when can't be told — and the onboard didn't record whether it created or adopted it, so it may be a pre-existing account (that needs an offboard)" }
+        }
+        return [pscustomobject]@{ User = $u; Refused = $null; Tried = "user id $id" }
     }
     $cands = [System.Collections.Generic.List[object]]::new()
     foreach ($pair in @(@((Get-CtgProp $t 'email'), 'target'), @((Get-CtgGoogleCaseEmail $User), 'case'), @($(if ($IncludeNew) { Get-CtgProp $Config 'newUpn' }), 'new'))) {
@@ -571,24 +584,26 @@ function Invoke-CtgGoogleRemoveUser {
     [CmdletBinding(SupportsShouldProcess)]
     param([Parameter(Mandatory)][pscustomobject]$User, [Parameter(Mandatory)][pscustomobject]$Config)
     $actions = [System.Collections.Generic.List[string]]::new()
-    $r = Resolve-CtgGoogleCaseAccount -User $User -Config $Config
+    $r = Resolve-CtgGoogleCaseAccount -User $User -Config $Config -Destructive
     if (-not $r.Tried) { throw "no email/UPN or user id for the user — refusing to guess which Google user to delete" }
     if ($r.Refused) {
         $actions.Add("WARN $($r.Refused). Nothing deleted: check it in the Google admin console")
-        return [pscustomobject]@{ System = 'google-workspace'; Status = 'ok'; Actions = $actions.ToArray() }
+        return [pscustomobject]@{ System = 'google-workspace'; Status = 'ok'; Deleted = $false; Actions = $actions.ToArray() }
     }
     $u = $r.User
     if (-not $u) {
         $actions.Add("WARN Google user not found ($($r.Tried)) — nothing deleted. Already removed, or renamed outside this case: check before assuming it is gone")
-        return [pscustomobject]@{ System = 'google-workspace'; Status = 'ok'; Actions = $actions.ToArray() }
+        return [pscustomobject]@{ System = 'google-workspace'; Status = 'ok'; Deleted = $false; Actions = $actions.ToArray() }
     }
     $email = [string](Get-CtgProp $u 'primaryEmail')
     $key = if ([string](Get-CtgProp $u 'id')) { [string](Get-CtgProp $u 'id') } else { $email }
+    $deleted = $false
     if ($PSCmdlet.ShouldProcess($email, "Delete Google user")) {
         Invoke-CtgGoogleApi -Method DELETE -Path "/users/$key" | Out-Null
+        $deleted = $true
         $actions.Add("deleted Google user $email (Google keeps it restorable for 20 days; there is no API to purge it sooner)")
     }
-    [pscustomobject]@{ System = 'google-workspace'; Status = 'ok'; Email = $email; Id = [string](Get-CtgProp $u 'id'); Actions = $actions.ToArray() }
+    [pscustomobject]@{ System = 'google-workspace'; Status = 'ok'; Deleted = $deleted; Email = $email; Id = [string](Get-CtgProp $u 'id'); Actions = $actions.ToArray() }
 }
 
 # Correct names / primary email on a Google user. Renaming primaryEmail makes Google keep the old address

@@ -21,6 +21,7 @@ import { insertStepSequence } from "../jobs/adhoc";
 import {
   REMOVE_USER_KEY, CORRECT_USER_KEY, REMOVE_USER_WINDOW_DAYS, USER_ADHOC_SYSTEM_KEYS, CORRECT_USER_SYSTEM_KEYS, REMOVE_USER_SYSTEM_KEYS,
   TARGET_SYSTEM_OF, identityOf, correctedPayload, resolveTarget, describeTarget, type UserCorrection,
+  preexistingAccounts, removeDeletedSomething, AD_USER_ADHOC_KEYS, userAdhocVersionExclusions, USER_ADHOC_MIN_RUNNER,
 } from "../jobs/user-adhoc";
 import { adUpnFor, STANDALONE } from "../profiles/ad-domain";
 import { resolveActor, type ActorInput } from "../auth/actor";
@@ -62,8 +63,9 @@ export async function dispatchUserAdhoc(
     return { ok: false, status: 409, error: `"Remove user" is only offered for ${REMOVE_USER_WINDOW_DAYS} days after the onboard — offboard this user instead` };
   }
   // M2: once the account has been removed there is nothing to correct — and a correction's fallback
-  // lookups must never land on whoever holds that name now.
-  if (kind === "correct" && c.jobs.some((j) => REMOVE_USER_SYSTEM_KEYS.includes(j.systemKey) && j.status === RAN)) {
+  // lookups must never land on whoever holds that name now. Only a Remove that actually DELETED
+  // something counts (round 3, N2): a refused / not-found remove leaves the account live.
+  if (kind === "correct" && removeDeletedSomething(c.jobs)) {
     return { ok: false, status: 409, error: "the user was removed on this case — there's no account left to correct" };
   }
   const map = kind === "remove" ? REMOVE_USER_KEY : CORRECT_USER_KEY;
@@ -91,6 +93,25 @@ export async function dispatchUserAdhoc(
   if (sources.size === 0) return { ok: false, status: 409, error: "no directory step on this case has run yet, so there's no account to act on" };
 
   const payload = (c.payload ?? {}) as Record<string, unknown>;
+  // Round 3 (N1): a Remove hard-deletes and purges. An account that existed before this case (a rehire
+  // adopted by the onboard, or an operator Adopt) holds someone's earlier history — it needs an offboard,
+  // never a Remove. Refuse the whole Remove, naming which systems, rather than delete half of it.
+  if (kind === "remove") {
+    const pre = preexistingAccounts(c.jobs, payload, c.createdAt);
+    if (pre.length) {
+      return { ok: false, status: 409, error: `"Remove user" deletes only accounts this case created, and these existed before it (a rehire or an adopted account) — offboard the user instead: ${pre.join("; ")}` };
+    }
+  }
+  // Round 3 (N3): the AD keys run on the client's own runner. One older than the correct/remove
+  // executors is never offered them, so the job would sit pending forever and block every later
+  // Correct/Remove on the case — refuse now and say what to update.
+  if ([...sources.keys()].some((k) => AD_USER_ADHOC_KEYS.includes(k))) {
+    const agents = await db.agent.findMany({ where: { clientId: c.clientId, enabled: true }, select: { name: true, semver: true } });
+    if (agents.length && agents.every((a) => userAdhocVersionExclusions(a.semver).length > 0)) {
+      const list = agents.map((a) => `${a.name} (${a.semver ?? "version unknown"})`).join(", ");
+      return { ok: false, status: 409, error: `the client's runner must be updated to ${USER_ADHOC_MIN_RUNNER} or later before it can ${kind === "remove" ? "remove" : "correct"} the AD account — ${list}` };
+    }
+  }
   const previousIdentity = identityOf(payload);
   const correctionId = kind === "correct" ? randomUUID() : null;
   const destructive = kind === "remove";
@@ -104,7 +125,7 @@ export async function dispatchUserAdhoc(
 
   const configFor = (targetKey: string): Record<string, unknown> => {
     const system = TARGET_SYSTEM_OF[targetKey];
-    const target = system ? resolveTarget(system, c.jobs) : null;
+    const target = system ? resolveTarget(system, c.jobs, c.createdAt) : null;
     if (kind === "remove") {
       return { target, caseCreatedAt, approvalTarget: system ? describeTarget(system, target, payload) : null };
     }

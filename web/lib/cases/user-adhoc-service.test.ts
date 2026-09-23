@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import type { PrismaClient } from "@prisma/client";
 import { dispatchUserAdhoc, commitUserCorrectionIfComplete, userAdhocRequeueCheck } from "./user-adhoc-service";
 import {
-  checkCorrection, resolveTarget, removeConfirmKey, removalAccounts, userAdhocVersionExclusions, userAdhocResultStatus, USER_ADHOC_SYSTEM_KEYS,
+  checkCorrection, resolveTarget, removeConfirmKey, removalAccounts, userAdhocVersionExclusions, userAdhocResultStatus, USER_ADHOC_SYSTEM_KEYS, preexistingOf, preexistingAccounts, removeDeletedSomething,
 } from "../jobs/user-adhoc";
 import { adUpnFor } from "../profiles/ad-domain";
 import { buildRunReport } from "./run-report";
@@ -20,7 +20,7 @@ const DEFAULT_JOBS = (): J[] => [
 ];
 
 // An in-memory case: dispatched jobs join the case's job list, so a later dispatch / commit sees them.
-function stubDb(opts: { action?: string; ageDays?: number; jobs?: J[]; payload?: Record<string, unknown>; client?: { backbone: string | null; identity: unknown }; busyInTx?: string } = {}) {
+function stubDb(opts: { action?: string; ageDays?: number; jobs?: J[]; payload?: Record<string, unknown>; client?: { backbone: string | null; identity: unknown }; busyInTx?: string; agents?: Array<{ name: string; semver: string | null }> } = {}) {
   const created: Array<Record<string, unknown>> = [];
   const updates: Array<Record<string, unknown>> = [];
   const raw: string[] = [];
@@ -67,6 +67,7 @@ function stubDb(opts: { action?: string; ageDays?: number; jobs?: J[]; payload?:
       findUnique: async (args: { where: { id: string } }) => { const j = state.jobs.find((x) => x.id === args.where.id); return j ? { caseRequestId: "case", ...j } : null; },
       findMany: async () => state.jobs,
     },
+    agent: { findMany: async () => opts.agents ?? [{ name: "dc01", semver: "1.127.0" }] },
     $transaction: async (fn: (t: typeof tx) => unknown) => fn(tx),
     auditLog: { create: async () => ({}) },
   } as unknown as PrismaClient;
@@ -329,4 +330,51 @@ test("checkCorrection trims, requires something, and rejects a malformed email",
   assert.deepEqual(checkCorrection({ firstName: " Jon ", email: "" }), { ok: true, value: { firstName: "Jon" } });
   assert.equal(checkCorrection({}).ok, false);
   assert.equal(checkCorrection({ email: "not-an-email" }).ok, false);
+});
+
+// ── Round 3 ────────────────────────────────────────────────────────────────────────────────────────
+test("N1: Remove is refused when an account existed before the case (rehire / adopted) — and names it", async () => {
+  const jobs = DEFAULT_JOBS();
+  jobs[1].result = { System: "m365", UserId: "entra-1", Upn: "jmsmyth@acme.com", OnPremSyncEnabled: false, Adopted: true, AccountCreated: "2019-03-01T12:00:00Z" };
+  const { db, created } = stubDb({ jobs });
+  const r = await dispatchUserAdhoc(db, "case", "remove", "t");
+  assert.equal(r.ok, false);
+  assert.match(String((r as { error: string }).error), /offboard the user instead: Microsoft 365: jmsmyth@acme\.com \(id entra-1\)/);
+  assert.equal(created.length, 0, "nothing queued — not even the AD half");
+});
+
+test("N1: an onboard RE-RUN that found this case's own account (Adopted, created after the case) may still be removed", async () => {
+  const jobs = DEFAULT_JOBS();
+  const { db, created, createdAt } = stubDb({ jobs });
+  jobs[1].result = { System: "m365", UserId: "entra-1", Upn: "jmsmyth@acme.com", OnPremSyncEnabled: false, Adopted: true, AccountCreated: new Date(createdAt.getTime() + 60_000).toISOString() };
+  const r = await dispatchUserAdhoc(db, "case", "remove", "t");
+  assert.equal(r.ok, true);
+  assert.equal(cfgOf(created[1]).target && (cfgOf(created[1]).target as { adopted?: boolean }).adopted, false);
+});
+
+test("N1: Adopted with no readable creation date counts as pre-existing; a result from before the flag leaves it to the runner", () => {
+  assert.equal(preexistingOf(true, null, new Date()), true);
+  assert.equal(preexistingOf(false, null, new Date()), false);
+  assert.equal(preexistingOf(undefined, "2019-01-01T00:00:00Z", new Date()), null);
+  assert.deepEqual(preexistingAccounts(DEFAULT_JOBS(), {}, new Date()), []);
+});
+
+test("N2: a Remove that deleted nothing (refused / not found) does not block Correct; one that deleted does", async () => {
+  const noop = [...DEFAULT_JOBS(), { id: "r1", systemKey: "ad-remove-user", status: "succeeded", request: {}, result: { Status: "ok", Deleted: false } }];
+  assert.equal(removeDeletedSomething(noop), false);
+  const { db } = stubDb({ jobs: noop });
+  const r = await dispatchUserAdhoc(db, "case", "correct", "t", { firstName: "Jon" });
+  assert.equal(r.ok, true);
+  const legacy = [...DEFAULT_JOBS(), { id: "r1", systemKey: "ad-remove-user", status: "succeeded", request: {}, result: { Status: "ok" } }];
+  assert.equal(removeDeletedSomething(legacy), true, "a result from before the flag counts as deleted");
+});
+
+test("N3: an AD correct/remove is refused when every runner of the client is older than 1.127.0", async () => {
+  const { db, created } = stubDb({ agents: [{ name: "dc01", semver: "1.126.4" }, { name: "dc02", semver: null }] });
+  const r = await dispatchUserAdhoc(db, "case", "remove", "t");
+  assert.equal(r.ok, false);
+  assert.match(String((r as { error: string }).error), /updated to 1\.127\.0 or later .* dc01 \(1\.126\.4\), dc02 \(version unknown\)/);
+  assert.equal(created.length, 0);
+  const ok = stubDb({ agents: [{ name: "dc01", semver: "1.126.4" }, { name: "dc02", semver: "1.127.0" }] });
+  assert.equal((await dispatchUserAdhoc(ok.db, "case", "remove", "t")).ok, true);
 });

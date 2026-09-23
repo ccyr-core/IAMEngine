@@ -105,6 +105,12 @@ export type TargetSystem = "active-directory" | "m365" | "google-workspace";
 export type SystemTarget = {
   sam?: string | null; upn?: string | null; email?: string | null;
   id?: string | null; objectGuid?: string | null; syncEnabled?: boolean | null;
+  // What the onboard said about the account: Adopted = it EXISTED when the onboard ran, AccountCreated
+  // = that account's creation date. Raw here; preexistingOf() turns it into "existed before this case".
+  adoptedRaw?: boolean | null; accountCreated?: string | null;
+  // Set by resolveTarget(…, caseCreatedAt): true = the account existed before this case (a rehire, an
+  // operator Adopt) — Remove must refuse it; false = this case created it; null = the onboard didn't say.
+  adopted?: boolean | null;
   source: "onboard" | "correction";
 };
 
@@ -134,6 +140,14 @@ const envelope = (r: unknown): Record<string, unknown> => {
 const pickStr = (o: Record<string, unknown>, ...keys: string[]) => { for (const k of keys) { const s = str(o[k]); if (s) return s; } return null; };
 
 function targetFromResult(system: TargetSystem, r: Record<string, unknown>, source: SystemTarget["source"]): SystemTarget | null {
+  const t = targetFields(system, r, source);
+  // Only carried when the onboard reported them (a result from before the flag has neither).
+  if (t && typeof r.Adopted === "boolean") t.adoptedRaw = r.Adopted;
+  const accountCreated = t ? pickStr(r, "AccountCreated") : null;
+  if (t && accountCreated) t.accountCreated = accountCreated;
+  return t;
+}
+function targetFields(system: TargetSystem, r: Record<string, unknown>, source: SystemTarget["source"]): SystemTarget | null {
   if (system === "active-directory") {
     const t = { sam: pickStr(r, "Sam", "sam"), upn: pickStr(r, "Upn", "upn"), objectGuid: pickStr(r, "ObjectGuid", "objectGuid"), source };
     return t.sam || t.upn || t.objectGuid ? t : null;
@@ -147,20 +161,42 @@ function targetFromResult(system: TargetSystem, r: Record<string, unknown>, sour
   return t.email || t.id ? t : null;
 }
 
-export function resolveTarget(system: TargetSystem, jobs: JobWithResult[]): SystemTarget | null {
+// Round 3 (N1): did the account exist before THIS case? The onboard says Adopted whenever the account
+// already existed when it ran — which includes a re-run of this very case finding the account its first
+// run created. So Adopted alone isn't "pre-existing": the account's creation date decides. Adopted with
+// a creation date no earlier than the case (5 min clock slack) = this case made it; Adopted with an
+// earlier or unreadable date = a rehire / operator Adopt. Not Adopted = created fresh. Unknown (an
+// onboard result from before the flag) = null, and the runner applies its own creation-date check.
+const CREATED_SLACK_MS = 5 * 60_000;
+export function preexistingOf(adoptedRaw: boolean | null | undefined, accountCreated: string | null | undefined, caseCreatedAt: Date | string): boolean | null {
+  if (adoptedRaw === false) return false;
+  if (adoptedRaw !== true) return null;
+  const created = accountCreated ? Date.parse(accountCreated) : NaN;
+  const since = new Date(caseCreatedAt).getTime();
+  if (Number.isNaN(created) || Number.isNaN(since)) return true;
+  return created < since - CREATED_SLACK_MS;
+}
+
+export function resolveTarget(system: TargetSystem, jobs: JobWithResult[], caseCreatedAt?: Date | string): SystemTarget | null {
   const bySeq = [...jobs].sort((a, b) => (b.sequence ?? 0) - (a.sequence ?? 0));
   const corr = bySeq.find((j) => j.systemKey === CORRECT_KEY_OF[system] && j.status === "succeeded");
   const fromCorr = corr ? targetFromResult(system, envelope(corr.result), "correction") : null;
-  if (fromCorr) {
+  const ob = resolveOnboard(system, bySeq);
+  const t = fromCorr ?? ob;
+  if (!t) return null;
+  if (fromCorr && ob) {
     // A correction result names the account's NEW identity; the id rides from the onboard if the
-    // correction (an older runner) didn't report one.
-    if (!(fromCorr.id || fromCorr.objectGuid)) {
-      const ob = resolveOnboard(system, bySeq);
-      if (ob) { fromCorr.id = ob.id ?? null; fromCorr.objectGuid = ob.objectGuid ?? null; }
-    }
-    return fromCorr;
+    // correction (an older runner) didn't report one. Whether the account pre-dates the case is the
+    // onboard's to say — a rename doesn't change it.
+    if (!(fromCorr.id || fromCorr.objectGuid)) { fromCorr.id = ob.id ?? null; fromCorr.objectGuid = ob.objectGuid ?? null; }
+    if (ob.adoptedRaw !== undefined) fromCorr.adoptedRaw = ob.adoptedRaw;
+    if (ob.accountCreated) fromCorr.accountCreated = ob.accountCreated;
   }
-  return resolveOnboard(system, bySeq);
+  if (caseCreatedAt !== undefined) {
+    const adopted = preexistingOf(t.adoptedRaw, t.accountCreated, caseCreatedAt);
+    if (adopted !== null) t.adopted = adopted;
+  }
+  return t;
 }
 function resolveOnboard(system: TargetSystem, bySeq: JobWithResult[]): SystemTarget | null {
   // m365 and entra share a tenant: take the first succeeded line that actually reported the account.
@@ -195,6 +231,24 @@ export function removeConfirmKey(jobs: JobWithResult[], payload: Record<string, 
 }
 
 // The accounts a Remove would delete, one line per directory system the onboard ran.
+// Round 3 (N1): the directory systems whose account existed before this case — a Remove must not
+// delete a rehire's or an adopted account (it needs an offboard). Empty = Remove may go ahead.
+export function preexistingAccounts(jobs: JobWithResult[], payload: Record<string, unknown>, caseCreatedAt: Date | string): string[] {
+  const out: string[] = [];
+  for (const system of ["active-directory", "m365", "google-workspace"] as TargetSystem[]) {
+    const t = resolveTarget(system, jobs, caseCreatedAt);
+    if (t?.adopted === true) out.push(describeTarget(system, t, payload));
+  }
+  return out;
+}
+
+// Round 3 (N2): did a Remove actually delete anything? A refused or not-found remove reports Status ok
+// with a WARN (recorded succeeded) and Deleted:false — the account is still live, so Correct stays open.
+// A result from before the flag counts as deleted (the conservative reading: don't rename after it).
+export function removeDeletedSomething(jobs: JobWithResult[]): boolean {
+  return jobs.some((j) => REMOVE_USER_SYSTEM_KEYS.includes(j.systemKey) && j.status === "succeeded" && envelope(j.result).Deleted !== false);
+}
+
 export function removalAccounts(jobs: JobWithResult[], payload: Record<string, unknown>): string[] {
   const out: string[] = [];
   for (const system of ["active-directory", "m365", "google-workspace"] as TargetSystem[]) {

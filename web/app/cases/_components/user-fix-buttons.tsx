@@ -72,8 +72,9 @@ export function CorrectUserButton({ caseId, current }: { caseId: string; current
 }
 
 // `email` is the confirm key — the account the onboard created (removeConfirmKey); `accounts` lists
-// every account the steps will delete, one per system.
-export function RemoveUserButton({ caseId, email, accounts }: { caseId: string; email: string; accounts: string[] }) {
+// every account the steps will delete, one per system. `preexisting` lists accounts that existed before
+// this case (a rehire / adopted account): the server refuses a Remove then, so the dialog says so up front.
+export function RemoveUserButton({ caseId, email, accounts, preexisting = [] }: { caseId: string; email: string; accounts: string[]; preexisting?: string[] }) {
   const router = useRouter();
   const [open, setOpen] = useState(false);
   const [confirm, setConfirm] = useState("");
@@ -97,6 +98,15 @@ export function RemoveUserButton({ caseId, email, accounts }: { caseId: string; 
       {open && (
         <Dialog onClose={() => setOpen(false)}>
           <h2 style={{ margin: "0 0 0.25rem" }}>Remove the user</h2>
+          {preexisting.length > 0 ? (
+            <>
+              <p className="note" style={{ marginTop: 0 }}>
+                &ldquo;Remove user&rdquo; only deletes accounts this case created. These existed before it (a rehire or an adopted account), so offboard the user instead:
+              </p>
+              <ul className="note" style={{ margin: "0 0 0.5rem" }}>{preexisting.map((a) => <li key={a}>{a}</li>)}</ul>
+              <div className="toolbar" style={{ justifyContent: "flex-end" }}><button onClick={() => setOpen(false)}>Close</button></div>
+            </>
+          ) : (<>
           <p className="note" style={{ color: "#b3261e", marginTop: 0 }}>
             This permanently deletes the account this onboard created on each system. It adds one step per system to this case; each needs approval before it runs, and the user&rsquo;s groups are saved first.
           </p>
@@ -113,6 +123,7 @@ export function RemoveUserButton({ caseId, email, accounts }: { caseId: string; 
             <button onClick={() => setOpen(false)}>Cancel</button>
             <button className="danger" disabled={busy || confirm.trim().toLowerCase() !== email.toLowerCase()} onClick={submit}>{busy ? "Queuing…" : "Queue removal"}</button>
           </div>
+          </>)}
         </Dialog>
       )}
     </>

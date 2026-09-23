@@ -32,7 +32,8 @@ Describe 'Invoke-CtgADRemoveUser' {
         Mock Get-ADUser -ModuleName Coretelligent.ActiveDirectory { $null }
         Mock Get-ADUser -ModuleName Coretelligent.ActiveDirectory -ParameterFilter { $Identity -eq 'guid-jane' } { [pscustomobject]@{ SamAccountName = 'jmsmith'; DistinguishedName = 'CN=Jane Smith,OU=Staff,DC=acme,DC=com'; MemberOf = @('CN=Finance,DC=acme,DC=com'); ObjectGUID = 'guid-jane'; whenCreated = $script:Before } }
         Mock Remove-ADObject -ModuleName Coretelligent.ActiveDirectory { }
-        $r = Invoke-CtgADRemoveUser -User $script:Case -Config (Cfg @{ target = [pscustomobject]@{ sam = 'jmsmith'; objectGuid = 'guid-jane' } })
+        $r = Invoke-CtgADRemoveUser -User $script:Case -Config (Cfg @{ target = [pscustomobject]@{ sam = 'jmsmith'; objectGuid = 'guid-jane'; adopted = $false } })
+        $r.Deleted | Should -BeTrue
         Should -Invoke Remove-ADObject -ModuleName Coretelligent.ActiveDirectory -Times 1 -Exactly -ParameterFilter { $Identity -eq 'CN=Jane Smith,OU=Staff,DC=acme,DC=com' -and $Recursive }
         Should -Invoke Get-ADUser -ModuleName Coretelligent.ActiveDirectory -Times 0 -Exactly -ParameterFilter { $Identity -eq 'jsmyth' }
         $r.Evidence.Groups | Should -Contain 'CN=Finance,DC=acme,DC=com'
@@ -132,7 +133,8 @@ Describe 'M365 correct / remove' {
         Mock Get-MgUser -ModuleName Coretelligent.M365 -ParameterFilter { $UserId -eq 'id-jane' } { [pscustomobject]@{ Id = 'id-jane'; UserPrincipalName = 'jmsmith@acme.com'; OnPremisesSyncEnabled = $null; CreatedDateTime = $script:Before } }
         Mock Remove-MgUser -ModuleName Coretelligent.M365 { }
         Mock Remove-MgDirectoryDeletedItem -ModuleName Coretelligent.M365 { }
-        $r = Invoke-CtgM365RemoveUser -User $script:Case -Config (Cfg @{ target = [pscustomobject]@{ id = 'id-jane'; upn = 'jmsmith@acme.com' } })
+        $r = Invoke-CtgM365RemoveUser -User $script:Case -Config (Cfg @{ target = [pscustomobject]@{ id = 'id-jane'; upn = 'jmsmith@acme.com'; adopted = $false } })
+        $r.Deleted | Should -BeTrue
         Should -Invoke Remove-MgUser -ModuleName Coretelligent.M365 -Times 1 -Exactly -ParameterFilter { $UserId -eq 'id-jane' }
         Should -Invoke Remove-MgDirectoryDeletedItem -ModuleName Coretelligent.M365 -Times 1 -Exactly -ParameterFilter { $DirectoryObjectId -eq 'id-jane' }
         Should -Invoke Get-MgUser -ModuleName Coretelligent.M365 -Times 0 -Exactly -ParameterFilter { $UserId -eq 'jsmyth@acme.com' }
@@ -238,7 +240,8 @@ Describe 'Google correct / remove' {
         Mock Get-CtgGoogleUser -ModuleName Coretelligent.GoogleWorkspace { $null }
         Mock Get-CtgGoogleUser -ModuleName Coretelligent.GoogleWorkspace -ParameterFilter { $Email -eq 'gid-jane' } { [pscustomobject]@{ id = 'gid-jane'; primaryEmail = 'jmsmith@acme.com'; creationTime = '2024-03-01T00:00:00.000Z' } }
         Mock Invoke-CtgGoogleApi -ModuleName Coretelligent.GoogleWorkspace { }
-        $r = Invoke-CtgGoogleRemoveUser -User $script:Case -Config (Cfg @{ target = [pscustomobject]@{ id = 'gid-jane'; email = 'jmsmith@acme.com' } })
+        $r = Invoke-CtgGoogleRemoveUser -User $script:Case -Config (Cfg @{ target = [pscustomobject]@{ id = 'gid-jane'; email = 'jmsmith@acme.com'; adopted = $false } })
+        $r.Deleted | Should -BeTrue
         Should -Invoke Invoke-CtgGoogleApi -ModuleName Coretelligent.GoogleWorkspace -Times 1 -Exactly -ParameterFilter { $Method -eq 'DELETE' -and $Path -eq '/users/gid-jane' }
         ($r.Actions -join ' ') | Should -Match 'deleted Google user jmsmith@acme\.com.*20 days'
     }
@@ -301,5 +304,63 @@ Describe 'the exchange-correct-user runner lane' {
         $global:CtgTestSeenCreds | Should -BeNullOrEmpty -Because 'the optional job connects best-effort inside Onboard, not in Connect'
         $r = & $script:Handler.Onboard $job @{ 'm365-admin' = 'exo' }
         ($r.Actions -join ' ') | Should -Match '^WARN manual follow-up: .*NOT changed to jsmith@acme\.com'
+    }
+}
+
+# Round 3 (N1/N2): an account that existed before this case (a rehire, an operator Adopt) is never
+# deleted by Remove — it needs an offboard — and every remove says whether it deleted anything.
+Describe 'Remove never deletes a pre-existing account' {
+    It 'AD: refuses an adopted account by its objectGUID, deleting nothing (Deleted = false)' {
+        Mock Get-ADUser -ModuleName Coretelligent.ActiveDirectory { [pscustomobject]@{ SamAccountName = 'jsmith'; DistinguishedName = 'CN=Jane Smith,DC=acme,DC=com'; ObjectGUID = 'guid-old'; whenCreated = $script:Before } }
+        Mock Remove-ADObject -ModuleName Coretelligent.ActiveDirectory { }
+        $r = Invoke-CtgADRemoveUser -User $script:Case -Config (Cfg @{ target = [pscustomobject]@{ sam = 'jsmith'; objectGuid = 'guid-old'; adopted = $true } })
+        Should -Invoke Remove-ADObject -ModuleName Coretelligent.ActiveDirectory -Times 0 -Exactly
+        $r.Deleted | Should -BeFalse
+        ($r.Actions -join ' ') | Should -Match 'existed before this case.*offboard'
+    }
+    It 'AD: an id with no Adopted flag (older onboard) is refused when the account is older than the case' {
+        Mock Get-ADUser -ModuleName Coretelligent.ActiveDirectory { [pscustomobject]@{ SamAccountName = 'jsmith'; DistinguishedName = 'CN=Jane Smith,DC=acme,DC=com'; ObjectGUID = 'guid-old'; whenCreated = $script:Before } }
+        Mock Remove-ADObject -ModuleName Coretelligent.ActiveDirectory { }
+        $r = Invoke-CtgADRemoveUser -User $script:Case -Config (Cfg @{ target = [pscustomobject]@{ sam = 'jsmith'; objectGuid = 'guid-old' } })
+        Should -Invoke Remove-ADObject -ModuleName Coretelligent.ActiveDirectory -Times 0 -Exactly
+        ($r.Actions -join ' ') | Should -Match 'may be a pre-existing account'
+    }
+    It 'M365: refuses an adopted Entra user, never calling Remove-MgUser or the purge' {
+        Mock Get-MgUser -ModuleName Coretelligent.M365 { [pscustomobject]@{ Id = 'id-old'; UserPrincipalName = 'jsmith@acme.com'; CreatedDateTime = $script:Before } }
+        Mock Remove-MgUser -ModuleName Coretelligent.M365 { }
+        Mock Remove-MgDirectoryDeletedItem -ModuleName Coretelligent.M365 { }
+        $r = Invoke-CtgM365RemoveUser -User $script:Case -Config (Cfg @{ target = [pscustomobject]@{ id = 'id-old'; upn = 'jsmith@acme.com'; adopted = $true } })
+        Should -Invoke Remove-MgUser -ModuleName Coretelligent.M365 -Times 0 -Exactly
+        Should -Invoke Remove-MgDirectoryDeletedItem -ModuleName Coretelligent.M365 -Times 0 -Exactly
+        $r.Deleted | Should -BeFalse
+    }
+    It 'M365: an id with no Adopted flag is refused when the user is older than the case, deleted when newer' {
+        Mock Remove-MgUser -ModuleName Coretelligent.M365 { }
+        Mock Remove-MgDirectoryDeletedItem -ModuleName Coretelligent.M365 { }
+        Mock Get-MgUser -ModuleName Coretelligent.M365 { [pscustomobject]@{ Id = 'id-x'; UserPrincipalName = 'jsmith@acme.com'; CreatedDateTime = $script:Before } }
+        $old = Invoke-CtgM365RemoveUser -User $script:Case -Config (Cfg @{ target = [pscustomobject]@{ id = 'id-x' } })
+        $old.Deleted | Should -BeFalse
+        Mock Get-MgUser -ModuleName Coretelligent.M365 { [pscustomobject]@{ Id = 'id-x'; UserPrincipalName = 'jsmith@acme.com'; CreatedDateTime = $script:After } }
+        $new = Invoke-CtgM365RemoveUser -User $script:Case -Config (Cfg @{ target = [pscustomobject]@{ id = 'id-x' } })
+        $new.Deleted | Should -BeTrue
+        Should -Invoke Remove-MgUser -ModuleName Coretelligent.M365 -Times 1 -Exactly
+    }
+    It 'M365: a synced user left to AD reports Deleted = false (the AD step reports its own delete)' {
+        Mock Get-MgUser -ModuleName Coretelligent.M365 { [pscustomobject]@{ Id = 'id-s'; UserPrincipalName = 'jmsmith@acme.com'; OnPremisesSyncEnabled = $true; CreatedDateTime = $script:After } }
+        $r = Invoke-CtgM365RemoveUser -User $script:Case -Config (Cfg @{ target = [pscustomobject]@{ id = 'id-s'; adopted = $false } })
+        $r.Deleted | Should -BeFalse
+    }
+    It 'Google: refuses an adopted user, never sending the DELETE' {
+        Mock Get-CtgGoogleUser -ModuleName Coretelligent.GoogleWorkspace { [pscustomobject]@{ id = 'gid-old'; primaryEmail = 'jsmith@acme.com'; creationTime = '2019-03-01T00:00:00.000Z' } }
+        Mock Invoke-CtgGoogleApi -ModuleName Coretelligent.GoogleWorkspace { }
+        $r = Invoke-CtgGoogleRemoveUser -User $script:Case -Config (Cfg @{ target = [pscustomobject]@{ id = 'gid-old'; email = 'jsmith@acme.com'; adopted = $true } })
+        Should -Invoke Invoke-CtgGoogleApi -ModuleName Coretelligent.GoogleWorkspace -Times 0 -Exactly
+        $r.Deleted | Should -BeFalse
+        ($r.Actions -join ' ') | Should -Match 'existed before this case'
+    }
+    It 'a not-found remove reports Deleted = false' {
+        Mock Get-CtgGoogleUser -ModuleName Coretelligent.GoogleWorkspace { $null }
+        $r = Invoke-CtgGoogleRemoveUser -User $script:Case -Config (Cfg @{ target = [pscustomobject]@{ id = 'gid-gone'; adopted = $false } })
+        $r.Deleted | Should -BeFalse
     }
 }
