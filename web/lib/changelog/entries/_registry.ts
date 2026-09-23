@@ -606,6 +606,7 @@ export { entry as selfhealNeverImportsInProcess } from "./selfheal-never-imports
 export { entry as selfhealRestartCannotLoop } from "./selfheal-restart-cannot-loop";
 export { entry as settingsDeploymentStatus } from "./settings-deployment-status";
 export { entry as setupRunCancelButton } from "./setup-run-cancel-button";
+export { entry as sharepointSiteGroups } from "./sharepoint-site-groups";
 export { entry as slackCatalogBuilt } from "./slack-catalog-built";
 export { entry as smallMailboxesNotEmpty } from "./small-mailboxes-not-empty";
 export { entry as slackConsoleBrowserSetup } from "./slack-console-browser-setup";
