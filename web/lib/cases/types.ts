@@ -61,6 +61,11 @@ export type CaseListItem = {
   createdSource: CaseSource;
   // The person the case is about, as a name (FR #123) — null when the payload names nobody.
   userName: string | null;
+  // WHO the ServiceNow ticket is assigned to, mirrored by the assignee sweep (FR #0000045). Both null
+  // = unassigned in ServiceNow; snAssigneeCheckedAt null = not read from ServiceNow yet.
+  snAssignedTo: string | null;
+  snAssignedToEmail: string | null;
+  snAssigneeCheckedAt: Date | null;
   // Per-case run readiness — can this case's systems actually run? Based on whether the required
   // Delinea credentials are set for the systems in its plan: "ready" (all set), "partial" (some set),
   // "blocked" (none set), "none" (no credential-gated systems — e.g. all-manual). readinessMissing

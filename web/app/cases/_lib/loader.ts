@@ -49,10 +49,14 @@ export async function loadCasesPage() {
     lastActionBy: c.lastActionBy,
     readiness: c.readiness,
     readinessMissing: c.readinessMissing,
-    // FR #0000045: who opened/imported the case. The repository already selects and normalises it
-    // (the "user:" prefix is stripped there); it was simply dropped on the way to the table.
+    // Who opened/imported the case (the "user:" prefix is stripped in the repository). Shown in the
+    // "Assigned to" cell's tooltip — the column itself is the ServiceNow assignee below.
     createdBy: c.createdBy,
     userName: c.userName,
+    // FR #0000045: the ServiceNow ticket's assigned_to, mirrored by the assignee sweep.
+    snAssignedTo: c.snAssignedTo,
+    snAssignedToEmail: c.snAssignedToEmail,
+    snAssigneeChecked: c.snAssigneeCheckedAt != null,
     createdAtIso: c.createdAt.toISOString(),
   }));
 
