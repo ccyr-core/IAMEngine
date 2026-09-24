@@ -583,6 +583,7 @@ export function makeCaseRepository(db: PrismaClient) {
           id: true, action: true, status: true, subject: true, pausedAt: true, pausedReason: true, scheduledFor: true,
           serviceNowCaseNumber: true, createdAt: true, clientId: true, payload: true, secretOverrides: true,
           createdBy: true, createdSource: true,
+          snAssignedTo: true, snAssignedToEmail: true, snAssigneeCheckedAt: true,
           client: { select: { name: true, slug: true, parentId: true } },
           jobs: { select: { systemKey: true, sequence: true, status: true, mode: true, error: true, request: true, startedAt: true, finishedAt: true } },
         },
@@ -762,6 +763,7 @@ export function makeCaseRepository(db: PrismaClient) {
           lastActionBy: lastActionByCase.get(r.id)?.by ?? null,
           createdBy: r.createdBy?.startsWith("user:") ? r.createdBy.slice(5) : (r.createdBy ?? null),
           createdSource: r.createdSource,
+          snAssignedTo: r.snAssignedTo, snAssignedToEmail: r.snAssignedToEmail, snAssigneeCheckedAt: r.snAssigneeCheckedAt,
           readiness, readinessMissing: planMissing,
           clientName: r.client.name, clientSlug: r.client.slug, jobCount: r.jobs.length,
           statusHint: needsInfo
