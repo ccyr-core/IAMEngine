@@ -4,7 +4,7 @@ export const entry: ChangelogEntry = {
   id: "google-drive-transfer-real-api",
   date: "2026-09-23",
   time: "16:30",
-  title: "Google offboards: Drive ownership transfer actually happens now (runner 1.138.0)",
+  title: "Google offboards: Drive ownership transfer actually happens now (runner 1.139.0)",
   items: [
     "The offboard's Drive transfer to transferTarget called an address Google doesn't have - the error was swallowed and the step still said \"transferred Drive ownership\", so no Drive was ever moved",
     "It now uses Google's Data Transfer API, and the step says it REQUESTED the transfer (Google runs it in the background) with Google's status",
