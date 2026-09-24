@@ -258,9 +258,9 @@ export function removalAccounts(jobs: JobWithResult[], payload: Record<string, u
   return out;
 }
 
-// L2: runners before 1.130.0 have no executor for these keys — they'd post "skipped" and a correction
+// L2: runners before 1.136.0 have no executor for these keys — they'd post "skipped" and a correction
 // would never commit. Withhold the keys from any runner that doesn't report at least that version.
-export const USER_ADHOC_MIN_RUNNER = "1.130.0";
+export const USER_ADHOC_MIN_RUNNER = "1.136.0";
 function semverAtLeast(v: string, min: string): boolean {
   const p = (s: string) => s.split(".").map((x) => parseInt(x, 10) || 0);
   const a = p(v); const b = p(min);
