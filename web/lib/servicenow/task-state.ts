@@ -4,17 +4,39 @@
 import type { SnConfig } from "./types";
 import { snGet } from "./http";
 
-export type TaskState = { number: string; state: string; sysClassName: string } | null;
+// assignedTo / assignedToEmail: the ticket's `assigned_to` user (display name) and that user's email
+// (dot-walked), both null when the ticket is unassigned. FR #0000045 mirrors them onto the case.
+export type TaskState = { number: string; state: string; sysClassName: string; assignedTo: string | null; assignedToEmail: string | null } | null;
 
 type Fetcher = typeof fetch;
+type Field = { display_value?: string };
+type TaskRow = { number?: Field; state?: Field; sys_class_name?: Field; assigned_to?: Field; "assigned_to.email"?: Field };
+
+const FIELDS = "number,state,sys_class_name,assigned_to,assigned_to.email";
+
+// An unassigned reference comes back as an empty display value, not a missing key — both mean "nobody".
+function orNull(f: Field | undefined): string | null {
+  const v = f?.display_value?.trim();
+  return v ? v : null;
+}
+
+function toTaskState(r: TaskRow, number: string): NonNullable<TaskState> {
+  return {
+    number,
+    state: r.state?.display_value ?? "",
+    sysClassName: r.sys_class_name?.display_value ?? "",
+    assignedTo: orNull(r.assigned_to),
+    assignedToEmail: orNull(r["assigned_to.email"]),
+  };
+}
 
 export async function fetchTaskState(config: SnConfig, number: string, fetcher: Fetcher = fetch): Promise<TaskState> {
-  const rows = await snGet<Array<{ number?: { display_value?: string }; state?: { display_value?: string }; sys_class_name?: { display_value?: string } }>>(
+  const rows = await snGet<TaskRow[]>(
     config,
     "/api/now/table/task",
     {
       sysparm_query: `number=${number}`,
-      sysparm_fields: "number,state,sys_class_name",
+      sysparm_fields: FIELDS,
       sysparm_display_value: "all",
       sysparm_limit: "1",
     },
@@ -22,11 +44,7 @@ export async function fetchTaskState(config: SnConfig, number: string, fetcher: 
   );
   const r = rows[0];
   if (!r) return null;
-  return {
-    number: r.number?.display_value ?? number,
-    state: r.state?.display_value ?? "",
-    sysClassName: r.sys_class_name?.display_value ?? "",
-  };
+  return toTaskState(r, r.number?.display_value ?? number);
 }
 
 // Batch lookup: the states of many task numbers in one query per chunk (`numberIN<a>,<b>,…`), keyed
@@ -40,12 +58,12 @@ export async function fetchTaskStates(config: SnConfig, numbers: string[], fetch
   const out = new Map<string, NonNullable<TaskState>>();
   for (let i = 0; i < valid.length; i += CHUNK) {
     const chunk = valid.slice(i, i + CHUNK);
-    const rows = await snGet<Array<{ number?: { display_value?: string }; state?: { display_value?: string }; sys_class_name?: { display_value?: string } }>>(
+    const rows = await snGet<TaskRow[]>(
       config,
       "/api/now/table/task",
       {
         sysparm_query: `numberIN${chunk.join(",")}`,
-        sysparm_fields: "number,state,sys_class_name",
+        sysparm_fields: FIELDS,
         sysparm_display_value: "all",
         sysparm_limit: String(chunk.length),
       },
@@ -54,7 +72,7 @@ export async function fetchTaskStates(config: SnConfig, numbers: string[], fetch
     for (const r of rows) {
       const number = r.number?.display_value;
       if (!number) continue;
-      out.set(number, { number, state: r.state?.display_value ?? "", sysClassName: r.sys_class_name?.display_value ?? "" });
+      out.set(number, toTaskState(r, number));
     }
   }
   return out;
