@@ -2862,9 +2862,21 @@ function Invoke-CtgM365PasswordReset {
     if ([string]::IsNullOrWhiteSpace($upn)) { throw "no resolvable user (no UPN or unique display-name match on the case) — password not reset" }
     $u = Resolve-CtgM365User -Upn $upn -Property @('Id', 'UserPrincipalName', 'OnPremisesSyncEnabled')
     if (-not $u) { throw "M365 user '$upn' not found — password not reset" }
-    if ((Get-CtgProp $u 'OnPremisesSyncEnabled') -eq $true) {
-        throw "'$upn' is AD-synced (directory-synced) — reset the password on the Active Directory line instead; Entra rejects cloud resets for synced users unless password write-back is enabled"
-    }
+    # FR #0000113: this used to THROW here for any directory-synced user, on the assumption that the
+    # tenant has no password write-back. The message even named the condition it never checked, so on a
+    # tenant that DOES have write-back the operator was sent to Active Directory for nothing.
+    #
+    # Rather than read the tenant flag (Get-MgDirectoryOnPremiseSynchronization ->
+    # Features.PasswordWritebackEnabled), we let Entra answer. Reading it needs
+    # OnPremDirectorySynchronization.Read.All, which no app registration in this fleet demonstrably
+    # holds — it appears nowhere in the permission catalog on either side — so that route is a consent
+    # change across ~200 tenants before a line of it works, and it fails closed on every tenant that
+    # never grants it. The write itself already knows the answer, and the attempt costs nothing extra:
+    # the app injects newPassword at claim and wipes it after the one-time reveal, so the value is
+    # spent whether we attempt the reset or refuse it here.
+    #
+    # Kept as a flag because it changes how a FAILURE is explained below, not whether we try.
+    $isSynced = (Get-CtgProp $u 'OnPremisesSyncEnabled') -eq $true
     $actions = [System.Collections.Generic.List[string]]::new()
     # Default ON; the operator can untick "require change at next sign-in" when they still have to
     # log in AS the user (equipment setup) before handing the account over (FR #14).
@@ -2879,6 +2891,16 @@ function Invoke-CtgM365PasswordReset {
             Invoke-CtgM365Write { Update-MgUser -UserId $u.Id -PasswordProfile @{ Password = $newPassword; ForceChangePasswordNextSignIn = $requireChange } -ErrorAction Stop }
         } catch {
             $msg = [string]$_.Exception.Message
+            # FR #0000113: a directory-synced user whose tenant has no password write-back is refused by
+            # Entra with its own, recognisable message — "objects that have originated within an
+            # external service". THAT is the evidence the old pre-emptive throw was guessing at, and it
+            # arrives only on tenants where the guess was right. Checked before the permission branch
+            # because it is the more specific signal; a missing write-back is a 400, not a 403.
+            if ($isSynced -and $msg -match 'originated within an external service|originated in an external service') {
+                throw ("resetting the password for '$upn': $msg`n" +
+                    "'$upn' is directory-synced and Entra refused the cloud reset — that is what it returns when the tenant does not have password write-back enabled. Reset the password on the Active Directory line of this case instead; it will sync up from there. " +
+                    "Nothing was changed in Entra by this attempt.")
+            }
             # Graph treats passwordProfile as a PRIVILEGED write with its own app role. User.ReadWrite.All
             # — which every wired tenant has — sets a password as part of CREATING a user, but is denied
             # when CHANGING one afterwards. So the bare "Insufficient privileges" here does not mean the
@@ -2891,10 +2913,21 @@ function Invoke-CtgM365PasswordReset {
                     "If it was granted recently, this runner's cached Graph token predates the consent and still carries the old permissions — restart the runner, then dispatch a fresh reset. " +
                     "If it is granted and consented and this still denies, the target likely holds an admin role: resetting an administrator's password additionally requires a privileged directory role (Privileged Authentication Administrator) on the app's service principal.")
             }
+            # Any other failure on a synced user: say the user is synced, because it is the first thing
+            # the operator will wonder about, but do NOT claim write-back is the cause. We only know
+            # that when Entra says so above, and inventing a diagnosis is the habit this change removes.
+            if ($isSynced) {
+                throw ("resetting the password for '$upn': $msg`n" +
+                    "'$upn' is directory-synced. Entra did not refuse this as an unwritable synced object, so the error above is the real one rather than a missing password write-back — read it on its own terms. If it turns out the tenant has no write-back, reset on the Active Directory line instead.")
+            }
             throw "resetting the password for '$upn': $msg"
         }
         $suffix = if ($requireChange) { 'must change at next sign-in' } else { 'change at next sign-in NOT required — operator choice' }
         $actions.Add("reset password for $upn ($suffix; shown once to the operator, never stored)")
+        # Worth recording: the reset succeeding on a synced user IS the tenant fact the old code assumed
+        # it could not have. It tells the next operator that cloud resets work here, without anyone
+        # having to read a tenant flag we cannot read.
+        if ($isSynced) { $actions.Add("$upn is directory-synced and Entra accepted the cloud reset — this tenant has password write-back enabled") }
     }
     [pscustomobject]@{ System = 'm365-password-reset'; Status = 'ok'; Upn = $upn; Actions = $actions.ToArray() }
 }
