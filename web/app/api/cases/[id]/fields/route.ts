@@ -16,6 +16,7 @@ import { makeCaseRepository } from "@/lib/cases/repository";
 import { replanCase } from "@/lib/cases/replan-service";
 import { recordAudit } from "@/lib/auth/audit";
 import { auditActor } from "@/lib/auth/actor";
+import { splitTypedList, LIST_PAYLOAD_FIELDS } from "@/lib/cases/typed-list";
 
 export const dynamic = "force-dynamic";
 
@@ -41,10 +42,13 @@ export async function PATCH(req: Request, { params }: { params: { id: string } }
   const touched: string[] = [];
   const filled: string[] = [];
   for (const [k, v] of Object.entries(fields)) {
-    const val = typeof v === "string" ? v.trim() : v;
+    // A typed value for a list field is stored as the array the intake would have produced (FR #174):
+    // "Sales, East; Finance" -> ["Sales, East", "Finance"].
+    const val = typeof v === "string" && LIST_PAYLOAD_FIELDS.has(k) ? splitTypedList(v)
+      : typeof v === "string" ? v.trim() : v;
     payload[k] = val;
     touched.push(k);
-    if (typeof val === "string" ? val !== "" : val != null) filled.push(k);
+    if (typeof val === "string" ? val !== "" : Array.isArray(val) ? val.length > 0 : val != null) filled.push(k);
   }
   // Editing the UPN must keep its siblings consistent (deriveIdentity computed them together) — the
   // AD lane reads samAccountName independently, so leaving it stale creates an account that doesn't
