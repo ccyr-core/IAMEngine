@@ -18,9 +18,15 @@ const cardStyle: React.CSSProperties = { background: "var(--bg)", border: "1px s
 // Portal the overlay to <body>: rendered inline (inside the step's <details> row) the fixed overlay
 // can end up positioned by a transformed/contained ancestor — the dialog then appears far down the
 // page instead of centered in the viewport. These dialogs only mount after a click, so document exists.
+//
+// FR #43: stop the click HERE. A portal moves the DOM, not the React tree — React still bubbles the
+// dialog's clicks up to the run report's step <summary>, whose onClick calls preventDefault() and
+// toggles the row. That cancelled every radio and checkbox click (the mode could never switch to
+// "enter a specific password", "require change" could never be unticked) and collapsed/expanded the
+// step behind the dialog on every click — the "jitter" #29 fixed with CSS, which was never the cause.
 function Overlay({ onBackdropClick, children }: { onBackdropClick?: () => void; children: React.ReactNode }) {
   return createPortal(
-    <div role="dialog" aria-modal="true" style={overlayStyle} onClick={(e) => { if (e.target === e.currentTarget) onBackdropClick?.(); }}>
+    <div role="dialog" aria-modal="true" style={overlayStyle} onClick={(e) => { e.stopPropagation(); if (e.target === e.currentTarget) onBackdropClick?.(); }}>
       <div style={cardStyle}>{children}</div>
     </div>,
     document.body
