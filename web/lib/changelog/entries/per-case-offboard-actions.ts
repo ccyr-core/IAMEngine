@@ -4,7 +4,7 @@ export const entry: ChangelogEntry = {
   id: "per-case-offboard-actions",
   date: "2026-09-23",
   time: "10:00",
-  title: "Offboards: choose delete or keep per case for Google, the mailbox and Spanning (runner 1.130.0)",
+  title: "Offboards: choose delete or keep per case for Google, the mailbox and Spanning (runner 1.134.0)",
   items: [
     "An offboarding case has a new Offboard actions section: for this one case, choose to suspend or delete the Google account, convert the mailbox to shared or let it be deleted, and archive or remove the Spanning licence",
     "Each shows what the case will do now, read the same way the offboard step reads the client's setting, so the client's usual setting is the starting point. Only the choices you change are saved; the rest stay on the client's setting",
