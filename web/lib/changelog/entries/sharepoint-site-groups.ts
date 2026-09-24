@@ -4,7 +4,7 @@ export const entry: ChangelogEntry = {
   id: "sharepoint-site-groups",
   date: "2026-09-23",
   time: "10:30",
-  title: "SharePoint: site groups are cleaned up on offboard and mirrored on onboard (runner 1.135.0)",
+  title: "SharePoint: site groups are cleaned up on offboard and mirrored on onboard (runner 1.136.0)",
   items: [
     "The SharePoint system now runs as a real step: on offboard it removes the leaver from every SharePoint site group they're in (a site's Owners, Members, Visitors and custom groups), on every site in the tenant",
     "On an onboard that says \"mirror <user>\", it adds the new user to the same site groups as the reference user. Groups on the client's mirror-policy \"never mirror\" list are skipped. A SharePoint step without its own list uses the Microsoft 365 one",
