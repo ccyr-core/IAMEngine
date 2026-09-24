@@ -1713,10 +1713,69 @@ Describe 'Invoke-CtgM365PasswordReset' {
         ($r.Actions -join ' ') | Should -Match 'NOT required'
     }
 
-    It 'refuses an AD-synced user and points the operator at Active Directory' {
-        Mock Get-MgUser -ModuleName Coretelligent.M365 -MockWith { [pscustomobject]@{ Id = 'u1'; UserPrincipalName = 'jdoe@x.com'; OnPremisesSyncEnabled = $true } }
-        { Invoke-CtgM365PasswordReset -User $user -Config $config } | Should -Throw '*AD-synced*'
-        Should -Invoke Update-MgUser -ModuleName Coretelligent.M365 -Times 0 -Exactly
+    # FR #0000113: "The runner is assuming all clients don't have AD writeback, while it has the
+    # permissions to be able to check." It was assuming. It refused every directory-synced user before
+    # trying, so a tenant WITH password write-back sent the operator to Active Directory for nothing.
+    #
+    # It does not have the permission to check, either: reading the tenant flag needs
+    # OnPremDirectorySynchronization.Read.All, which appears nowhere in this repo's permission catalog.
+    # So the answer comes from the write itself — Entra refuses a synced object in terms it names.
+    Context 'when the user is directory-synced (FR #0000113)' {
+        BeforeEach {
+            Mock Get-MgUser -ModuleName Coretelligent.M365 -MockWith { [pscustomobject]@{ Id = 'u1'; UserPrincipalName = 'jdoe@x.com'; OnPremisesSyncEnabled = $true } }
+        }
+
+        It 'ATTEMPTS the reset instead of refusing on the assumption write-back is off' {
+            # The whole point. This assertion is the inverse of the one it replaces, which required
+            # Update-MgUser NOT to be called.
+            $r = Invoke-CtgM365PasswordReset -User $user -Config $config
+            Should -Invoke Update-MgUser -ModuleName Coretelligent.M365 -Times 1 -Exactly -ParameterFilter { $UserId -eq 'u1' }
+            $r.Status | Should -Be 'ok'
+        }
+
+        It 'records that the tenant HAS write-back when Entra accepts it' {
+            # The fact the old code assumed it could never learn, now free on every successful reset.
+            $r = Invoke-CtgM365PasswordReset -User $user -Config $config
+            ($r.Actions -join ' ') | Should -Match 'Entra accepted the cloud reset'
+            ($r.Actions -join ' ') | Should -Match 'password write-back enabled'
+        }
+
+        It 'points at Active Directory when Entra refuses the synced object' {
+            # Entra's own wording for a synced object it will not write — the evidence the pre-emptive
+            # throw was guessing at, and it arrives only where the guess was right.
+            Mock Update-MgUser -ModuleName Coretelligent.M365 -MockWith {
+                throw 'Request_BadRequest: Unable to update the specified properties for objects that have originated within an external service.'
+            }
+            # Anchored on wording unique to THIS branch. Both synced branches mention the Active
+            # Directory line, so matching that alone would pass for either and prove nothing.
+            $err = { Invoke-CtgM365PasswordReset -User $user -Config $config } | Should -Throw -PassThru
+            "$err" | Should -Match 'Entra refused the cloud reset'
+            "$err" | Should -Match 'Active Directory line'
+        }
+
+        It 'does NOT blame write-back for an unrelated failure on a synced user' {
+            # The habit being removed: a diagnosis invented rather than read. A synced user can fail for
+            # any other reason, and that reason must survive unmodified.
+            Mock Update-MgUser -ModuleName Coretelligent.M365 -MockWith { throw 'Request_ThrottledTemporarily: too many requests' }
+            $err = { Invoke-CtgM365PasswordReset -User $user -Config $config } | Should -Throw -PassThru
+            "$err" | Should -Match 'ThrottledTemporarily'
+            "$err" | Should -Not -Match 'Entra refused the cloud reset'
+            "$err" | Should -Match 'did not refuse this as an unwritable synced object'
+        }
+
+        It 'still names the missing permission when Graph denies a synced user' {
+            # The 403 branch must not be shadowed by the new synced branch above it.
+            Mock Update-MgUser -ModuleName Coretelligent.M365 -MockWith { throw 'Authorization_RequestDenied: Insufficient privileges to complete the operation.' }
+            { Invoke-CtgM365PasswordReset -User $user -Config $config } | Should -Throw '*User-PasswordProfile.ReadWrite.All*'
+        }
+
+        It 'never echoes the password, on the failure path too' {
+            Mock Update-MgUser -ModuleName Coretelligent.M365 -MockWith {
+                throw 'Request_BadRequest: Unable to update the specified properties for objects that have originated within an external service.'
+            }
+            $err = { Invoke-CtgM365PasswordReset -User $user -Config $config } | Should -Throw -PassThru
+            "$err" | Should -Not -Match ([regex]::Escape('Xy7#kQ9pLm2$Wn4v'))
+        }
     }
 
     It 'throws when the user is not found — never silently no-ops' {
