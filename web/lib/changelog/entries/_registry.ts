@@ -40,6 +40,7 @@ export { entry as casePrerunPasswordReset } from "./case-prerun-password-reset";
 export { entry as caseRequestedMailForwarding } from "./case-requested-mail-forwarding";
 export { entry as caseRequestedSharedMailboxes } from "./case-requested-shared-mailboxes";
 export { entry as casesAssignedToColumn } from "./cases-assigned-to-column";
+export { entry as casesAssignedToServicenow } from "./cases-assigned-to-servicenow";
 export { entry as casesEmptyM365autosetupJsonFilter } from "./cases-empty-m365autosetup-json-filter";
 export { entry as casesV2AccessRules } from "./cases-v2-access-rules";
 export { entry as changeActionGroundwork } from "./change-action-groundwork";
@@ -210,6 +211,7 @@ export { entry as offboardUnifiedGroupRemoval } from "./offboard-unified-group-r
 export { entry as onedriveGrantRealError } from "./onedrive-grant-real-error";
 export { entry as optionalCredEmptyLabel } from "./optional-cred-empty-label";
 export { entry as passwordChangeAtFirstLoginOptional } from "./password-change-at-first-login-optional";
+export { entry as passwordDialogControlsWork } from "./password-dialog-controls-work";
 export { entry as passwordResetGuiFix } from "./password-reset-gui-fix";
 export { entry as perContactIntakeRules } from "./per-contact-intake-rules";
 export { entry as personaSystemMembership } from "./persona-system-membership";
@@ -351,6 +353,7 @@ export { entry as licenseHoldCoversMailboxSystems } from "./license-hold-covers-
 
 export { entry as mfaDenialHintRanksCauses } from "./mfa-denial-hint-ranks-causes";
 
+export { entry as passwordResetLetsEntraAnswer } from "./password-reset-lets-entra-answer";
 export { entry as runnerAnchorsWorkingDirectory } from "./runner-anchors-working-directory";
 export { entry as syncWaitActuallyWaits } from "./sync-wait-actually-waits";
 export { entry as onedriveScaGrantActuallyRuns } from "./onedrive-sca-grant-actually-runs";

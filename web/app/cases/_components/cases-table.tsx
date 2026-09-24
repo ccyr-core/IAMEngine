@@ -30,8 +30,13 @@ export type CaseRowVM = {
   readiness?: "ready" | "partial" | "blocked" | "none"; // can this case's systems run? (are the creds set)
   readinessMissing?: string[]; // the unset secret names, for the tooltip
   // Who opened/imported the case — the operator's email for a signed-in engineer, else the raw actor
-  // label ("servicenow-poller"). Shown as "Assigned to" (FR #0000045).
+  // label ("servicenow-poller"). Shown in the "Assigned to" tooltip only.
   createdBy?: string | null;
+  // FR #0000045: the ServiceNow ticket's assigned_to (display name + email), mirrored by the assignee
+  // sweep. Both null = unassigned in ServiceNow — unless snAssigneeChecked is false (not read yet).
+  snAssignedTo?: string | null;
+  snAssignedToEmail?: string | null;
+  snAssigneeChecked?: boolean;
   createdAtIso: string;
 };
 
@@ -65,20 +70,27 @@ const STATUS_COLOR: Record<string, string> = {
   running: "var(--info-fg)",
 };
 
-type SortKey = "subject" | "clientName" | "action" | "serviceNowCaseNumber" | "jobCount" | "status" | "effectiveDate" | "lastRun" | "createdAt" | "createdBy";
+type SortKey = "subject" | "clientName" | "action" | "serviceNowCaseNumber" | "jobCount" | "status" | "effectiveDate" | "lastRun" | "createdAt" | "assignedTo";
 
-// Every operator is @core.tech, so the domain is a column's worth of noise repeated on every row.
-// Show the local part and keep the full value in the title. A non-email actor label
-// ("servicenow-poller") has no @ and renders unchanged — it is already the readable form.
-function assignedLabel(createdBy: string | null | undefined): string {
-  if (!createdBy) return "—";
-  const at = createdBy.indexOf("@");
-  return at > 0 ? createdBy.slice(0, at) : createdBy;
+// The "Assigned to" cell (FR #0000045): the ServiceNow ticket's assignee, which is who is actually
+// working it — not who opened the case in the app (that stays in the tooltip). Four states that must
+// not look alike: assigned, unassigned in ServiceNow, not read from ServiceNow yet, and no ticket.
+function assignee(c: CaseRowVM): { label: string; title: string; muted: boolean } {
+  const opened = c.createdBy ? ` · opened by ${c.createdBy}` : "";
+  if (!c.serviceNowCaseNumber) return { label: "—", title: `No ServiceNow ticket${opened}`, muted: true };
+  if (!c.snAssigneeChecked) return { label: "—", title: `Not read from ServiceNow yet — refreshes every few minutes${opened}`, muted: true };
+  if (!c.snAssignedTo && !c.snAssignedToEmail) return { label: "unassigned", title: `Unassigned in ServiceNow${opened}`, muted: true };
+  return { label: c.snAssignedTo ?? c.snAssignedToEmail!, title: `${c.snAssignedToEmail ?? c.snAssignedTo} (ServiceNow)${opened}`, muted: false };
+}
+
+function AssigneeCell({ c }: { c: CaseRowVM }) {
+  const a = assignee(c);
+  return <td className={a.muted ? "muted" : undefined} style={{ whiteSpace: "nowrap" }} title={a.title}>{a.label}</td>;
 }
 type SortDir = "asc" | "desc";
 
 function haystack(c: CaseRowVM): string {
-  return [c.subject, c.clientName, c.action, c.serviceNowCaseNumber, c.imported ? "imported" : STATUS_LABEL[c.status] ?? c.status, c.statusHint, ...(c.warnings ?? [])]
+  return [c.subject, c.clientName, c.action, c.serviceNowCaseNumber, c.imported ? "imported" : STATUS_LABEL[c.status] ?? c.status, c.statusHint, c.snAssignedTo, c.snAssignedToEmail, ...(c.warnings ?? [])]
     .filter(Boolean)
     .join(" ")
     .toLowerCase();
@@ -166,6 +178,13 @@ function compare(a: CaseRowVM, b: CaseRowVM, key: SortKey): number {
       return a.jobCount - b.jobCount;
     case "createdAt":
       return a.createdAtIso.localeCompare(b.createdAtIso);
+    case "assignedTo": {
+      // Assigned people A–Z, then unassigned/unknown last — the same "empty sorts last" as lastRun.
+      const av = a.snAssignedTo ?? a.snAssignedToEmail ?? ""; const bv = b.snAssignedTo ?? b.snAssignedToEmail ?? "";
+      if (!av && bv) return 1;
+      if (av && !bv) return -1;
+      return av.localeCompare(bv);
+    }
     case "lastRun": {
       const av = a.lastRunIso ?? ""; const bv = b.lastRunIso ?? "";
       if (!av && bv) return 1; // never-run last
@@ -447,7 +466,7 @@ export function CasesTable({ cases, trashed, splitCompleted = false }: { cases: 
             <SortHead k="effectiveDate" label="Start / off date" />
             <SortHead k="lastRun" label="Last run" />
             <SortHead k="createdAt" label="Created" />
-            <SortHead k="createdBy" label="Assigned to" />
+            <SortHead k="assignedTo" label="Assigned to" />
             <th aria-label="Run controls"></th>
             <th style={{ width: 28 }} aria-label="Actions"></th>
           </tr>
@@ -513,7 +532,7 @@ export function CasesTable({ cases, trashed, splitCompleted = false }: { cases: 
                 )}
               </td>
               <td className="muted" style={{ whiteSpace: "nowrap" }}>{new Date(c.createdAtIso).toLocaleDateString()}</td>
-              <td className="muted" style={{ whiteSpace: "nowrap" }} title={c.createdBy ?? "nobody recorded"}>{assignedLabel(c.createdBy)}</td>
+              <AssigneeCell c={c} />
               <td style={{ whiteSpace: "nowrap" }}>
                 {(() => {
                   const terminal = c.status === "completed" || c.status === "failed";
@@ -615,7 +634,7 @@ export function CasesTable({ cases, trashed, splitCompleted = false }: { cases: 
                     {c.ranBy && <div className="note" style={{ fontSize: 11 }}>by {c.ranBy}</div>}
                   </td>
                   <td className="muted" style={{ whiteSpace: "nowrap" }}>{new Date(c.createdAtIso).toLocaleDateString()}</td>
-                  <td className="muted" style={{ whiteSpace: "nowrap" }} title={c.createdBy ?? "nobody recorded"}>{assignedLabel(c.createdBy)}</td>
+                  <AssigneeCell c={c} />
                   <td style={{ width: 28, padding: 0, textAlign: "right" }}>
                     <button
                       onClick={() => remove(c)}
