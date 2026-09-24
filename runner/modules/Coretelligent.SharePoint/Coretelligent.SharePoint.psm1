@@ -72,12 +72,75 @@ function Connect-CtgSharePointPnP {
     }
 }
 
+$script:CtgSharePointModuleFile = $PSCommandPath
+
+# Windows 0xC00000FD (STATUS_STACK_OVERFLOW) as a signed exit code; 134 = SIGABRT, how .NET ends a
+# process on a stack overflow on Linux/macOS.
+$script:CtgStackOverflowExitCodes = @(-1073741571, 134)
+
+# Run one Grant-CtgSharePointSiteAccess -InProcess in a clean child pwsh that loads only this module and
+# PnP.PowerShell. The request (certificate included) goes over STDIN, never the command line, which
+# other processes on the host can read. Returns the grant's action line; throws a readable reason
+# when the child fails, crashes or hangs, so the caller's catch turns it into a WARN on the case.
+function Invoke-CtgPnPChild {
+    param([Parameter(Mandatory)][hashtable]$GrantArgs, [int]$TimeoutSeconds = 180)
+    $pwsh = (Get-Process -Id $PID).Path
+    if (-not $pwsh -or (Split-Path $pwsh -Leaf) -notmatch '^pwsh') { $pwsh = (Get-Command pwsh -ErrorAction SilentlyContinue).Source }
+    if (-not $pwsh) { throw 'cannot locate pwsh to run PnP.PowerShell in a separate process' }
+    $child = @'
+$ErrorActionPreference = 'Stop'
+$req = [Console]::In.ReadToEnd() | ConvertFrom-Json -AsHashtable
+$enc = { param($s) [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$s)) }
+try {
+    Import-Module $req.ModuleFile -Force
+    $a = $req.GrantArgs
+    $line = Grant-CtgSharePointSiteAccess -InProcess @a
+    [Console]::Out.WriteLine('CTG-PNP-OK:' + (& $enc $line))
+}
+catch {
+    [Console]::Out.WriteLine('CTG-PNP-ERR:' + (& $enc $_.Exception.Message))
+    exit 3
+}
+'@
+    $psi = [System.Diagnostics.ProcessStartInfo]::new($pwsh)
+    foreach ($a in @('-NoProfile', '-NonInteractive', '-EncodedCommand', [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($child)))) { $psi.ArgumentList.Add($a) }
+    $psi.RedirectStandardInput = $true; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+    $p = [System.Diagnostics.Process]::Start($psi)
+    try {
+        $outTask = $p.StandardOutput.ReadToEndAsync(); $errTask = $p.StandardError.ReadToEndAsync()
+        $p.StandardInput.Write((@{ ModuleFile = $script:CtgSharePointModuleFile; GrantArgs = $GrantArgs } | ConvertTo-Json -Compress -Depth 5))
+        $p.StandardInput.Close()
+        if (-not $p.WaitForExit($TimeoutSeconds * 1000)) {
+            try { $p.Kill($true) } catch { }
+            throw "PnP.PowerShell did not finish within $TimeoutSeconds s on $($GrantArgs.SiteUrl) — stopped it; grant the access by hand or re-run this step"
+        }
+        $p.WaitForExit()
+        $out = [string]$outTask.Result; $err = [string]$errTask.Result
+        $dec = { param($b) [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b)) }
+        if ($out -match '(?m)^CTG-PNP-OK:(\S*)') { return (& $dec $Matches[1]) }
+        if ($out -match '(?m)^CTG-PNP-ERR:(\S*)') { throw (& $dec $Matches[1]) }
+        if ($p.ExitCode -in $script:CtgStackOverflowExitCodes -or $err -match 'Stack overflow') {
+            throw "PnP.PowerShell crashed (stack overflow in its assembly loader) while connecting to $($GrantArgs.SiteUrl). The runner kept running; the grant did not happen. Update PnP.PowerShell on the runner host (Update-Module PnP.PowerShell), then re-run this step, or grant the access by hand"
+        }
+        $first = @(($err -split "`r?`n") | Where-Object { $_.Trim() }) | Select-Object -First 1
+        throw "PnP.PowerShell helper process exited with code $($p.ExitCode) and no result$(if ($first) { ": $first" })"
+    }
+    finally { $p.Dispose() }
+}
+
 # Grant a delegate (e.g. the leaver's manager) SITE-COLLECTION ADMIN on one SharePoint/OneDrive site
 # — full access to every item on it, not just what a folder/file-level share would cover. This is why
 # the offboard hand-off goes over PnP rather than Graph's drive /invite: Graph has no "make this
 # person a site collection admin" call, only per-item permissions.
 # Idempotent (checks Get-PnPSiteCollectionAdmin first) and supports -WhatIf/-Confirm. Callers wrap
 # this in try/catch and WARN on failure — a SharePoint/PnP problem must never fail the offboard.
+#
+# PnP runs in a CHILD pwsh, not in the runner (-InProcess is what that child calls). PnP.PowerShell's
+# assembly resolver (PnPPowerShellModuleInitializer.ResolveDependency) can recurse into itself until
+# the process dies of a stack overflow during Connect-PnPOnline, seen on a runner that already had
+# Graph + ExchangeOnlineManagement loaded. A stack overflow cannot be caught: in-process it killed the
+# whole runner mid-job, every other client's work with it. In a child it costs one WARN on the case.
 function Grant-CtgSharePointSiteAccess {
     [CmdletBinding(SupportsShouldProcess)]
     param(
@@ -87,8 +150,18 @@ function Grant-CtgSharePointSiteAccess {
         [Parameter(Mandatory)][string]$Tenant,
         [string]$CertificateBase64,
         [string]$CertificatePassword,
-        [string]$CertificateThumbprint
+        [string]$CertificateThumbprint,
+        [switch]$InProcess
     )
+    if (-not $InProcess) {
+        $grantArgs = @{ SiteUrl = $SiteUrl; Delegate = $Delegate; AppId = $AppId; Tenant = $Tenant }
+        foreach ($k in 'CertificateBase64', 'CertificatePassword', 'CertificateThumbprint') {
+            $v = Get-Variable -Name $k -ValueOnly
+            if ($v) { $grantArgs[$k] = $v }
+        }
+        if ($WhatIfPreference) { $grantArgs['WhatIf'] = $true }
+        return (Invoke-CtgPnPChild -GrantArgs $grantArgs)
+    }
     Connect-CtgSharePointPnP -Url $SiteUrl -AppId $AppId -Tenant $Tenant -CertificateBase64 $CertificateBase64 -CertificatePassword $CertificatePassword -CertificateThumbprint $CertificateThumbprint
     $existing = @(Get-PnPSiteCollectionAdmin -ErrorAction SilentlyContinue)
     # Exact, case-insensitive match on Email or LoginName — NOT -like/substring. A -like "*$Delegate*"

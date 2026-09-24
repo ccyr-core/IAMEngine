@@ -40,13 +40,13 @@ Describe 'Grant-CtgSharePointSiteAccess' {
         Mock -CommandName Get-PnPSiteCollectionAdmin -ModuleName Coretelligent.SharePoint -MockWith { @() }
     }
     It 'adds the delegate as a site collection admin' {
-        $r = Grant-CtgSharePointSiteAccess -SiteUrl 'https://x.sharepoint.com/sites/s' -Delegate 'amelia@x.com' -AppId a -Tenant t -CertificateBase64 'Yg=='
+        $r = Grant-CtgSharePointSiteAccess -InProcess -SiteUrl 'https://x.sharepoint.com/sites/s' -Delegate 'amelia@x.com' -AppId a -Tenant t -CertificateBase64 'Yg=='
         Should -Invoke Add-PnPSiteCollectionAdmin -ModuleName Coretelligent.SharePoint -Times 1
         $r | Should -Match 'granted amelia@x.com site-collection admin'
     }
     It 'is idempotent when already an admin' {
         Mock -CommandName Get-PnPSiteCollectionAdmin -ModuleName Coretelligent.SharePoint -MockWith { @([pscustomobject]@{ Email = 'amelia@x.com' }) }
-        $r = Grant-CtgSharePointSiteAccess -SiteUrl 'https://x/s' -Delegate 'amelia@x.com' -AppId a -Tenant t -CertificateBase64 'Yg=='
+        $r = Grant-CtgSharePointSiteAccess -InProcess -SiteUrl 'https://x/s' -Delegate 'amelia@x.com' -AppId a -Tenant t -CertificateBase64 'Yg=='
         Should -Invoke Add-PnPSiteCollectionAdmin -ModuleName Coretelligent.SharePoint -Times 0
         $r | Should -Match 'already'
     }
@@ -54,21 +54,77 @@ Describe 'Grant-CtgSharePointSiteAccess' {
         # bsmith@x.com contains "smith@x.com": a -like "*$Delegate*" match would wrongly call this
         # "already admin" and skip the grant entirely. Exact match must reject this and still add.
         Mock -CommandName Get-PnPSiteCollectionAdmin -ModuleName Coretelligent.SharePoint -MockWith { @([pscustomobject]@{ Email = 'bsmith@x.com' }) }
-        $r = Grant-CtgSharePointSiteAccess -SiteUrl 'https://x/s' -Delegate 'smith@x.com' -AppId a -Tenant t -CertificateBase64 'Yg=='
+        $r = Grant-CtgSharePointSiteAccess -InProcess -SiteUrl 'https://x/s' -Delegate 'smith@x.com' -AppId a -Tenant t -CertificateBase64 'Yg=='
         Should -Invoke Add-PnPSiteCollectionAdmin -ModuleName Coretelligent.SharePoint -Times 1
         $r | Should -Match 'granted smith@x.com site-collection admin'
     }
     It 'is idempotent on an exact-match email (still no false negative)' {
         Mock -CommandName Get-PnPSiteCollectionAdmin -ModuleName Coretelligent.SharePoint -MockWith { @([pscustomobject]@{ Email = 'smith@x.com' }) }
-        $r = Grant-CtgSharePointSiteAccess -SiteUrl 'https://x/s' -Delegate 'smith@x.com' -AppId a -Tenant t -CertificateBase64 'Yg=='
+        $r = Grant-CtgSharePointSiteAccess -InProcess -SiteUrl 'https://x/s' -Delegate 'smith@x.com' -AppId a -Tenant t -CertificateBase64 'Yg=='
         Should -Invoke Add-PnPSiteCollectionAdmin -ModuleName Coretelligent.SharePoint -Times 0
         $r | Should -Match 'already'
     }
     It 'matches a claims-format LoginName (i:0#.f|membership|user@x.com) when Email is empty' {
         Mock -CommandName Get-PnPSiteCollectionAdmin -ModuleName Coretelligent.SharePoint -MockWith { @([pscustomobject]@{ Email = ''; LoginName = 'i:0#.f|membership|smith@x.com' }) }
-        $r = Grant-CtgSharePointSiteAccess -SiteUrl 'https://x/s' -Delegate 'smith@x.com' -AppId a -Tenant t -CertificateBase64 'Yg=='
+        $r = Grant-CtgSharePointSiteAccess -InProcess -SiteUrl 'https://x/s' -Delegate 'smith@x.com' -AppId a -Tenant t -CertificateBase64 'Yg=='
         Should -Invoke Add-PnPSiteCollectionAdmin -ModuleName Coretelligent.SharePoint -Times 0
         $r | Should -Match 'already'
+    }
+}
+
+# PnP.PowerShell crashed a runner with a stack overflow inside its own assembly resolver during
+# Connect-PnPOnline. That is uncatchable, so it took the whole runner down mid-job. The grant now runs
+# in a child pwsh; these tests start REAL child processes (a fake grant module stands in for PnP).
+Describe 'Grant-CtgSharePointSiteAccess runs PnP out of process' {
+    BeforeAll {
+        $script:FakeDir = Join-Path ([System.IO.Path]::GetTempPath()) ("ctg-pnp-test-" + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $script:FakeDir | Out-Null
+        $script:Fake = {
+            param($name, $body)
+            $f = Join-Path $script:FakeDir "$name.psm1"
+            Set-Content -LiteralPath $f -Value "function Grant-CtgSharePointSiteAccess { param(`$SiteUrl, `$Delegate, `$AppId, `$Tenant, `$CertificateBase64, `$CertificatePassword, `$CertificateThumbprint, [switch]`$InProcess, [switch]`$WhatIf) $body }"
+            $f
+        }
+        $script:UseModule = { param($f) & (Get-Module Coretelligent.SharePoint) { param($x) $script:CtgSharePointModuleFile = $x } $f }
+        $script:RealModule = & (Get-Module Coretelligent.SharePoint) { $script:CtgSharePointModuleFile }
+    }
+    AfterEach { & $script:UseModule $script:RealModule }
+    AfterAll { Remove-Item -LiteralPath $script:FakeDir -Recurse -Force -ErrorAction SilentlyContinue }
+
+    It 'never connects PnP in the calling process — the grant goes to Invoke-CtgPnPChild' {
+        Mock -CommandName Connect-CtgSharePointPnP -ModuleName Coretelligent.SharePoint -MockWith { }
+        Mock -CommandName Invoke-CtgPnPChild -ModuleName Coretelligent.SharePoint -MockWith { "granted $($GrantArgs.Delegate) site-collection admin on $($GrantArgs.SiteUrl)" }
+        $r = Grant-CtgSharePointSiteAccess -SiteUrl 'https://x/s' -Delegate 'amelia@x.com' -AppId a -Tenant t -CertificateBase64 'Yg==' -CertificatePassword 'pw'
+        Should -Invoke Connect-CtgSharePointPnP -ModuleName Coretelligent.SharePoint -Times 0 -Exactly
+        Should -Invoke Invoke-CtgPnPChild -ModuleName Coretelligent.SharePoint -Times 1 -Exactly -ParameterFilter {
+            $GrantArgs.SiteUrl -eq 'https://x/s' -and $GrantArgs.Delegate -eq 'amelia@x.com' -and $GrantArgs.CertificateBase64 -eq 'Yg==' -and $GrantArgs.CertificatePassword -eq 'pw' -and -not $GrantArgs.ContainsKey('CertificateThumbprint')
+        }
+        $r | Should -Be 'granted amelia@x.com site-collection admin on https://x/s'
+    }
+
+    It 'round-trips the request over stdin and returns the child''s action line' {
+        & $script:UseModule (& $script:Fake 'ok' 'if (-not $InProcess) { throw "not in-process" }; "granted $Delegate on $SiteUrl (cert $CertificateBase64)"')
+        $r = Grant-CtgSharePointSiteAccess -SiteUrl 'https://x/s' -Delegate 'o''brien@x.com' -AppId a -Tenant t -CertificateBase64 'Yg=='
+        $r | Should -Be "granted o'brien@x.com on https://x/s (cert Yg==)"
+    }
+
+    It 'turns an error inside the child into a throw carrying its message' {
+        & $script:UseModule (& $script:Fake 'err' 'throw "Access denied: Sites.FullControl.All is missing"')
+        { Grant-CtgSharePointSiteAccess -SiteUrl 'https://x/s' -Delegate 'a@x.com' -AppId a -Tenant t -CertificateBase64 'Yg==' } | Should -Throw '*Sites.FullControl.All is missing*'
+    }
+
+    It 'survives a REAL stack overflow in the child and says so' {
+        # A genuine .NET stack overflow, the same process death PnP's resolver caused. In-process this
+        # would end the Pester run itself; the assertion running at all is half the proof.
+        & $script:UseModule (& $script:Fake 'so' 'Add-Type -TypeDefinition "public static class CtgBoom { public static int F(int n) { return F(n + 1) + 1; } }"; [CtgBoom]::F(0)')
+        { Grant-CtgSharePointSiteAccess -SiteUrl 'https://x/s' -Delegate 'a@x.com' -AppId a -Tenant t -CertificateBase64 'Yg==' } | Should -Throw '*stack overflow*The runner kept running*'
+    }
+
+    It 'stops a hung child at the timeout instead of hanging the job' {
+        & $script:UseModule (& $script:Fake 'hang' 'Start-Sleep -Seconds 60')
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        { & (Get-Module Coretelligent.SharePoint) { Invoke-CtgPnPChild -GrantArgs @{ SiteUrl = 'https://x/s'; Delegate = 'a@x.com' } -TimeoutSeconds 3 } } | Should -Throw '*did not finish within 3 s*'
+        $sw.Elapsed.TotalSeconds | Should -BeLessThan 30
     }
 }
 
