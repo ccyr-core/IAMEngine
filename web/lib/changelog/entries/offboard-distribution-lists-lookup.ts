@@ -4,7 +4,7 @@ export const entry: ChangelogEntry = {
   id: "offboard-distribution-lists-lookup",
   date: "2026-09-24",
   time: "15:00",
-  title: "Offboarding finds the user's distribution lists directly instead of checking every list (runner 1.141.0, FR #176)",
+  title: "Offboarding finds the user's distribution lists directly instead of checking every list (runner 1.142.0, FR #176)",
   items: [
     "The Exchange offboard step used to read every distribution list in the tenant and then each list's members to find the leaver - on a large tenant, minutes of a step that looked stuck",
     "It now asks Microsoft 365 for the user's own group memberships in one lookup and removes them from the cloud distribution lists and mail-enabled security groups found there",
