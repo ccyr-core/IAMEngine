@@ -436,6 +436,7 @@ export { entry as coretelligentPostResetRestore } from "./coretelligent-post-res
 export { entry as credExpirySettings } from "./cred-expiry-settings";
 export { entry as credPlatform } from "./cred-platform";
 export { entry as cvpMailboxAuditing } from "./cvp-mailbox-auditing";
+export { entry as defaultPasswordOnCase } from "./default-password-on-case";
 export { entry as defaultSharedMailboxAccess } from "./default-shared-mailbox-access";
 export { entry as delineaSecretserverCloudCreateFix } from "./delinea-secretserver-cloud-create-fix";
 export { entry as delineaTemplateByName } from "./delinea-template-by-name";
@@ -621,6 +622,7 @@ export { entry as spanningOtpBroker } from "./spanning-otp-broker";
 export { entry as starwarsEgg } from "./starwars-egg";
 export { entry as spanningPortalSecretSplit } from "./spanning-portal-secret-split";
 export { entry as systemsEditorKb } from "./systems-editor-kb";
+export { entry as tapForEveryClient } from "./tap-for-every-client";
 export { entry as tenFixHardeningBatch } from "./ten-fix-hardening-batch";
 export { entry as unlicensedUserHoldsMimecastSpanning } from "./unlicensed-user-holds-mimecast-spanning";
 export { entry as unmodeledStepsBecomeManual } from "./unmodeled-steps-become-manual";
