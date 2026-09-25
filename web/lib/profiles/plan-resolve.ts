@@ -8,6 +8,7 @@ import { resolveSystemConfig } from "./resolve";
 import { evaluateLicenseRules } from "../m365/license-rules";
 import { hideFromGalOptedOut, adLaneHidesViaAttribute, readHideFromGal } from "./hide-from-gal";
 import type { PlannedJob } from "../orchestrator";
+import { matchChoices, coveredKey, type ChoiceMapping } from "../clients/universal-choices";
 
 type PlanClient = {
   backbone?: string | null;
@@ -15,6 +16,8 @@ type PlanClient = {
   // Discovered group catalogs (see prisma schema): adObjects = { groups: string[] } from the DC,
   // cloudGroups = { groups: [{ name, type }] } from Entra/Graph. Used to route location groups.
   adObjects?: unknown; cloudGroups?: unknown;
+  // The client's ServiceNow Universal Choices with their hand-mapped groups (UniversalChoice rows).
+  universalChoices?: ChoiceMapping[];
 };
 
 // A location group is inherently multi-lane, but a group discovery proves is CLOUD-ONLY — present in
@@ -403,11 +406,15 @@ export function resolvePlannedConfigs(
     for (const g of add) { const k = g.toLowerCase(); if (!seen.has(k)) { seen.add(k); base.push(g); } }
     cfg.groups = base;
   };
-  const reqDls = safeGroups(strList(payload.emailDistroGroups));
+  // Universal Choices (see lib/clients/universal-choices): a pick whose choice is MAPPED gets the
+  // mapped groups below instead of being used as a group name here. Unmapped picks are unchanged.
+  const choiceMatch = matchChoices(payload, client.universalChoices ?? []);
+  const notMapped = (field: string) => (g: string) => !choiceMatch.covered.has(coveredKey(field, g));
+  const reqDls = safeGroups(strList(payload.emailDistroGroups).filter(notMapped("emailDistroGroups")));
   // FR #30: operator-typed "additional groups" on the case review panel (payload.extraGroups) merge
   // into the same mastering-lane routing as ticket-picked security groups — AD lane if the client
   // has one, else m365/entra — and pass the same protected-groups filter.
-  const reqSec = safeGroups([...strList(payload.securityGroups), ...strList(payload.extraGroups)]);
+  const reqSec = safeGroups([...strList(payload.securityGroups).filter(notMapped("securityGroups")), ...strList(payload.extraGroups)]);
   // No Graph lane planned (exchange-only client): the namedGroups handoff below has nothing to read
   // from, so hand the DLs to the exchange job directly.
   const hasGraphLane = withLoc.some((j) => j.systemKey === "m365" || j.systemKey === "entra");
@@ -462,9 +469,32 @@ export function resolvePlannedConfigs(
     return { ...j, config: { ...cfg, defaultSharedMailboxes: base } };
   });
 
+  // Universal Choices -> mapped groups. Microsoft 365 groups go to the m365/entra lane, where the
+  // M365 executor adds security/M365 groups and hands mail-enabled ones to Exchange (the same route a
+  // requested DL takes); with no Graph lane, to the exchange job's namedGroups. Google groups go to
+  // the google-workspace lane. Same protected-groups filter as every other requested group.
+  const choiceM365 = safeGroups(choiceMatch.m365);
+  const choiceGoogle = safeGroups(choiceMatch.google);
+  const withChoices = (choiceM365.length === 0 && choiceGoogle.length === 0) ? withSharedMailboxes : withSharedMailboxes.map((j) => {
+    const toGraph = choiceM365.length > 0 && (j.systemKey === "m365" || j.systemKey === "entra");
+    const toExchange = choiceM365.length > 0 && !hasGraphLane && j.systemKey === "exchange";
+    const toGoogle = choiceGoogle.length > 0 && j.systemKey === "google-workspace";
+    if (!toGraph && !toExchange && !toGoogle) return j;
+    const cfg = { ...((j.config as Record<string, unknown> | null) ?? {}) };
+    if (toGraph) unionGroups(cfg, choiceM365);
+    if (toGoogle) unionGroups(cfg, choiceGoogle);
+    if (toExchange) {
+      const base = Array.isArray(cfg.namedGroups) ? [...(cfg.namedGroups as unknown[])] : [];
+      const seen = new Set(base.map((g) => String(g).toLowerCase()));
+      for (const g of choiceM365) { const k = g.toLowerCase(); if (!seen.has(k)) { seen.add(k); base.push(g); } }
+      cfg.namedGroups = base;
+    }
+    return { ...j, config: cfg };
+  });
+
   const withMirror = !mirror
-    ? withSharedMailboxes
-    : withSharedMailboxes.map((j) =>
+    ? withChoices
+    : withChoices.map((j) =>
         DIRECTORY_SYSTEMS.has(j.systemKey)
           ? { ...j, config: { ...((j.config as Record<string, unknown> | null) ?? {}), mirrorFromUser: mirror } }
           : j
