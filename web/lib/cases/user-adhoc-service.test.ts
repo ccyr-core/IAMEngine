@@ -67,7 +67,7 @@ function stubDb(opts: { action?: string; ageDays?: number; jobs?: J[]; payload?:
       findUnique: async (args: { where: { id: string } }) => { const j = state.jobs.find((x) => x.id === args.where.id); return j ? { caseRequestId: "case", ...j } : null; },
       findMany: async () => state.jobs,
     },
-    agent: { findMany: async () => opts.agents ?? [{ name: "dc01", semver: "1.137.0" }] },
+    agent: { findMany: async () => opts.agents ?? [{ name: "dc01", semver: "1.138.0" }] },
     $transaction: async (fn: (t: typeof tx) => unknown) => fn(tx),
     auditLog: { create: async () => ({}) },
   } as unknown as PrismaClient;
@@ -274,17 +274,17 @@ test("any correct/remove step in flight blocks both kinds", async () => {
 });
 
 // ── L2: runner version gate + "skipped" is not done ─────────────────────────────────────────────
-test("L2: runners older than 1.137.0 (or not reporting a version) are withheld the correct/remove keys", () => {
+test("L2: runners older than 1.138.0 (or not reporting a version) are withheld the correct/remove keys", () => {
   assert.deepEqual(userAdhocVersionExclusions("1.126.9").sort(), [...USER_ADHOC_SYSTEM_KEYS].sort());
   assert.deepEqual(userAdhocVersionExclusions(null).sort(), [...USER_ADHOC_SYSTEM_KEYS].sort());
-  assert.deepEqual(userAdhocVersionExclusions("1.137.0"), []);
+  assert.deepEqual(userAdhocVersionExclusions("1.138.0"), []);
   assert.deepEqual(userAdhocVersionExclusions("2.0.1"), []);
 });
 
 test("L2: a 'skipped' correct/remove result is recorded as failed (not done); other keys are untouched", () => {
   const r = userAdhocResultStatus("m365-correct-user", "skipped");
   assert.equal(r.status, "failed");
-  assert.match(r.error ?? "", /runner 1.137.0 or later/);
+  assert.match(r.error ?? "", /runner 1.138.0 or later/);
   assert.deepEqual(userAdhocResultStatus("m365", "skipped"), { status: "skipped" });
   assert.deepEqual(userAdhocResultStatus("ad-remove-user", "succeeded"), { status: "succeeded" });
 });
@@ -369,13 +369,13 @@ test("N2: a Remove that deleted nothing (refused / not found) does not block Cor
   assert.equal(removeDeletedSomething(legacy), true, "a result from before the flag counts as deleted");
 });
 
-test("N3: an AD correct/remove is refused when every runner of the client is older than 1.137.0", async () => {
+test("N3: an AD correct/remove is refused when every runner of the client is older than 1.138.0", async () => {
   const { db, created } = stubDb({ agents: [{ name: "dc01", semver: "1.126.4" }, { name: "dc02", semver: null }] });
   const r = await dispatchUserAdhoc(db, "case", "remove", "t");
   assert.equal(r.ok, false);
-  assert.match(String((r as { error: string }).error), /updated to 1.137.0 or later .* dc01 \(1\.126\.4\), dc02 \(version unknown\)/);
+  assert.match(String((r as { error: string }).error), /updated to 1.138.0 or later .* dc01 \(1\.126\.4\), dc02 \(version unknown\)/);
   assert.equal(created.length, 0);
-  const ok = stubDb({ agents: [{ name: "dc01", semver: "1.126.4" }, { name: "dc02", semver: "1.137.0" }] });
+  const ok = stubDb({ agents: [{ name: "dc01", semver: "1.126.4" }, { name: "dc02", semver: "1.138.0" }] });
   assert.equal((await dispatchUserAdhoc(ok.db, "case", "remove", "t")).ok, true);
 });
 
@@ -385,10 +385,10 @@ test("N3 (final review): refused when the client has no enabled runner, or none 
   assert.equal(r1.ok, false);
   assert.match(String((r1 as { error: string }).error), /no enabled runner/);
   assert.equal(none.created.length, 0);
-  const noAd = stubDb({ agents: [{ name: "fs01", semver: "1.137.0", capabilities: ["directory-sync"] }] });
+  const noAd = stubDb({ agents: [{ name: "fs01", semver: "1.138.0", capabilities: ["directory-sync"] }] });
   const r2 = await dispatchUserAdhoc(noAd.db, "case", "correct", "t", { firstName: "Jon" });
   assert.equal(r2.ok, false);
   assert.match(String((r2 as { error: string }).error), /none of the client's runners can run Active Directory steps \(fs01\)/);
-  const ok = stubDb({ agents: [{ name: "fs01", semver: "1.137.0", capabilities: ["directory-sync"] }, { name: "dc01", semver: "1.137.0", capabilities: ["active-directory"] }] });
+  const ok = stubDb({ agents: [{ name: "fs01", semver: "1.138.0", capabilities: ["directory-sync"] }, { name: "dc01", semver: "1.138.0", capabilities: ["active-directory"] }] });
   assert.equal((await dispatchUserAdhoc(ok.db, "case", "remove", "t")).ok, true);
 });
