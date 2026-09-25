@@ -4,11 +4,11 @@
 // (add groups / place OU / set attrs); offboard resolves the OFFBOARD fragments with offboard
 // semantics (remove groups / move OU / set attrs).
 import { buildPlanContext } from "./context";
+import { matchChoices, coveredKey, type ChoiceMapping } from "../clients/universal-choices";
 import { resolveSystemConfig } from "./resolve";
 import { evaluateLicenseRules } from "../m365/license-rules";
 import { hideFromGalOptedOut, adLaneHidesViaAttribute, readHideFromGal } from "./hide-from-gal";
 import type { PlannedJob } from "../orchestrator";
-import { matchChoices, coveredKey, type ChoiceMapping } from "../clients/universal-choices";
 
 type PlanClient = {
   backbone?: string | null;
@@ -442,40 +442,13 @@ export function resolvePlannedConfigs(
         return { ...j, config: cfg };
       });
 
-  // Case-requested SHARED MAILBOXES (FR #0000115). The intake captured them
-  // (u_shared_resource_mailboxes -> payload.sharedMailboxes) and nothing planned them — the FOURTH
-  // field of this exact shape, after #47 (out-of-office), #84 (delegates) and #97 (forwarding).
-  //
-  // The destination already exists: the m365/entra lane's defaultSharedMailboxes list, which the
-  // Exchange finish grants at FullAccess by default (Invoke-CtgExchangeDefaultMailboxAccess, FR #15).
-  // That is why the requester saw per-client defaults working while ticket-named ones did nothing —
-  // the client list is profile config, and the ticket had no route to the same place.
-  //
-  // UNION, never replace: a client's standing list and the ticket's request are both wanted. Entries
-  // may be bare strings (FullAccess) or { address, access }, so compare on the address either way — a
-  // duplicate would be granted twice and logged twice, reading on the case as two separate grants.
-  const reqMailboxes = strList(payload.sharedMailboxes);
-  const withSharedMailboxes = reqMailboxes.length === 0 ? withRequested : withRequested.map((j) => {
-    if (j.systemKey !== "m365" && j.systemKey !== "entra") return j;
-    const cfg = (j.config as Record<string, unknown> | null) ?? {};
-    const base = Array.isArray(cfg.defaultSharedMailboxes) ? [...(cfg.defaultSharedMailboxes as unknown[])] : [];
-    const addressOf = (e: unknown): string =>
-      (typeof e === "string" ? e : String((e as { address?: unknown })?.address ?? "")).trim().toLowerCase();
-    const seen = new Set(base.map(addressOf).filter(Boolean));
-    for (const m of reqMailboxes) {
-      const k = m.toLowerCase();
-      if (!seen.has(k)) { seen.add(k); base.push(m); }
-    }
-    return { ...j, config: { ...cfg, defaultSharedMailboxes: base } };
-  });
-
   // Universal Choices -> mapped groups. Microsoft 365 groups go to the m365/entra lane, where the
   // M365 executor adds security/M365 groups and hands mail-enabled ones to Exchange (the same route a
   // requested DL takes); with no Graph lane, to the exchange job's namedGroups. Google groups go to
   // the google-workspace lane. Same protected-groups filter as every other requested group.
   const choiceM365 = safeGroups(choiceMatch.m365);
   const choiceGoogle = safeGroups(choiceMatch.google);
-  const withChoices = (choiceM365.length === 0 && choiceGoogle.length === 0) ? withSharedMailboxes : withSharedMailboxes.map((j) => {
+  const withChoices = (choiceM365.length === 0 && choiceGoogle.length === 0) ? withRequested : withRequested.map((j) => {
     const toGraph = choiceM365.length > 0 && (j.systemKey === "m365" || j.systemKey === "entra");
     const toExchange = choiceM365.length > 0 && !hasGraphLane && j.systemKey === "exchange";
     const toGoogle = choiceGoogle.length > 0 && j.systemKey === "google-workspace";
@@ -492,9 +465,36 @@ export function resolvePlannedConfigs(
     return { ...j, config: cfg };
   });
 
+  // Case-requested SHARED MAILBOXES (FR #0000115). The intake captured them
+  // (u_shared_resource_mailboxes -> payload.sharedMailboxes) and nothing planned them — the FOURTH
+  // field of this exact shape, after #47 (out-of-office), #84 (delegates) and #97 (forwarding).
+  //
+  // The destination already exists: the m365/entra lane's defaultSharedMailboxes list, which the
+  // Exchange finish grants at FullAccess by default (Invoke-CtgExchangeDefaultMailboxAccess, FR #15).
+  // That is why the requester saw per-client defaults working while ticket-named ones did nothing —
+  // the client list is profile config, and the ticket had no route to the same place.
+  //
+  // UNION, never replace: a client's standing list and the ticket's request are both wanted. Entries
+  // may be bare strings (FullAccess) or { address, access }, so compare on the address either way — a
+  // duplicate would be granted twice and logged twice, reading on the case as two separate grants.
+  const reqMailboxes = strList(payload.sharedMailboxes);
+  const withSharedMailboxes = reqMailboxes.length === 0 ? withChoices : withChoices.map((j) => {
+    if (j.systemKey !== "m365" && j.systemKey !== "entra") return j;
+    const cfg = (j.config as Record<string, unknown> | null) ?? {};
+    const base = Array.isArray(cfg.defaultSharedMailboxes) ? [...(cfg.defaultSharedMailboxes as unknown[])] : [];
+    const addressOf = (e: unknown): string =>
+      (typeof e === "string" ? e : String((e as { address?: unknown })?.address ?? "")).trim().toLowerCase();
+    const seen = new Set(base.map(addressOf).filter(Boolean));
+    for (const m of reqMailboxes) {
+      const k = m.toLowerCase();
+      if (!seen.has(k)) { seen.add(k); base.push(m); }
+    }
+    return { ...j, config: { ...cfg, defaultSharedMailboxes: base } };
+  });
+
   const withMirror = !mirror
-    ? withChoices
-    : withChoices.map((j) =>
+    ? withSharedMailboxes
+    : withSharedMailboxes.map((j) =>
         DIRECTORY_SYSTEMS.has(j.systemKey)
           ? { ...j, config: { ...((j.config as Record<string, unknown> | null) ?? {}), mirrorFromUser: mirror } }
           : j

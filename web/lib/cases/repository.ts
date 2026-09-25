@@ -1,6 +1,7 @@
 // Thin Prisma wrapper for the cases domain. Factory-style for testability, mirroring
 // lib/clients/repository.ts.
 import type { PrismaClient, ClientSystem, CaseStatus, Action } from "@prisma/client";
+import type { ChoiceMapping } from "../clients/universal-choices";
 import { Prisma } from "@prisma/client"; // value import — Prisma.DbNull is used at runtime
 import type { PlannedJob } from "../orchestrator";
 import type { AuditEntry } from "../clients/types";
@@ -18,10 +19,6 @@ import { notM365AutoSetupCase } from "./exclude-m365-autosetup";
 import { type ClientScope, clientIdWhere, scopeAllows } from "../auth/client-scope";
 import { inheritsFromParent, inheritsParentModeling, applyParentInheritance, PARENT_INHERIT_SELECT } from "./parent-inheritance";
 import { unmodeledStepTitle, type UnmodeledSection } from "./unmodeled-steps";
-import type { ChoiceMapping } from "../clients/universal-choices";
-
-// The UniversalChoice columns the planner reads (lib/clients/universal-choices matchChoices).
-const UNIVERSAL_CHOICE_SELECT = { question: true, label: true, value: true, m365Groups: true, googleGroups: true } as const;
 
 // One-line explanation of a case's status, for the list hover tooltip. Reads the case's jobs the
 // same way deriveCaseStatus / the dependency gate do, so the hint matches the badge.
@@ -124,6 +121,9 @@ async function wiredOptionalSecretNames(db: PrismaClient, clientId: string, pare
   const effective = await effectiveSecretMap(db, clientId, parentId);
   return [...effective].filter(([name, id]) => ALL_OPTIONAL_SECRET_NAMES.has(name) && secretIsSet(id)).map(([name]) => name);
 }
+
+// The UniversalChoice columns the planner reads (lib/clients/universal-choices matchChoices).
+const UNIVERSAL_CHOICE_SELECT = { question: true, label: true, value: true, m365Groups: true, googleGroups: true } as const;
 
 export function makeCaseRepository(db: PrismaClient) {
   return {
