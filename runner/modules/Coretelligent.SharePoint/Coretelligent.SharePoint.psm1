@@ -613,7 +613,8 @@ function Invoke-CtgSharePointSiteGroupsStep {
         $Payload,
         $Config,
         [string]$LeaverUpn,
-        [Parameter(Mandatory)][scriptblock]$Context
+        [Parameter(Mandatory)][scriptblock]$Context,
+        [switch]$InProcess
     )
     $actions = [System.Collections.Generic.List[string]]::new()
     $result = { param($email) [pscustomobject]@{ System = 'sharepoint'; Status = 'ok'; Email = $email; Actions = $actions.ToArray() } }
@@ -630,26 +631,159 @@ function Invoke-CtgSharePointSiteGroupsStep {
         if (-not $refUpn) { $actions.Add("WARN mirror user not found in Entra: $mirror — SharePoint site groups not mirrored"); return (& $result $email) }
         $exclude = @(@(Get-CtgProp (Get-CtgProp $Config 'mirrorPolicy') 'exclude') | Where-Object { $_ } | ForEach-Object { [string]$_ })
     }
+    # Everything above is Graph and stays in this process. Everything below is PnP, and PnP must never
+    # load in the runner (see Invoke-CtgPnPGrantOutOfProcess: its identity assemblies clash with Graph's
+    # and Graph stops answering). The walk runs in a child pwsh; -InProcess is for the tests, which
+    # exercise the walk itself with PnP mocked.
     $ctx = & $Context
-    $cert = New-CtgPnPCertFile $ctx.CertArgs   # once for the site listing AND the whole walk
-    try {
+    $walk = @{
+        Lane = $Lane; Email = $email; AppId = $ctx.AppId; Tenant = $ctx.Tenant; CertArgs = $ctx.CertArgs; AdminUrl = $ctx.AdminUrl
         # Offboard ALWAYS lists fresh (and refreshes the cache): a site created inside the 6 h cache
         # window would otherwise never be walked, and the leaver would keep access there while the
         # step reported success. A mirror that misses a brand-new site only grants less, so it may use the cache.
-        $fresh = $Lane -eq 'offboard'
-        Write-CtgSharePointStep "listing SharePoint sites$(if ($fresh) { ' (fresh)' } else { ' (cached per tenant)' })"
-        $sites = @(Get-CtgSharePointSiteUrls -AdminUrl $ctx.AdminUrl -AppId $ctx.AppId -Tenant $ctx.Tenant -CertArgs $cert.CertArgs -NoCache:$fresh)
+        NoCache = ($Lane -eq 'offboard')
+    }
+    if ($Lane -eq 'onboard') { $walk.ReferenceEmail = $refUpn; $walk.Exclude = $exclude }
+    $walked = if ($InProcess) { Invoke-CtgSharePointSiteGroupsWalk @walk } else { Invoke-CtgSharePointSiteWalkOutOfProcess -Walk $walk }
+    foreach ($a in @($walked)) { $actions.Add([string]$a) }
+    return (& $result $email)
+}
+
+# The PnP half of the site-groups step: list the tenant's sites (unless -Sites is given), then remove
+# the leaver from, or mirror the reference user's, site groups on each. Runs in the child pwsh that
+# Invoke-CtgSharePointSiteWalkOutOfProcess starts (or in-process under the tests). -OnSites is told the
+# freshly listed sites, so the parent can keep the per-tenant cache the child's short life can't.
+function Invoke-CtgSharePointSiteGroupsWalk {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)][ValidateSet('onboard', 'offboard')][string]$Lane,
+        [Parameter(Mandatory)][string]$Email,
+        [string]$ReferenceEmail,
+        [string[]]$Exclude = @(),
+        [Parameter(Mandatory)][string]$AppId,
+        [Parameter(Mandatory)][string]$Tenant,
+        [hashtable]$CertArgs = @{},
+        [string]$AdminUrl,
+        [AllowEmptyCollection()][string[]]$Sites,
+        [switch]$NoCache,
+        [scriptblock]$OnSites
+    )
+    $cert = New-CtgPnPCertFile $CertArgs   # once for the site listing AND the whole walk
+    try {
+        if ($null -eq $Sites) {
+            Write-CtgSharePointStep "listing SharePoint sites$(if ($NoCache) { ' (fresh)' } else { ' (cached per tenant)' })"
+            $Sites = @(Get-CtgSharePointSiteUrls -AdminUrl $AdminUrl -AppId $AppId -Tenant $Tenant -CertArgs $cert.CertArgs -NoCache:$NoCache)
+            if ($OnSites) { & $OnSites $Sites }
+        }
         if ($Lane -eq 'offboard') {
-            Write-CtgSharePointStep "removing $email from site groups on $($sites.Count) site(s)"
-            foreach ($a in (Invoke-CtgSharePointSiteGroupsOffboard -Email $email -Sites $sites -AppId $ctx.AppId -Tenant $ctx.Tenant -CertArgs $cert.CertArgs)) { $actions.Add($a) }
+            Write-CtgSharePointStep "removing $Email from site groups on $($Sites.Count) site(s)"
+            return @(Invoke-CtgSharePointSiteGroupsOffboard -Email $Email -Sites $Sites -AppId $AppId -Tenant $Tenant -CertArgs $cert.CertArgs)
         }
-        else {
-            Write-CtgSharePointStep "mirroring $refUpn's site groups onto $email across $($sites.Count) site(s)"
-            foreach ($a in (Invoke-CtgSharePointSiteGroupsMirror -NewEmail $email -ReferenceEmail $refUpn -Sites $sites -AppId $ctx.AppId -Tenant $ctx.Tenant -CertArgs $cert.CertArgs -Exclude $exclude)) { $actions.Add($a) }
-        }
+        Write-CtgSharePointStep "mirroring $ReferenceEmail's site groups onto $Email across $($Sites.Count) site(s)"
+        return @(Invoke-CtgSharePointSiteGroupsMirror -NewEmail $Email -ReferenceEmail $ReferenceEmail -Sites $Sites -AppId $AppId -Tenant $Tenant -CertArgs $cert.CertArgs -Exclude $Exclude)
     }
     finally { Remove-CtgPnPCertFile $cert.Path }
-    return (& $result $email)
+}
+
+# Longest the site-walk child may go without printing a line before it is presumed hung and stopped.
+# The walk narrates at least every 30 s and its longest throttle back-off is 60 s, so a live child is
+# never this quiet. It stays well under the runner's 600 s stall watchdog, so a hung child is stopped
+# and reported as a failed step instead of taking the whole runner down with it.
+$script:CtgSpWalkQuietSeconds = 420
+
+# Run Invoke-CtgSharePointSiteGroupsWalk in a clean child pwsh, relaying its progress live.
+# The child prints one tagged line per event: PROGRESS / ACT / SITES (base64 text), then DONE, or FAIL
+# with the walk's own failure message. The request, certificate included, goes in a file in a private
+# per-call directory, which the child deletes before it does anything else and this function removes in
+# a finally; it is never on a command line. Returns the walk's action lines; throws its failure
+# message, or a plain account of a child that crashed, hung or ended without a verdict.
+function Invoke-CtgSharePointSiteWalkOutOfProcess {
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)][hashtable]$Walk,
+        [string]$ModulePath = (Join-Path $PSScriptRoot 'Coretelligent.SharePoint.psd1'),
+        [int]$QuietSeconds = $script:CtgSpWalkQuietSeconds
+    )
+    $w = $Walk.Clone()
+    $hit = $script:CtgSiteCache[[string]$w.Tenant]
+    if (-not $w.NoCache -and $hit -and ((Get-Date) - $hit.At).TotalHours -lt $script:CtgSiteCacheHours) { $w.Sites = @($hit.Urls) }
+
+    $pwshPath = (Get-Process -Id $PID).Path
+    if (-not $pwshPath -or (Split-Path $pwshPath -Leaf) -notmatch '^pwsh') { $pwshPath = (Get-Command pwsh -ErrorAction SilentlyContinue).Source }
+    if (-not $pwshPath) { throw 'cannot locate pwsh to run the SharePoint site walk in a clean process' }
+
+    $dir = Join-Path ([System.IO.Path]::GetTempPath()) ("ctg-spwalk-" + [guid]::NewGuid().ToString('N'))
+    # .NET file calls, not the cmdlets, all through here: a dry run sets $WhatIfPreference, and New-Item /
+    # Set-Content / Remove-Item honour it, so the request never reached the child and the cleanup left the
+    # certificate behind.
+    $null = [System.IO.Directory]::CreateDirectory($dir)
+    if (-not $IsWindows) { & chmod 700 $dir 2>$null }
+    $payloadPath = Join-Path $dir 'walk.json'
+    $childPath = Join-Path $dir 'walk.ps1'
+    $p = $null
+    try {
+        [System.IO.File]::WriteAllText($payloadPath, (@{ Walk = $w; ModulePath = $ModulePath; WhatIf = [bool]$WhatIfPreference } | ConvertTo-Json -Depth 6 -Compress))
+        if (-not $IsWindows) { & chmod 600 $payloadPath 2>$null }
+        [System.IO.File]::WriteAllText($childPath, @'
+param([string]$PayloadPath)
+$ErrorActionPreference = 'Stop'
+function global:Send-CtgLine { param([string]$Tag, [string]$Text) [Console]::Out.WriteLine($Tag + "`t" + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Text))) }
+function global:Send-CtgProgress { param([string]$Message) Send-CtgLine 'PROGRESS' $Message }
+try {
+    $p = Get-Content -LiteralPath $PayloadPath -Raw | ConvertFrom-Json -AsHashtable
+    Remove-Item -LiteralPath $PayloadPath -Force -ErrorAction SilentlyContinue
+    Import-Module $p.ModulePath -Force
+    $walk = $p.Walk
+    if (-not $walk.CertArgs) { $walk.CertArgs = @{} }
+    $walk.OnSites = { param($s) Send-CtgLine 'SITES' (ConvertTo-Json -InputObject @($s) -Compress) }
+    $acts = Invoke-CtgSharePointSiteGroupsWalk @walk -WhatIf:([bool]$p.WhatIf)
+    foreach ($a in @($acts)) { Send-CtgLine 'ACT' ([string]$a) }
+    [Console]::Out.WriteLine('DONE')
+}
+catch { Send-CtgLine 'FAIL' $_.Exception.Message; exit 3 }
+'@)
+        $psi = [System.Diagnostics.ProcessStartInfo]::new($pwshPath)
+        foreach ($a in @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $childPath, '-PayloadPath', $payloadPath)) { $psi.ArgumentList.Add($a) }
+        $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+        $p = [System.Diagnostics.Process]::Start($psi)
+        $errTask = $p.StandardError.ReadToEndAsync()
+        $dec = { param($b) try { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b)) } catch { $b } }
+        $acts = [System.Collections.Generic.List[string]]::new()
+        $fail = $null; $done = $false
+        $quiet = [System.Diagnostics.Stopwatch]::StartNew()
+        $read = $p.StandardOutput.ReadLineAsync()
+        while ($true) {
+            if (-not $read.Wait(1000)) {
+                if ($quiet.Elapsed.TotalSeconds -lt $QuietSeconds) { continue }
+                try { $p.Kill($true) } catch { }
+                throw "SharePoint site groups: the SharePoint helper went $QuietSeconds s without reporting anything and was stopped, so the walk did not finish$(if ($acts.Count) { ". Done before it stopped: $($acts -join '; ')" }). Re-run the step (it only changes what is still left to do)."
+            }
+            $line = $read.Result
+            if ($null -eq $line) { break }
+            $quiet.Restart()
+            $tag, $body = $line -split "`t", 2
+            switch ($tag) {
+                'PROGRESS' { Write-CtgSharePointStep (& $dec $body) }
+                'ACT' { $acts.Add((& $dec $body)) }
+                'SITES' { $script:CtgSiteCache[[string]$w.Tenant] = @{ At = Get-Date; Urls = @((& $dec $body) | ConvertFrom-Json) } }
+                'FAIL' { $fail = & $dec $body }
+                'DONE' { $done = $true }
+            }
+            $read = $p.StandardOutput.ReadLineAsync()
+        }
+        $p.WaitForExit()
+        if ($fail) { throw $fail }
+        if (-not $done) {
+            $first = @(([string]$errTask.Result -split "`r?`n") | Where-Object { $_.Trim() }) | Select-Object -First 1
+            $why = if ($p.ExitCode -in @(-1073741571, 134) -or "$first" -match 'Stack overflow') { 'crashed (stack overflow in PnP.PowerShell)' } else { "exited with code $($p.ExitCode)$(if ($first) { ": $first" })" }
+            throw "SharePoint site groups: the SharePoint helper $why before finishing, so the walk is incomplete$(if ($acts.Count) { ". Done before it stopped: $($acts -join '; ')" }). The runner kept running; re-run the step."
+        }
+        return $acts.ToArray()
+    }
+    finally {
+        if ($p) { $p.Dispose() }
+        try { [System.IO.Directory]::Delete($dir, $true) } catch { }
+    }
 }
 
 # Run the PnP grants in a CLEAN CHILD pwsh, so PnP.PowerShell's assemblies never enter the runner
@@ -759,4 +893,4 @@ function Get-CtgOneDriveSiteUrl {
     $m.Groups[1].Value
 }
 
-Export-ModuleMember -Function Connect-CtgSharePointPnP, Get-CtgSharePointSiteUrls, Invoke-CtgSharePointSiteGroupsOffboard, Invoke-CtgSharePointSiteGroupsMirror, Invoke-CtgSharePointSiteGroupsStep, Grant-CtgSharePointSiteAccess, Get-CtgOneDriveSiteUrl, Test-CtgOffboardResolved, Invoke-CtgSharePointOffboardGrant, Test-CtgDelegateUnambiguous, Invoke-CtgPnPGrantOutOfProcess, ConvertFrom-CtgPnPGrantOutput
+Export-ModuleMember -Function Connect-CtgSharePointPnP, Get-CtgSharePointSiteUrls, Invoke-CtgSharePointSiteGroupsOffboard, Invoke-CtgSharePointSiteGroupsMirror, Invoke-CtgSharePointSiteGroupsStep, Invoke-CtgSharePointSiteGroupsWalk, Invoke-CtgSharePointSiteWalkOutOfProcess, Grant-CtgSharePointSiteAccess, Get-CtgOneDriveSiteUrl, Test-CtgOffboardResolved, Invoke-CtgSharePointOffboardGrant, Test-CtgDelegateUnambiguous, Invoke-CtgPnPGrantOutOfProcess, ConvertFrom-CtgPnPGrantOutput

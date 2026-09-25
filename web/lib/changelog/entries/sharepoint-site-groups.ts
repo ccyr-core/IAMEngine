@@ -14,6 +14,7 @@ export const entry: ChangelogEntry = {
     "Sites the person never used are skipped quickly. An offboard always reads the tenant's current list of sites, so a site created that morning is still cleaned up. An onboard reuses a list up to 6 hours old",
     "If SharePoint is throttling, the step waits and retries. If a site still can't be checked, the other sites are still done, then the step fails and lists the sites it couldn't finish. An offboard never reports success while the leaver might still have access somewhere. The run report shows progress as the step works through the sites",
     "A dry run writes the certificate to disk only once and deletes it afterwards. Before this, each site left its own copy behind",
+    "The SharePoint work runs in a separate PowerShell process, never inside the runner, the same way the OneDrive hand-off does since runner 1.131.0. Loading SharePoint's module in the runner is what made Microsoft 365 steps hang and the runner restart. Progress still shows live on the run report, and a SharePoint process that stops responding is stopped after 7 minutes and reported, instead of the runner restarting",
     "It uses the client's existing Microsoft 365 app and certificate (the same Sites.FullControl.All access the OneDrive hand-off already needs)",
   ],
 };
