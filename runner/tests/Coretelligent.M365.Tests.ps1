@@ -1090,6 +1090,13 @@ Describe 'Invoke-CtgM365Offboarding' {
         ($r.Actions -join ' ') | Should -Match "license 'SPE_E3' is GROUP-ASSIGNED by 'M365 E3 Users Group'"
     }
 
+    It 'removes the license when under the threshold and removeLicense is requested' {
+        $user = [pscustomobject]@{ UserPrincipalName = 'jdoe@x.com' }
+        $config = [pscustomobject]@{ removeLicense = [pscustomobject]@{}; mailbox = [pscustomobject]@{ sizeThresholdGB = 50 } }
+        $r = Invoke-CtgM365Offboarding -User $user -Config $config -MailboxSizeGB 10
+        Should -Invoke Set-MgUserLicense -ModuleName Coretelligent.M365 -Times 1 -Exactly   # license removed
+    }
+
     # FR #0000177: "[Request_BadRequest] : User does not have a corresponding license." failed the entra
     # offboard at random, and a retry always passed: one SKU in the batch was already gone (the other
     # lane, or a stale replica read), and Graph refuses the whole call for it.
@@ -1136,13 +1143,6 @@ Describe 'Invoke-CtgM365Offboarding' {
             }
             { Invoke-CtgM365Offboarding -User ([pscustomobject]@{ UserPrincipalName = 'jdoe@x.com' }) -Config $script:licCfg -MailboxSizeGB 10 } | Should -Throw '*Insufficient privileges*'
         }
-    }
-
-    It 'removes the license when under the threshold and removeLicense is requested' {
-        $user = [pscustomobject]@{ UserPrincipalName = 'jdoe@x.com' }
-        $config = [pscustomobject]@{ removeLicense = [pscustomobject]@{}; mailbox = [pscustomobject]@{ sizeThresholdGB = 50 } }
-        $r = Invoke-CtgM365Offboarding -User $user -Config $config -MailboxSizeGB 10
-        Should -Invoke Set-MgUserLicense -ModuleName Coretelligent.M365 -Times 1 -Exactly   # license removed
     }
 
     # --- convert-to-shared BEFORE the license comes off --------------------------------------------
